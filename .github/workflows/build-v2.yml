@@ -15,6 +15,7 @@ on:
     branches:
       - test-ci
       - test-ci-v2
+      - test-pre-commit-v2
       - develop
       - nightly
       - master
@@ -145,11 +146,25 @@ jobs:
           && needs.plan.outputs.untrusted_pr != 'false'
         run: echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
 
+      - name: Get lychee version
+        run: |
+          version="$(bash scripts/cargo-tool-version.sh lychee)"
+          echo "LYCHEE_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install lychee
+        # https://github.com/taiki-e/install-action
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: lychee@${{ env.LYCHEE_VERSION }}
+        env:
+          # Ubuntu 22.04 glibc is older than Lychee's GNU binary requires
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+
       - name: Run pre-commit
         run: prek run --all-files
 
   build:
-    if: needs.plan.outputs.run-tests == 'true'
+    if: github.ref != 'refs/heads/test-pre-commit-v2' && needs.plan.outputs.run-tests == 'true'
     needs:
       - plan
       - pre-commit
