@@ -204,6 +204,7 @@ EXTRA_REEXPORTS: dict[str, tuple[str, ...]] = {
         "from nautilus_trader.adapters.projectx.backtest import ProjectXCatalogDownloadResult as ProjectXCatalogDownloadResult",
         "from nautilus_trader.adapters.projectx.backtest import build_external_bar_type as build_external_bar_type",
         "from nautilus_trader.adapters.projectx.backtest import download_bars_to_catalog as download_bars_to_catalog",
+        "from nautilus_trader.adapters.projectx.backtest import download_bars_to_catalog_async as download_bars_to_catalog_async",
         "from nautilus_trader.adapters.projectx.providers import ProjectXInstrumentProvider as ProjectXInstrumentProvider",
     ),
     "nautilus_trader/adapters/rithmic/__init__.pyi": (
@@ -592,7 +593,9 @@ PYCLASS_ATTR_RE = re.compile(r"\b(?:pyo3::)?pyclass\s*\(")
 PYO3_NAME_RE = re.compile(r'#\[pyo3\(\s*name\s*=\s*"([^"]+)"')
 ATTR_NAME_RE = re.compile(r'\bname\s*=\s*"([^"]+)"')
 RUST_IMPL_RE = re.compile(r"^\s*impl(?:\s*<[^>]+>)?\s+([A-Za-z_][A-Za-z0-9_:<>]*)\s*\{")
-RUST_STRUCT_RE = re.compile(r"^\s*(?:(?:pub|pub\s*\(\s*crate\s*\))\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+RUST_STRUCT_RE = re.compile(
+    r"^\s*(?:(?:pub|pub\s*\(\s*crate\s*\))\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)\b"
+)
 RUST_FN_RE = re.compile(
     r"fn\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*<[^>]+>)?\s*\((.*)\)\s*(?:->\s*(.*?))?\s*\{",
     flags=re.DOTALL,

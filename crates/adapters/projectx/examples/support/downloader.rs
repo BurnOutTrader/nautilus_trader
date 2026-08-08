@@ -6,6 +6,7 @@ use std::{
     str::FromStr,
 };
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
@@ -20,7 +21,7 @@ use projectx_client::{Bar as PxApiBar, BarUnit, Contract, ContractId, HistoryReq
 use projectx_nt::{
     ProjectXHttpClient, factories::projectx_contract_to_instrument, http::error::ProjectXHttpError,
 };
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 
 use super::common::projectx_transport_config_from_env;
 
@@ -49,61 +50,43 @@ pub(crate) fn build_external_bar_type(
     BarType::from_str(&format!("{instrument_id}-{normalized}-EXTERNAL")).map_err(Into::into)
 }
 
-fn infer_price_precision(value: f64) -> u8 {
-    let formatted = format!("{value:.12}");
-    let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
-    trimmed
-        .split('.')
-        .nth(1)
-        .map_or(0, |fraction| fraction.len() as u8)
-}
+fn map_historical_bars(bar_type: BarType, bars: Vec<PxApiBar>) -> anyhow::Result<Vec<Bar>> {
+    let mut mapped = Vec::with_capacity(bars.len());
 
-fn infer_bar_price_precision(open: f64, high: f64, low: f64, close: f64) -> u8 {
-    [
-        infer_price_precision(open),
-        infer_price_precision(high),
-        infer_price_precision(low),
-        infer_price_precision(close),
-    ]
-    .into_iter()
-    .max()
-    .unwrap_or(0)
-}
-
-fn parse_ts(value: &str) -> Option<UnixNanos> {
-    let parsed = DateTime::parse_from_rfc3339(value).ok()?;
-    let nanos = parsed.timestamp_nanos_opt()?;
-    let nanos_u64 = u64::try_from(nanos).ok()?;
-    Some(UnixNanos::from(nanos_u64))
-}
-
-fn map_historical_bars(bar_type: BarType, bars: Vec<PxApiBar>) -> Vec<Bar> {
-    let mut mapped = bars
-        .into_iter()
-        .filter_map(|bar| {
-            let ts_event = u64::try_from(bar.t.as_jiff().as_nanosecond())
-                .ok()
-                .map(UnixNanos::from)?;
-            let o = bar.o.to_f64().unwrap_or_default();
-            let h = bar.h.to_f64().unwrap_or_default();
-            let l = bar.l.to_f64().unwrap_or_default();
-            let c = bar.c.to_f64().unwrap_or_default();
-            let price_prec = infer_bar_price_precision(o, h, l, c);
-            Some(Bar::new(
+    for bar in bars {
+        let ts_event = UnixNanos::from(
+            u64::try_from(bar.t.as_jiff().as_nanosecond())
+                .context("ProjectX historical bar timestamp predates the Unix epoch")?,
+        );
+        let price_precision = [bar.o, bar.h, bar.l, bar.c]
+            .into_iter()
+            .map(|price| price.normalize().scale() as u8)
+            .max()
+            .unwrap_or(0);
+        let volume = Quantity::from_decimal_dp(Decimal::from(bar.v), 0)
+            .context("invalid ProjectX historical bar volume")?;
+        mapped.push(
+            Bar::new_checked(
                 bar_type,
-                Price::new(o, price_prec),
-                Price::new(h, price_prec),
-                Price::new(l, price_prec),
-                Price::new(c, price_prec),
-                Quantity::new(bar.v as f64, 0),
+                Price::from_decimal_dp(bar.o, price_precision)
+                    .context("invalid ProjectX historical open price")?,
+                Price::from_decimal_dp(bar.h, price_precision)
+                    .context("invalid ProjectX historical high price")?,
+                Price::from_decimal_dp(bar.l, price_precision)
+                    .context("invalid ProjectX historical low price")?,
+                Price::from_decimal_dp(bar.c, price_precision)
+                    .context("invalid ProjectX historical close price")?,
+                volume,
                 ts_event,
                 ts_event,
-            ))
-        })
-        .collect::<Vec<_>>();
+            )
+            .context("invalid ProjectX historical OHLC relationship")?,
+        );
+    }
+
     mapped.sort_by_key(|bar| bar.ts_event);
     mapped.dedup_by_key(|bar| bar.ts_event);
-    mapped
+    Ok(mapped)
 }
 
 fn filter_completed_historical_bars(
@@ -195,7 +178,7 @@ async fn retrieve_bars_page(
     allow_live_history_fallback: bool,
 ) -> Result<Vec<PxApiBar>, ProjectXHttpError> {
     match http.retrieve_bars(request).await {
-        Err(error) if provider_error_code(&error) == Some(1) && allow_live_history_fallback => {
+        Err(e) if provider_error_code(&e) == Some(1) && allow_live_history_fallback => {
             println!(
                 "ProjectX live historical request rejected for {symbol}; retrying with live=false because explicit fallback is enabled",
             );
@@ -250,11 +233,13 @@ pub(crate) async fn download_bars_to_catalog(
     let bar_type = build_external_bar_type(instrument_id, bar_spec)?;
     let symbol = instrument_id.symbol.to_string();
     let end_nanos = UnixNanos::from(u64::try_from(
-        end.timestamp_nanos_opt().unwrap_or_default(),
+        end.timestamp_nanos_opt()
+            .context("ProjectX download end timestamp is outside the nanosecond range")?,
     )?);
-    let mut current_start = UnixNanos::from(u64::try_from(
-        start.timestamp_nanos_opt().unwrap_or_default(),
-    )?);
+    let mut current_start =
+        UnixNanos::from(u64::try_from(start.timestamp_nanos_opt().context(
+            "ProjectX download start timestamp is outside the nanosecond range",
+        )?)?);
 
     std::fs::create_dir_all(catalog_path)?;
 
@@ -283,7 +268,7 @@ pub(crate) async fn download_bars_to_catalog(
         // writing.
         let page_bars = filter_completed_historical_bars(
             bar_type,
-            map_historical_bars(bar_type, response),
+            map_historical_bars(bar_type, response)?,
             end_nanos,
         );
 

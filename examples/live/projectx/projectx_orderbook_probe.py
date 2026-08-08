@@ -28,27 +28,33 @@ Note:
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from examples.live.live_node_run_helpers import schedule_live_node_interrupt
+_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+sys.path[:] = [_REPO_ROOT, *(path for path in sys.path if path != _REPO_ROOT)]
 
-from nautilus_trader._libnautilus.common import Environment
-from nautilus_trader._libnautilus.common import LogColor
-from nautilus_trader._libnautilus.model import BookType
-from nautilus_trader._libnautilus.model import ClientId
+from nautilus_trader._libnautilus.common import Environment, LogColor
+from nautilus_trader._libnautilus.model import (
+    BookType,
+    ClientId,
+    OrderBook,
+    StrategyId,
+    TraderId,
+)
 from nautilus_trader._libnautilus.model import InstrumentId as PyInstrumentId
-from nautilus_trader._libnautilus.model import OrderBook
-from nautilus_trader._libnautilus.model import StrategyId
-from nautilus_trader._libnautilus.model import TraderId
-from nautilus_trader._libnautilus.trading import Strategy
-from nautilus_trader._libnautilus.trading import StrategyConfig
-from nautilus_trader.adapters.projectx import PROJECTX_CLIENT_ID
-from nautilus_trader.adapters.projectx import ProjectXDataClientConfig
-from nautilus_trader.adapters.projectx import ProjectXDataClientFactory
-from nautilus_trader.adapters.projectx import load_projectx_env
+from nautilus_trader._libnautilus.trading import Strategy, StrategyConfig
+from nautilus_trader.adapters.projectx import (
+    PROJECTX_CLIENT_ID,
+    ProjectXDataClientConfig,
+    ProjectXDataClientFactory,
+    load_projectx_env,
+)
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import InstrumentId
 
+from examples.live.live_node_run_helpers import schedule_live_node_interrupt
 
 if TYPE_CHECKING:
     from nautilus_trader.config import ImportableStrategyConfig
@@ -143,7 +149,6 @@ class ProjectXOrderBookProbeStrategyConfig(StrategyConfig):
 class ProjectXOrderBookProbeStrategy(Strategy):
     def __init__(self, config: ProjectXOrderBookProbeStrategyConfig):
         super().__init__(config)
-        self.config = config
         self._book = OrderBook(config.instrument_id, config.book_type)
         self._delta_batches = 0
 
@@ -253,7 +258,9 @@ def main() -> None:
     print(f"Levels to print: {levels_to_print}")
 
     if STREAM_MODE.strip().lower() == "depth":
-        print("Raw depth callbacks are not exposed on PyO3 strategies; using managed book output.")
+        print(
+            "Raw depth callbacks are not exposed on PyO3 strategies; using managed book output."
+        )
     print("Press CTRL+C to stop.")
     print()
 

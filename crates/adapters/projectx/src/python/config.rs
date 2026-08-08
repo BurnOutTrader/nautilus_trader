@@ -41,35 +41,19 @@ fn parse_environment_or_default(value: Option<String>) -> PyResult<ProjectXEnvir
     }
 }
 
-fn parse_account_type(value: &str) -> PyResult<AccountType> {
-    match value.to_ascii_lowercase().as_str() {
-        "cash" => Ok(AccountType::Cash),
-        "margin" => Ok(AccountType::Margin),
-        "betting" => Ok(AccountType::Betting),
-        "wallet" => Ok(AccountType::Wallet),
-        _ => Err(to_pyvalue_err(format!(
-            "Invalid ProjectX account_type '{value}'"
-        ))),
-    }
-}
-
 fn resolve_projectx_credentials(
     user_name: Option<String>,
     api_key: Option<String>,
 ) -> PyResult<(String, String)> {
+    fn non_empty(value: String) -> Option<String> {
+        (!value.trim().is_empty()).then_some(value)
+    }
+
     fn pick(value: Option<String>, env_key: &str) -> Option<String> {
         value
-            .and_then(|v| {
-                let trimmed = v.trim().to_string();
-                (!trimmed.is_empty()).then_some(trimmed)
-            })
-            .or_else(|| {
-                std::env::var(env_key).ok().and_then(|v| {
-                    let trimmed = v.trim().to_string();
-                    (!trimmed.is_empty()).then_some(trimmed)
-                })
-            })
-            .or_else(|| projectx_cached_credential(env_key))
+            .and_then(non_empty)
+            .or_else(|| projectx_cached_credential(env_key).and_then(non_empty))
+            .or_else(|| std::env::var(env_key).ok().and_then(non_empty))
     }
 
     let user_name = pick(user_name, "PROJECTX_USERNAME").ok_or_else(|| {
@@ -79,6 +63,32 @@ fn resolve_projectx_credentials(
         to_pyvalue_err("ProjectX API key is required (pass `api_key` or set PROJECTX_API_KEY)")
     })?;
     Ok((user_name, api_key))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_transport_config(
+    environment: Option<String>,
+    user_name: Option<String>,
+    api_key: Option<String>,
+    http_timeout_secs: Option<u64>,
+    max_retries: Option<u32>,
+    retry_delay_initial_ms: Option<u64>,
+    retry_delay_max_ms: Option<u64>,
+    http_proxy_url: Option<String>,
+) -> PyResult<ProjectXConfig> {
+    let (user_name, api_key) = resolve_projectx_credentials(user_name, api_key)?;
+    Ok(ProjectXConfig::new(
+        parse_environment_or_default(environment)?,
+        user_name,
+        api_key,
+    )
+    .with_optional_overrides(
+        http_timeout_secs,
+        max_retries,
+        retry_delay_initial_ms,
+        retry_delay_max_ms,
+        http_proxy_url,
+    ))
 }
 
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.projectx")]
@@ -115,33 +125,16 @@ impl ProjectXConfig {
         retry_delay_max_ms: Option<u64>,
         http_proxy_url: Option<String>,
     ) -> PyResult<Self> {
-        let (user_name, api_key) = resolve_projectx_credentials(user_name, api_key)?;
-        let mut config = Self::new(
-            parse_environment_or_default(environment)?,
+        build_transport_config(
+            environment,
             user_name,
             api_key,
-        );
-
-        if let Some(value) = http_timeout_secs {
-            config = config.with_http_timeout_secs(value);
-        }
-
-        if let Some(value) = max_retries {
-            config = config.with_max_retries(value);
-        }
-
-        if let Some(value) = retry_delay_initial_ms {
-            config = config.with_retry_delay_initial_ms(value);
-        }
-
-        if let Some(value) = retry_delay_max_ms {
-            config = config.with_retry_delay_max_ms(value);
-        }
-
-        if let Some(value) = http_proxy_url {
-            config = config.with_http_proxy_url(value);
-        }
-        Ok(config)
+            http_timeout_secs,
+            max_retries,
+            retry_delay_initial_ms,
+            retry_delay_max_ms,
+            http_proxy_url,
+        )
     }
 
     fn __repr__(&self) -> String {
@@ -176,56 +169,34 @@ impl ProjectXDataClientConfig {
         http_proxy_url: Option<String>,
         market_data_live: bool,
     ) -> PyResult<Self> {
-        let (user_name, api_key) = resolve_projectx_credentials(user_name, api_key)?;
-        let mut config = ProjectXConfig::new(
-            parse_environment_or_default(environment)?,
+        let transport = build_transport_config(
+            environment,
             user_name,
             api_key,
-        );
-
-        if let Some(value) = http_timeout_secs {
-            config = config.with_http_timeout_secs(value);
-        }
-
-        if let Some(value) = max_retries {
-            config = config.with_max_retries(value);
-        }
-
-        if let Some(value) = retry_delay_initial_ms {
-            config = config.with_retry_delay_initial_ms(value);
-        }
-
-        if let Some(value) = retry_delay_max_ms {
-            config = config.with_retry_delay_max_ms(value);
-        }
-
-        if let Some(value) = http_proxy_url {
-            config = config.with_http_proxy_url(value);
-        }
-        Ok(Self {
-            transport: config,
-            market_data_live,
-        })
+            http_timeout_secs,
+            max_retries,
+            retry_delay_initial_ms,
+            retry_delay_max_ms,
+            http_proxy_url,
+        )?;
+        Ok(Self::builder()
+            .transport(transport)
+            .market_data_live(market_data_live)
+            .build())
     }
 
     fn __repr__(&self) -> String {
         format!("{self:?}")
-    }
-
-    #[getter]
-    fn transport(&self) -> ProjectXConfig {
-        self.transport.clone()
-    }
-
-    #[getter]
-    fn market_data_live(&self) -> bool {
-        self.market_data_live
     }
 }
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl ProjectXExecClientConfig {
+    /// Creates an execution configuration from the established string-based Python API.
+    ///
+    /// Both identifiers are parsed with checked Rust constructors so invalid Python input is
+    /// reported as `ValueError` rather than reaching an infallible constructor or panicking.
     #[new]
     #[pyo3(signature = (
         trader_id,
@@ -252,49 +223,94 @@ impl ProjectXExecClientConfig {
         retry_delay_initial_ms: Option<u64>,
         retry_delay_max_ms: Option<u64>,
         http_proxy_url: Option<String>,
-        account_type: Option<&str>,
+        account_type: Option<AccountType>,
     ) -> PyResult<Self> {
-        let (user_name, api_key) = resolve_projectx_credentials(user_name, api_key)?;
-        let mut transport = ProjectXConfig::new(
-            parse_environment_or_default(environment)?,
+        let trader_id = TraderId::new_checked(trader_id).map_err(to_pyvalue_err)?;
+        let account_id = projectx_account_id_from_raw(&account_id).map_err(to_pyvalue_err)?;
+        let account_type = account_type.unwrap_or(AccountType::Margin);
+        if account_type != AccountType::Margin {
+            return Err(to_pyvalue_err(format!(
+                "ProjectX futures accounts require AccountType::Margin, received {account_type:?}"
+            )));
+        }
+        let transport = build_transport_config(
+            environment,
             user_name,
             api_key,
-        );
+            http_timeout_secs,
+            max_retries,
+            retry_delay_initial_ms,
+            retry_delay_max_ms,
+            http_proxy_url,
+        )?;
 
-        if let Some(value) = http_timeout_secs {
-            transport = transport.with_http_timeout_secs(value);
-        }
-
-        if let Some(value) = max_retries {
-            transport = transport.with_max_retries(value);
-        }
-
-        if let Some(value) = retry_delay_initial_ms {
-            transport = transport.with_retry_delay_initial_ms(value);
-        }
-
-        if let Some(value) = retry_delay_max_ms {
-            transport = transport.with_retry_delay_max_ms(value);
-        }
-
-        if let Some(value) = http_proxy_url {
-            transport = transport.with_http_proxy_url(value);
-        }
-
-        Ok(Self {
-            trader_id: TraderId::from(trader_id.as_str()),
-            account_id: projectx_account_id_from_raw(account_id.as_str()),
-            account_type: parse_account_type(account_type.unwrap_or("margin"))?,
-            transport,
-        })
+        Ok(Self::builder()
+            .trader_id(trader_id)
+            .account_id(account_id)
+            .account_type(account_type)
+            .transport(transport)
+            .build())
     }
 
     fn __repr__(&self) -> String {
         format!("{self:?}")
     }
+}
 
-    #[getter]
-    fn transport(&self) -> ProjectXConfig {
-        self.transport.clone()
+#[cfg(test)]
+mod tests {
+    use nautilus_model::enums::AccountType;
+
+    use super::*;
+
+    fn exec_config(
+        trader_id: &str,
+        account_id: &str,
+        account_type: Option<AccountType>,
+    ) -> PyResult<ProjectXExecClientConfig> {
+        ProjectXExecClientConfig::py_new(
+            trader_id.to_string(),
+            account_id.to_string(),
+            None,
+            Some("test-user".to_string()),
+            Some("test-api-key".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            account_type,
+        )
+    }
+
+    #[rstest::rstest]
+    #[case("")]
+    #[case("bad")]
+    #[case("💥")]
+    fn invalid_python_trader_id_returns_error(#[case] trader_id: &str) {
+        assert!(exec_config(trader_id, "PROJECTX-12345", None).is_err());
+    }
+
+    #[rstest::rstest]
+    #[case("")]
+    #[case("PROJECTX-")]
+    #[case("💥")]
+    fn invalid_python_account_id_returns_error(#[case] account_id: &str) {
+        assert!(exec_config("TRADER-001", account_id, None).is_err());
+    }
+
+    #[rstest::rstest]
+    fn non_margin_python_account_type_returns_error() {
+        assert!(exec_config("TRADER-001", "PROJECTX-12345", Some(AccountType::Cash)).is_err());
+    }
+
+    #[rstest::rstest]
+    fn valid_python_exec_config_defaults_to_margin() {
+        let config =
+            exec_config("TRADER-001", "DEMO001", None).expect("valid ProjectX exec config");
+
+        assert_eq!(config.trader_id.as_str(), "TRADER-001");
+        assert_eq!(config.account_id.as_str(), "PROJECTX-DEMO001");
+        assert_eq!(config.account_type, AccountType::Margin);
     }
 }

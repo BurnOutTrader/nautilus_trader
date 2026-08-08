@@ -256,7 +256,7 @@ fn projectx_live_node_builds_with_pure_rust_exec_strategy() -> anyhow::Result<()
                 ProjectXEnvironment::TopstepX,
                 "test-user",
                 "test-key",
-            )),
+            )?),
         )?
         .build()?;
 

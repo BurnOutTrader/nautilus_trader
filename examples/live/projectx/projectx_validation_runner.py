@@ -18,22 +18,33 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from pathlib import Path
 
-from examples.live.projectx.projectx_contract_parity_check import run_contract_parity_check
-from examples.live.projectx.projectx_front_month_resolver import resolve_front_month_contract
-from examples.live.projectx.projectx_instrument_provider import load_provider_snapshot
-from examples.live.projectx.projectx_instrument_resolver import _instrument_id_from_contract
-from examples.live.projectx.projectx_live_data_probe import run_probe
+_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+sys.path[:] = [_REPO_ROOT, *(path for path in sys.path if path != _REPO_ROOT)]
 
 from nautilus_trader.adapters.projectx import load_projectx_env
 from nautilus_trader.model import InstrumentId
 
+from examples.live.projectx.projectx_contract_parity_check import (
+    run_contract_parity_check,
+)
+from examples.live.projectx.projectx_front_month_resolver import (
+    resolve_front_month_contract,
+)
+from examples.live.projectx.projectx_instrument_provider import load_provider_snapshot
+from examples.live.projectx.projectx_instrument_resolver import (
+    _instrument_id_from_contract,
+)
+from examples.live.projectx.projectx_live_data_probe import run_probe
 
 load_projectx_env()
 
-OUTPUT_PATH = Path("examples/live/projectx/projectx_validation_report.json").expanduser()
+OUTPUT_PATH = Path(
+    "examples/live/projectx/projectx_validation_report.json"
+).expanduser()
 PRODUCT_ROOT = "MNQ"
 INSTRUMENT_ID = InstrumentId.from_str("MNQM26.PROJECTX")
 ACTIVE_ONLY = True
@@ -128,7 +139,9 @@ async def _run_mode_validation(live: bool) -> dict[str, object]:
     return result
 
 
-def _run_reconnect_soak(*, live: bool, instrument_id: InstrumentId) -> dict[str, object]:
+def _run_reconnect_soak(
+    *, live: bool, instrument_id: InstrumentId
+) -> dict[str, object]:
     iterations: list[dict[str, object]] = []
 
     for iteration in range(1, SOAK_ITERATIONS + 1):
@@ -148,10 +161,10 @@ def _run_reconnect_soak(*, live: bool, instrument_id: InstrumentId) -> dict[str,
                 log_data=SOAK_LOG_DATA,
             )
             capture.setdefault("status", "ok")
-        except Exception as exc:
+        except Exception as e:  # noqa: BLE001 - soak harness records every iteration failure
             capture = {
                 "status": "error",
-                "error": repr(exc),
+                "error": repr(e),
                 "instrument_id": instrument_id.value,
                 "market_data_live": live,
             }

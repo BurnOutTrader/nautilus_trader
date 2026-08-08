@@ -12,78 +12,53 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_core::correctness::{CorrectnessResultExt, FAILED};
-use nautilus_core::python::to_pyvalue_err;
+use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 use nautilus_model::{
-    data::{Bar, BarType, Data},
+    data::{BarType, Data},
     instruments::InstrumentAny,
     python::{data::data_to_pyobject, instruments::instrument_any_to_pyobject},
-    types::{Price, Quantity},
 };
-use projectx_client::{BarUnit, ContractId, HistoryRequest, Timestamp};
+use projectx_client::{ContractId, HistoryRequest, Timestamp};
 use pyo3::{prelude::*, types::PyList};
 
 use crate::{
-    common::enums::ProjectXHub,
     config::ProjectXConfig,
+    data::{
+        projectx_expected_history_bar_unit, projectx_map_historical_bars,
+        projectx_retrieve_bars_with_optional_live_fallback,
+        projectx_validate_history_bar_semantics,
+    },
     factories::{projectx_contract_to_instrument, projectx_select_front_month_contract},
     http::client::ProjectXHttpClient,
 };
 
-fn to_client_bar_unit(unit: i32) -> Result<BarUnit, anyhow::Error> {
-    match unit {
-        1 => Ok(BarUnit::Second),
-        2 => Ok(BarUnit::Minute),
-        3 => Ok(BarUnit::Hour),
-        4 => Ok(BarUnit::Day),
-        5 => Ok(BarUnit::Week),
-        6 => Ok(BarUnit::Month),
-        _ => anyhow::bail!("invalid ProjectX bar unit code: {unit}"),
-    }
-}
-
-fn to_client_timestamp(value: &str) -> Result<Timestamp, anyhow::Error> {
-    Timestamp::new(value).map_err(anyhow::Error::from)
-}
-
-fn to_nautilus_bar(bar_type: BarType, bar: &projectx_client::Bar) -> Option<Bar> {
-    let ts_event = u64::try_from(bar.t.as_jiff().as_nanosecond())
-        .ok()
-        .map(nautilus_core::UnixNanos::from)?;
-    let precision = [bar.o, bar.h, bar.l, bar.c]
-        .into_iter()
-        .map(|px| px.scale() as u8)
-        .max()
-        .unwrap_or(0);
-    Some(Bar::new(
-        bar_type,
-        Price::from_decimal_dp(bar.o, precision).expect_display(FAILED),
-        Price::from_decimal_dp(bar.h, precision).expect_display(FAILED),
-        Price::from_decimal_dp(bar.l, precision).expect_display(FAILED),
-        Price::from_decimal_dp(bar.c, precision).expect_display(FAILED),
-        Quantity::new(bar.v as f64, 0),
-        ts_event,
-        ts_event,
-    ))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_history_request(
     contract_id: &str,
+    bar_type: BarType,
     start_time: &str,
     end_time: &str,
-    unit: i32,
-    unit_number: i32,
+    unit: Option<i32>,
+    unit_number: Option<i32>,
     limit: i32,
     live: bool,
     include_partial_bar: bool,
 ) -> Result<HistoryRequest, anyhow::Error> {
+    let (expected_unit, expected_unit_number) = projectx_expected_history_bar_unit(bar_type)?;
+    let unit_number = unit_number.unwrap_or(expected_unit_number);
+    let unit = match unit {
+        Some(unit) => projectx_validate_history_bar_semantics(bar_type, unit, unit_number)?,
+        None if unit_number == expected_unit_number => expected_unit,
+        None => anyhow::bail!(
+            "ProjectX unit_number {unit_number} does not match BarType step {expected_unit_number}"
+        ),
+    };
     Ok(HistoryRequest::builder(
         ContractId::new(contract_id)?,
         live,
-        to_client_timestamp(start_time)?,
-        to_client_timestamp(end_time)?,
-        to_client_bar_unit(unit)?,
+        Timestamp::new(start_time)?,
+        Timestamp::new(end_time)?,
+        unit,
     )
     .unit_number(unit_number)
     .limit(limit)
@@ -115,11 +90,6 @@ impl ProjectXHttpClient {
         self.urls().rtc_base.clone()
     }
 
-    #[pyo3(name = "create_ws_client")]
-    fn py_create_ws_client(&self, hub: ProjectXHub) -> crate::websocket::client::ProjectXWsClient {
-        Self::create_ws_client(self, hub)
-    }
-
     #[pyo3(name = "stop")]
     fn py_stop(&self) {
         Self::stop(self);
@@ -129,8 +99,7 @@ impl ProjectXHttpClient {
     fn py_start<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Self::start(&client).await.map_err(to_pyvalue_err)?;
-            Python::attach(|py| Ok(py.None()))
+            Self::start(&client).await.map_err(to_pyruntime_err)
         })
     }
 
@@ -138,8 +107,7 @@ impl ProjectXHttpClient {
     fn py_authenticate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Self::start(&client).await.map_err(to_pyvalue_err)?;
-            Python::attach(|py| Ok(py.None()))
+            Self::start(&client).await.map_err(to_pyruntime_err)
         })
     }
 
@@ -147,49 +115,55 @@ impl ProjectXHttpClient {
     fn py_validate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Self::start(&client).await.map_err(to_pyvalue_err)?;
-            Python::attach(|py| Ok(py.None()))
+            Self::validate_session(&client)
+                .await
+                .map_err(to_pyruntime_err)
         })
     }
 
     #[pyo3(name = "retrieve_bars")]
-    #[pyo3(signature = (contract_id, bar_type, start_time, end_time, unit, unit_number, limit = 500, live = false, include_partial_bar = false))]
+    #[pyo3(signature = (contract_id, bar_type, start_time, end_time, unit = None, unit_number = None, limit = 500, live = false, include_partial_bar = false, allow_live_history_fallback = false))]
     #[allow(clippy::too_many_arguments)]
     fn py_retrieve_bars<'py>(
         &self,
         py: Python<'py>,
-        contract_id: String,
+        contract_id: &str,
         bar_type: BarType,
-        start_time: String,
-        end_time: String,
-        unit: i32,
-        unit_number: i32,
+        start_time: &str,
+        end_time: &str,
+        unit: Option<i32>,
+        unit_number: Option<i32>,
         limit: i32,
         live: bool,
         include_partial_bar: bool,
+        allow_live_history_fallback: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let request = build_history_request(
+            contract_id,
+            bar_type,
+            start_time,
+            end_time,
+            unit,
+            unit_number,
+            limit,
+            live,
+            include_partial_bar,
+        )
+        .map_err(to_pyvalue_err)?;
         let client = self.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let request = build_history_request(
-                &contract_id,
-                &start_time,
-                &end_time,
-                unit,
-                unit_number,
-                limit,
-                live,
-                include_partial_bar,
+            let (bars, _) = projectx_retrieve_bars_with_optional_live_fallback(
+                &client,
+                &request,
+                allow_live_history_fallback,
             )
-            .map_err(to_pyvalue_err)?;
-            let bars = client
-                .retrieve_bars(&request)
-                .await
-                .map_err(to_pyvalue_err)?;
+            .await
+            .map_err(to_pyruntime_err)?;
+            let bars = projectx_map_historical_bars(bar_type, &bars).map_err(to_pyruntime_err)?;
 
             Python::attach(|py| {
                 let py_bars: PyResult<Vec<_>> = bars
-                    .iter()
-                    .filter_map(|bar| to_nautilus_bar(bar_type, bar))
+                    .into_iter()
                     .map(|bar| data_to_pyobject(py, Data::Bar(bar)))
                     .collect();
                 Ok(PyList::new(py, py_bars?)?.into_any().unbind())
@@ -210,14 +184,15 @@ impl ProjectXHttpClient {
             let contracts = client
                 .available_contracts(live)
                 .await
-                .map_err(to_pyvalue_err)?;
+                .map_err(to_pyruntime_err)?;
             let selected = projectx_select_front_month_contract(&contracts, &product_root)
                 .ok_or_else(|| {
                     to_pyvalue_err(anyhow::anyhow!(
                         "No ProjectX contract found for product root {product_root}"
                     ))
                 })?;
-            let instrument = projectx_contract_to_instrument(&selected).map_err(to_pyvalue_err)?;
+            let instrument =
+                projectx_contract_to_instrument(&selected).map_err(to_pyruntime_err)?;
             Python::attach(|py| instrument_any_to_pyobject(py, instrument))
         })
     }
@@ -226,15 +201,17 @@ impl ProjectXHttpClient {
     fn py_contract_by_id<'py>(
         &self,
         py: Python<'py>,
-        contract_id: String,
+        contract_id: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let contract_id = ContractId::new(contract_id).map_err(to_pyvalue_err)?;
         let client = self.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let contract = client
-                .contract_by_id(&ContractId::new(&contract_id).map_err(to_pyvalue_err)?)
+                .contract_by_id(&contract_id)
                 .await
-                .map_err(to_pyvalue_err)?;
-            let instrument = projectx_contract_to_instrument(&contract).map_err(to_pyvalue_err)?;
+                .map_err(to_pyruntime_err)?;
+            let instrument =
+                projectx_contract_to_instrument(&contract).map_err(to_pyruntime_err)?;
             Python::attach(|py| instrument_any_to_pyobject(py, instrument))
         })
     }
@@ -253,7 +230,7 @@ impl ProjectXHttpClient {
             let contracts = client
                 .available_contracts(live)
                 .await
-                .map_err(to_pyvalue_err)?;
+                .map_err(to_pyruntime_err)?;
 
             let instruments: Vec<InstrumentAny> = contracts
                 .into_iter()
@@ -266,7 +243,7 @@ impl ProjectXHttpClient {
                 })
                 .map(|contract| projectx_contract_to_instrument(&contract))
                 .collect::<anyhow::Result<Vec<_>>>()
-                .map_err(to_pyvalue_err)?;
+                .map_err(to_pyruntime_err)?;
 
             Python::attach(|py| {
                 let py_instruments: PyResult<Vec<_>> = instruments

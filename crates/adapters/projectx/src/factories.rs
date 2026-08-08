@@ -19,14 +19,15 @@ use std::{any::Any, cell::RefCell, rc::Rc};
 use crate::{
     common::{
         consts::{PROJECT_X, PROJECTX_VENUE},
-        symbols::{parse_databento_symbol, projectx_to_databento_symbol},
+        symbols::{format_databento_symbol, parse_databento_symbol, projectx_to_databento_symbol},
     },
     config::{ProjectXDataClientConfig, ProjectXExecClientConfig},
     data::ProjectXDataClient,
     execution::ProjectXExecutionClient,
 };
-use chrono::{NaiveDate, TimeZone, Utc};
+use anyhow::Context;
 use nautilus_common::{
+    cache::CacheView,
     clients::{DataClient, ExecutionClient},
     clock::Clock,
     factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
@@ -34,13 +35,13 @@ use nautilus_common::{
 use nautilus_core::{Params, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
-    enums::{AssetClass, OmsType},
+    enums::{AccountType, AssetClass, OmsType},
     identifiers::{ClientId, InstrumentId, Symbol},
     instruments::{FuturesContract, InstrumentAny},
     types::{Currency, Price, Quantity},
 };
 use projectx_client::Contract;
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use serde_json::Value;
 #[must_use]
 pub fn normalize_projectx_symbol_key(value: &str) -> String {
@@ -54,15 +55,14 @@ fn parsed_symbol(value: &str) -> Option<(String, char, u16)> {
 #[must_use]
 pub fn canonical_projectx_public_symbol(contract: &Contract) -> String {
     let translated = projectx_to_databento_symbol(contract.id.as_ref()).ok();
+    let translated_parts = translated.as_deref().and_then(parsed_symbol);
     let name = normalize_projectx_symbol_key(&contract.name);
 
     if let Some(name_parts) = parsed_symbol(&name) {
-        if let Some(translated_symbol) = translated.as_deref()
-            && parsed_symbol(translated_symbol).is_some_and(|translated_parts| {
-                translated_parts.0 == name_parts.0 && translated_parts.1 == name_parts.1
-            })
+        if let Some((_, translated_month, translated_year)) = translated_parts.as_ref()
+            && *translated_month == name_parts.1
         {
-            return translated_symbol.to_string();
+            return format_databento_symbol(&name_parts.0, name_parts.1, *translated_year);
         }
 
         return name;
@@ -71,12 +71,10 @@ pub fn canonical_projectx_public_symbol(contract: &Contract) -> String {
     let symbol_id = normalize_projectx_symbol_key(contract.symbol_id.as_ref());
 
     if let Some(symbol_parts) = parsed_symbol(&symbol_id) {
-        if let Some(translated_symbol) = translated.as_deref()
-            && parsed_symbol(translated_symbol).is_some_and(|translated_parts| {
-                translated_parts.0 == symbol_parts.0 && translated_parts.1 == symbol_parts.1
-            })
+        if let Some((_, translated_month, translated_year)) = translated_parts.as_ref()
+            && *translated_month == symbol_parts.1
         {
-            return translated_symbol.to_string();
+            return format_databento_symbol(&symbol_parts.0, symbol_parts.1, *translated_year);
         }
 
         return symbol_id;
@@ -137,21 +135,41 @@ pub fn projectx_select_front_month_contract(
 pub fn projectx_contract_to_instrument(contract: &Contract) -> anyhow::Result<InstrumentAny> {
     let public_symbol = canonical_projectx_public_symbol(contract);
     let (root, _, _) = parse_databento_symbol(&public_symbol)?;
-    let instrument_id = InstrumentId::new(Symbol::new(public_symbol.as_str()), *PROJECTX_VENUE);
-    let (activation_ns, expiration_ns) =
-        projectx_contract_expiry_bounds(contract).unwrap_or_else(|| {
-            let now = get_atomic_clock_realtime().get_time_ns();
-            (now, now)
-        });
+    let raw_symbol = Symbol::new_checked(public_symbol.as_str())
+        .context("invalid ProjectX contract public symbol")?;
+    let instrument_id = InstrumentId::new(raw_symbol, *PROJECTX_VENUE);
+    let activation_ns = UnixNanos::default();
+    // ProjectX does not provide contract lifecycle timestamps. Futures instruments always expose
+    // an expiration to Nautilus, so use the non-expiring sentinel rather than marking every
+    // contract expired at the Unix epoch.
+    let expiration_ns = UnixNanos::from(u64::MAX);
     let ts_init = get_atomic_clock_realtime().get_time_ns();
-    let tick_size = contract.tick_size.to_f64().unwrap_or_default();
-    let tick_value = contract.tick_value.to_f64().unwrap_or_default();
-    let price_precision = infer_price_precision(tick_size);
-    let multiplier = if tick_size > 0.0 {
-        tick_value / tick_size
-    } else {
-        1.0
-    };
+    anyhow::ensure!(
+        contract.tick_size > Decimal::ZERO,
+        "ProjectX contract {} tick size must be positive, was {}",
+        contract.id,
+        contract.tick_size,
+    );
+    anyhow::ensure!(
+        contract.tick_value > Decimal::ZERO,
+        "ProjectX contract {} tick value must be positive, was {}",
+        contract.id,
+        contract.tick_value,
+    );
+    let price_precision = contract.tick_size.normalize().scale() as u8;
+    let price_increment = Price::from_decimal_dp(contract.tick_size, price_precision)
+        .context("invalid ProjectX contract tick size")?;
+    let multiplier_decimal = contract
+        .tick_value
+        .checked_div(contract.tick_size)
+        .context("ProjectX tick value to tick size ratio overflowed")?;
+    let multiplier = Quantity::from_decimal_dp(
+        multiplier_decimal,
+        multiplier_decimal.normalize().scale() as u8,
+    )
+    .context("invalid ProjectX contract multiplier")?;
+    let lot_size =
+        Quantity::from_decimal_dp(Decimal::ONE, 0).context("invalid ProjectX contract lot size")?;
 
     let mut info = Params::new();
     info.insert(
@@ -175,19 +193,25 @@ pub fn projectx_contract_to_instrument(contract: &Contract) -> anyhow::Result<In
         Value::Bool(contract.active_contract),
     );
     info.insert(
+        "activation_source".to_string(),
+        Value::String("unavailable_from_projectx".to_string()),
+    );
+    info.insert(
+        "expiration_source".to_string(),
+        Value::String("unavailable_from_projectx".to_string()),
+    );
+    info.insert(
         "tick_size".to_string(),
-        serde_json::Number::from_f64(contract.tick_size.to_f64().unwrap_or_default())
-            .map_or(Value::Null, Value::Number),
+        Value::String(contract.tick_size.to_string()),
     );
     info.insert(
         "tick_value".to_string(),
-        serde_json::Number::from_f64(contract.tick_value.to_f64().unwrap_or_default())
-            .map_or(Value::Null, Value::Number),
+        Value::String(contract.tick_value.to_string()),
     );
 
-    Ok(InstrumentAny::FuturesContract(FuturesContract::new(
+    let instrument = FuturesContract::new_checked(
         instrument_id,
-        Symbol::new(public_symbol.as_str()),
+        raw_symbol,
         infer_asset_class(&root, &contract.description),
         None,
         root.as_str().into(),
@@ -195,14 +219,11 @@ pub fn projectx_contract_to_instrument(contract: &Contract) -> anyhow::Result<In
         expiration_ns,
         Currency::USD(),
         price_precision,
-        Price::new(
-            contract.tick_size.to_f64().unwrap_or_default(),
-            price_precision,
-        ),
-        Quantity::new(multiplier, infer_quantity_precision(multiplier)),
-        Quantity::new(1.0, 0),
+        price_increment,
+        multiplier,
+        lot_size,
         None,
-        Some(Quantity::new(1.0, 0)),
+        Some(lot_size),
         None,
         None,
         None,
@@ -213,20 +234,10 @@ pub fn projectx_contract_to_instrument(contract: &Contract) -> anyhow::Result<In
         Some(info),
         ts_init,
         ts_init,
-    )))
-}
+    )
+    .context("failed to construct ProjectX futures contract")?;
 
-fn infer_price_precision(value: f64) -> u8 {
-    let s = format!("{value:.12}");
-    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-    trimmed
-        .split('.')
-        .nth(1)
-        .map_or(0, |fraction| fraction.len() as u8)
-}
-
-fn infer_quantity_precision(value: f64) -> u8 {
-    infer_price_precision(value)
+    Ok(InstrumentAny::FuturesContract(instrument))
 }
 
 fn infer_asset_class(root: &str, description: &str) -> AssetClass {
@@ -275,41 +286,6 @@ fn infer_asset_class(root: &str, description: &str) -> AssetClass {
     AssetClass::Commodity
 }
 
-fn projectx_contract_expiry_bounds(contract: &Contract) -> Option<(UnixNanos, UnixNanos)> {
-    let (_, month_code, year_two) =
-        parse_databento_symbol(&canonical_projectx_public_symbol(contract)).ok()?;
-    let month = match month_code {
-        'F' => 1,
-        'G' => 2,
-        'H' => 3,
-        'J' => 4,
-        'K' => 5,
-        'M' => 6,
-        'N' => 7,
-        'Q' => 8,
-        'U' => 9,
-        'V' => 10,
-        'X' => 11,
-        'Z' => 12,
-        _ => return None,
-    };
-    let year = 2000 + i32::from(year_two);
-
-    let activation = NaiveDate::from_ymd_opt(year, month, 1)?.and_hms_nano_opt(0, 0, 0, 0)?;
-    let (next_year, next_month) = if month == 12 {
-        (year + 1, 1)
-    } else {
-        (year, month + 1)
-    };
-    let expiration =
-        NaiveDate::from_ymd_opt(next_year, next_month, 1)?.and_hms_nano_opt(0, 0, 0, 0)?;
-
-    Some((
-        UnixNanos::from(Utc.from_utc_datetime(&activation).timestamp_nanos_opt()? as u64),
-        UnixNanos::from(Utc.from_utc_datetime(&expiration).timestamp_nanos_opt()? as u64),
-    ))
-}
-
 fn month_code_index(month: char) -> Option<u8> {
     "FGHJKMNQUVXZ"
         .chars()
@@ -324,7 +300,8 @@ fn projectx_contract_root_and_sort_key(contract: &Contract) -> Option<(String, u
         Some((root, year_two, month_index))
     };
 
-    parse_candidate(&contract.name)
+    parse_candidate(&canonical_projectx_public_symbol(contract))
+        .or_else(|| parse_candidate(&contract.name))
         .or_else(|| parse_candidate(contract.symbol_id.as_ref()))
         .or_else(|| {
             let translated = projectx_to_databento_symbol(contract.id.as_ref()).ok()?;
@@ -374,7 +351,7 @@ impl DataClientFactory for ProjectXDataClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        _cache: nautilus_common::cache::CacheView,
+        _cache: CacheView,
         _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn DataClient>> {
         let projectx_config = config
@@ -431,7 +408,7 @@ impl ExecutionClientFactory for ProjectXExecutionClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        cache: nautilus_common::cache::CacheView,
+        cache: CacheView,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let projectx_config = config
             .as_any()
@@ -442,6 +419,13 @@ impl ExecutionClientFactory for ProjectXExecutionClientFactory {
                 )
             })?
             .clone();
+
+        if projectx_config.account_type != AccountType::Margin {
+            anyhow::bail!(
+                "ProjectX futures accounts require AccountType::Margin, received {:?}",
+                projectx_config.account_type
+            );
+        }
 
         let core = ExecutionClientCore::new(
             projectx_config.trader_id,
@@ -486,13 +470,14 @@ mod tests {
         factories::{DataClientFactory, ExecutionClientFactory},
         live::runner::replace_data_event_sender,
     };
-    use nautilus_core::Params;
+    use nautilus_core::{Params, UnixNanos, time::get_atomic_clock_realtime};
     use nautilus_live::ExecutionClientCore;
     use nautilus_model::{
         enums::{AccountType, OmsType},
         identifiers::{AccountId, ClientId, TraderId},
         instruments::{Instrument, InstrumentAny},
     };
+    use rust_decimal::Decimal;
 
     fn base_contract(id: &str, name: &str, active_contract: bool) -> Contract {
         serde_json::from_value(serde_json::json!({
@@ -530,6 +515,51 @@ mod tests {
         );
         assert_eq!(info.get_str("projectx_name"), Some("MESM26"));
         assert_eq!(info.get_bool("active_contract"), Some(true));
+        assert_eq!(
+            info.get_str("activation_source"),
+            Some("unavailable_from_projectx")
+        );
+        assert_eq!(
+            info.get_str("expiration_source"),
+            Some("unavailable_from_projectx")
+        );
+        assert_eq!(instrument.activation_ns, UnixNanos::default());
+        assert_eq!(instrument.expiration_ns, UnixNanos::from(u64::MAX));
+        assert!(get_atomic_clock_realtime().get_time_ns() < instrument.expiration_ns);
+    }
+
+    #[rstest::rstest]
+    fn shared_contract_parser_preserves_decimal_tick_arithmetic() {
+        let contract: Contract = serde_json::from_value(serde_json::json!({
+            "id": "CON.F.US.MES.M26",
+            "name": "MESM26",
+            "description": "Micro E-mini S&P 500",
+            "tickSize": "0.00000001",
+            "tickValue": "0.00000005",
+            "activeContract": true,
+            "symbolId": "MESM26",
+        }))
+        .expect("contract");
+
+        let InstrumentAny::FuturesContract(instrument) =
+            projectx_contract_to_instrument(&contract).expect("contract should parse")
+        else {
+            panic!("expected futures contract");
+        };
+
+        assert_eq!(instrument.price_increment.as_decimal(), contract.tick_size);
+        assert_eq!(instrument.price_precision, 8);
+        assert_eq!(instrument.multiplier.as_decimal(), Decimal::from(5));
+    }
+
+    #[rstest::rstest]
+    fn shared_contract_parser_rejects_non_positive_tick_values() {
+        let mut contract = base_contract("CON.F.US.MES.M26", "MESM26", true);
+        contract.tick_size = Decimal::ZERO;
+
+        let error = projectx_contract_to_instrument(&contract).expect_err("zero tick must fail");
+
+        assert!(error.to_string().contains("tick size must be positive"));
     }
 
     #[rstest::rstest]
@@ -560,10 +590,10 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn canonical_public_symbol_preserves_vendor_root_when_id_translation_differs() {
+    fn canonical_public_symbol_combines_vendor_root_with_authoritative_expiry() {
         let contract = base_contract("CON.F.US.EP.U25", "ESU5", true);
 
-        assert_eq!(canonical_projectx_public_symbol(&contract), "ESU5");
+        assert_eq!(canonical_projectx_public_symbol(&contract), "ESU25");
     }
 
     #[rstest::rstest]
@@ -578,6 +608,19 @@ mod tests {
             projectx_select_front_month_contract(&contracts, "MES").expect("front month");
 
         assert_eq!(selected.id.to_string(), "CON.F.US.MES.M26");
+    }
+
+    #[rstest::rstest]
+    fn front_month_selection_uses_canonical_alias_root_across_decade_boundary() {
+        let contracts = vec![
+            base_contract("CON.F.US.EP.H30", "ESH0", true),
+            base_contract("CON.F.US.EP.Z29", "ESZ9", true),
+        ];
+
+        let selected = projectx_select_front_month_contract(&contracts, "ES").expect("front month");
+
+        assert_eq!(selected.id.to_string(), "CON.F.US.EP.Z29");
+        assert_eq!(canonical_projectx_public_symbol(&selected), "ESZ29");
     }
 
     #[rstest::rstest]
@@ -611,7 +654,8 @@ mod tests {
             ProjectXEnvironment::TopstepX,
             "test-user",
             "test-key",
-        );
+        )
+        .expect("valid ProjectX execution config");
         let cache = Rc::new(RefCell::new(Cache::default()));
 
         let client = factory
@@ -640,7 +684,8 @@ mod tests {
             ProjectXEnvironment::TopstepX,
             "test-user",
             "test-key",
-        );
+        )
+        .expect("valid ProjectX execution config");
         let core = ExecutionClientCore::new(
             config.trader_id,
             ClientId::from("PROJECTX"),
@@ -657,6 +702,32 @@ mod tests {
         assert_eq!(
             core.account_id,
             AccountId::from("PROJECTX-PRAC-V2-64413-98419885"),
+        );
+    }
+
+    #[rstest::rstest]
+    fn execution_client_factory_rejects_non_margin_account_type() {
+        let factory = ProjectXExecutionClientFactory::new();
+        let mut config = ProjectXExecClientConfig::new(
+            TraderId::from("TRADER-001"),
+            AccountId::from("PRAC-V2-64413-98419885"),
+            ProjectXEnvironment::TopstepX,
+            "test-user",
+            "test-key",
+        )
+        .expect("valid ProjectX execution config");
+        config.account_type = AccountType::Cash;
+        let cache = Rc::new(RefCell::new(Cache::default()));
+
+        let result = factory.create("PROJECTX-TEST", &config, cache.into());
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .expect("cash account type should be rejected")
+                .to_string()
+                .contains("require AccountType::Margin")
         );
     }
 }

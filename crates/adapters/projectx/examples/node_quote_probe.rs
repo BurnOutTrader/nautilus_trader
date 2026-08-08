@@ -165,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let live = env_bool("PROJECTX_MARKET_DATA_LIVE", false);
     let run_secs = env_u64("PROJECTX_CAPTURE_SECONDS", DEFAULT_CAPTURE_SECONDS);
-    let trader_id = trader_id_from_env("PROJECTX_TRADER_ID", "RUST-PROJECTX-001");
+    let trader_id = trader_id_from_env("PROJECTX_TRADER_ID", "RUST-PROJECTX-001")?;
     let instrument_id = resolve_instrument_id_from_env(live).await?;
     let client_id = projectx_client_id();
     let data_config = data_config_from_env()?;

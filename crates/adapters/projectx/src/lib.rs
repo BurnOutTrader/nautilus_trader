@@ -21,6 +21,12 @@
 //! - Thin PyO3 bindings and factory/config exports for the v2 Python-on-Rust path.
 //!
 //! Current adapter planning and verification notes live in `devplan.md`.
+//!
+//! # Feature Flags
+//!
+//! - `high-precision`: Enables 128-bit fixed-point Nautilus value types and is enabled by default.
+//! - `python`: Enables the thin Python projection through [PyO3](https://pyo3.rs).
+//! - `extension-module`: Builds the Python extension module and enables `python`.
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]

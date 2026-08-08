@@ -15,9 +15,12 @@
 use std::fmt::Debug;
 
 use crate::common::enums::ProjectXEnvironment;
+use zeroize::ZeroizeOnDrop;
 
-#[derive(Clone)]
+/// ProjectX credentials whose secret strings are erased when dropped.
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct ProjectXCredential {
+    #[zeroize(skip)]
     pub environment: ProjectXEnvironment,
     pub user_name: String,
     pub api_key: String,
@@ -45,5 +48,26 @@ impl Debug for ProjectXCredential {
             .field("user_name", &"<redacted>")
             .field("api_key", &"<redacted>")
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProjectXCredential;
+    use crate::common::enums::ProjectXEnvironment;
+
+    #[rstest::rstest]
+    fn debug_redacts_projectx_credentials() {
+        let credential = ProjectXCredential::new(
+            ProjectXEnvironment::TopstepX,
+            "sensitive-user",
+            "sensitive-api-key",
+        );
+
+        let debug = format!("{credential:?}");
+
+        assert!(!debug.contains("sensitive-user"));
+        assert!(!debug.contains("sensitive-api-key"));
+        assert_eq!(debug.matches("<redacted>").count(), 2);
     }
 }

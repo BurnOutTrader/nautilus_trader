@@ -17,12 +17,27 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "Makefile"
-      - "pyproject.toml"
-      - "uv.lock"
+      - "python/pyproject.toml"
+      - "python/uv.lock"
       - "scripts/ci/**"
       - "crates/adapters/projectx/**"
-      - "crates/pyo3/Cargo.toml"
-      - "crates/pyo3/src/lib.rs"
+      - "crates/backtest/**"
+      - "crates/common/**"
+      - "crates/core/**"
+      - "crates/data/**"
+      - "crates/execution/**"
+      - "crates/indicators/**"
+      - "crates/live/**"
+      - "crates/model/**"
+      - "crates/persistence/**"
+      - "crates/portfolio/**"
+      - "crates/pyo3/**"
+      - "crates/risk/**"
+      - "crates/serialization/**"
+      - "crates/system/**"
+      - "crates/testkit/**"
+      - "crates/trading/**"
+      - "python/generate_stubs.py"
       - "python/nautilus_trader/adapters/projectx/**"
       - "examples/backtest/projectx/**"
       - "examples/live/projectx/**"
@@ -37,12 +52,27 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "Makefile"
-      - "pyproject.toml"
-      - "uv.lock"
+      - "python/pyproject.toml"
+      - "python/uv.lock"
       - "scripts/ci/**"
       - "crates/adapters/projectx/**"
-      - "crates/pyo3/Cargo.toml"
-      - "crates/pyo3/src/lib.rs"
+      - "crates/backtest/**"
+      - "crates/common/**"
+      - "crates/core/**"
+      - "crates/data/**"
+      - "crates/execution/**"
+      - "crates/indicators/**"
+      - "crates/live/**"
+      - "crates/model/**"
+      - "crates/persistence/**"
+      - "crates/portfolio/**"
+      - "crates/pyo3/**"
+      - "crates/risk/**"
+      - "crates/serialization/**"
+      - "crates/system/**"
+      - "crates/testkit/**"
+      - "crates/trading/**"
+      - "python/generate_stubs.py"
       - "python/nautilus_trader/adapters/projectx/**"
       - "examples/backtest/projectx/**"
       - "examples/live/projectx/**"
@@ -84,7 +114,7 @@ jobs:
         run: cargo clippy -p projectx-nt --all-targets --all-features -- -D warnings
 
       - name: Run Rust tests
-        run: make cargo-test-crate-projectx-nt NEXTEST_PROFILE=ci
+        run: make cargo-test-crate-projectx-nt-all-targets NEXTEST_PROFILE=ci
 
   python:
     name: python
@@ -96,6 +126,7 @@ jobs:
       BUILD_MODE: debug
       CARGO_TARGET_DIR: ${{ github.workspace }}/target-adapter-projectx-py
       RUST_BACKTRACE: 1
+      UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/.venv
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -112,18 +143,21 @@ jobs:
           rust-cache-on-failure: "false"
 
       - name: Sync Python dependencies
-        run: uv sync --all-groups --all-extras --inexact --no-install-package nautilus_trader
+        run: cd python && VIRTUAL_ENV= uv sync --all-groups --all-extras --inexact --no-install-package nautilus_trader
 
       - name: Lint adapter Python paths
         run: >-
-          uv run --no-sync ruff check
-          python/nautilus_trader/adapters/projectx
-          examples/backtest/projectx
-          examples/live/projectx
-          python/tests/unit/adapters/projectx
+          cd python && uv run --no-sync ruff check
+          nautilus_trader/adapters/projectx
+          ../examples/backtest/projectx
+          ../examples/live/projectx
+          tests/unit/adapters/projectx
 
       - name: Build debug extension
         run: make build-debug
+
+      - name: Check generated binding drift
+        run: make check-generated-drift
 
       - name: Run adapter Python tests
         run: >-

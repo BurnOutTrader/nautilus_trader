@@ -7968,10 +7968,10 @@ dependencies = [
  "ahash 0.8.12",
  "anyhow",
  "async-trait",
+ "bon",
  "chrono",
  "dashmap",
  "dotenvy",
- "futures-util",
  "jiff",
  "log",
  "nautilus-backtest",
@@ -7980,7 +7980,6 @@ dependencies = [
  "nautilus-indicators",
  "nautilus-live",
  "nautilus-model",
- "nautilus-network",
  "nautilus-persistence",
  "nautilus-system",
  "nautilus-testkit",
@@ -7990,7 +7989,6 @@ dependencies = [
  "pyo3",
  "pyo3-async-runtimes",
  "pyo3-stub-gen",
- "reqwest 0.13.4",
  "rstest",
  "rust_decimal",
  "serde",
@@ -7998,8 +7996,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
- "tokio-tungstenite 0.30.0",
  "ustr",
+ "zeroize",
 ]
 
 [[package]]

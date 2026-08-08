@@ -43,26 +43,34 @@ execution, historical bar requests, and reconciliation with reconnect handling.
 
 > [!NOTE]
 >
-> Local Python validation for this adapter expects the workflow environment to
-> be synced first:
-> `uv sync --all-groups --all-extras --inexact --no-install-package nautilus_trader`.
-> After that, run adapter-local checks with `uv run --no-sync ...` so pytest and
-> Ruff use the same dependency set as the project workflows.
+> From the repository root, sync the Python project into the same root virtual environment used by
+> the extension build:
+>
+> ```bash
+> UV_PROJECT_ENVIRONMENT="$PWD/.venv" \
+>   uv sync --project python --all-groups --all-extras --inexact \
+>   --no-install-package nautilus_trader
+> ```
+>
+> After that, run adapter-local checks with
+> `UV_PROJECT_ENVIRONMENT="$PWD/.venv" uv run --project python --no-sync ...` so pytest and Ruff use
+> the same dependency set as the project workflows.
 
 ## Overview
 
 The ProjectX adapter includes:
 
 - `ProjectXHttpClient`: low-level authenticated HTTP transport.
-- `ProjectXWsClient`: low-level SignalR/WebSocket transport.
 - `ProjectXDataClientFactory`: Rust-native live data client factory for `LiveNode`.
-- `ProjectXLiveDataClientFactory`: thin Python high-level data factory for `BacktestNode` download/catalog flows.
-- `ProjectXLiveDataClientConfig`: Python high-level config for `BacktestNode` download/catalog flows.
 - `ProjectXExecutionClientFactory`: live execution client factory for `LiveNode`.
 - `ProjectXDataClientConfig` and `ProjectXExecClientConfig`: Rust/PyO3 client configs for the live runtime path.
+- `download_bars_to_catalog(...)` and `download_bars_to_catalog_async(...)`: typed historical
+  download helpers backed by `ProjectXHttpClient` and `ParquetDataCatalog`.
 
-The adapter package re-exports those generic config names directly from the compiled PyO3 module.
-They are the live-runtime contract; the `ProjectXLiveDataClientConfig` wrapper remains helper-only.
+The adapter package re-exports the generic config and factory names directly from the compiled
+PyO3 module. They are the live-runtime contract.
+The raw SignalR client is deliberately Rust-only: live clients own and continuously drain its
+event stream so Python callers cannot create an unconsumed market-data queue.
 
 ## Examples
 
@@ -133,28 +141,32 @@ parameter.
 
 ## Front-month helper
 
-`ProjectXHttpClient.resolve_front_month_contract_json(product_root, live=False)` resolves a
-front-month contract from the ProjectX available-contract set for a given product root, preferring
-`activeContract=true` entries and then nearest expiry when multiple contracts match.
+`await ProjectXHttpClient.resolve_front_month_instrument(product_root, live=False)` resolves a
+front-month Nautilus futures instrument from the ProjectX available-contract set for a given
+product root, preferring `activeContract=true` entries and then nearest expiry when multiple
+contracts match.
 
-The returned JSON payload is either a serialized contract object or `null` if no match is found.
+The call returns a typed `FuturesContract` and raises when no matching contract is available. See
+`examples/live/projectx/projectx_front_month_resolver.py` for a JSON-friendly reporting wrapper.
 
 ## Instrument snapshot helper
 
-`ProjectXHttpClient.instrument_snapshot_json(live=False, active_only=False, product_root=None)`
-returns a JSON array of normalized instrument rows with fields such as:
+`await ProjectXHttpClient.available_instruments(live=False, active_only=False, product_root=None)`
+returns typed Nautilus futures instruments. Their `id`, price increment, and `info` metadata expose
+the canonical instrument ID and raw provider metadata. The snapshot example writes JSON fields such
+as:
 
-- `instrumentId` (for example `MESM26.PROJECTX`)
+- `id` (for example `MESM26.PROJECTX`)
 - `publicSymbol`
-- `contractId`
 - `name`
 - `symbolId`
 - `tickSize`
 - `tickValue`
 - `activeContract`
 
-The `projectx_instrument_snapshot.py` example writes this snapshot to disk for reuse in live
-configuration and research workflows.
+The raw contract ID remains available as `instrument.info["projectx_contract_id"]`. The
+`projectx_instrument_snapshot.py` example converts the typed objects to JSON and writes the snapshot
+to disk for reuse in live configuration and research workflows.
 
 This JSON snapshot helper is supplemental only. Canonical Nautilus persistence for ProjectX
 instruments should be the normal catalog/instrument path used by the backtest and live capture
@@ -209,9 +221,9 @@ ProjectX historical backtests follow the standard Nautilus high-level path:
 The helper scripts above demonstrate the full flow:
 
 - `examples/backtest/projectx/projectx_download_bars.py`
-  uses `download_bars_to_catalog(...)`, which runs `BacktestNode.setup_download_engine(...)`
-  with `ProjectXLiveDataClientFactory`, requests both the instrument definition and historical
-  bars, and writes them to `<NAUTILUS_PATH>/catalog`
+  uses `download_bars_to_catalog(...)`, resolves the exact instrument through
+  `ProjectXHttpClient`, requests historical bars, and writes both through the typed
+  `ParquetDataCatalog` instrument/bar methods to `<NAUTILUS_PATH>/catalog`
 - `examples/backtest/projectx/projectx_backtest_high_level.py`
   reads the resulting catalog and runs a standard `BacktestNode` EMA-cross configuration
 
@@ -421,11 +433,8 @@ Edit the module-level constants in `projectx_validation_runner.py` for:
 `ProjectXHttpClient.available_instruments(live=False, active_only=False, product_root=None)`
 returns PyO3 Nautilus instrument objects built from ProjectX available-contract metadata.
 
-`ProjectXInstrumentProvider` wraps this helper with standard provider loading surfaces:
-
-- `load_all` / `load_all_async`
-- `load_ids` / `load_ids_async`
-- `load` / `load_async`
+`ProjectXInstrumentProvider` is a small async wrapper with `load_all_async(filters=...)` and
+`get_all()` surfaces.
 
 The provider accepts filters:
 
@@ -440,7 +449,6 @@ The provider accepts filters:
 - `name`
 - `symbolId`
 - `tickSize`
-- `tickValue`
 - `activeContract`
 
 Edit the module-level constants in `projectx_contract_parity_check.py`:
@@ -452,26 +460,26 @@ Edit the module-level constants in `projectx_contract_parity_check.py`:
 
 ## Product support
 
-| Product Type      | Data Feed | Trading | Notes                               |
-|-------------------|-----------|---------|-------------------------------------|
+| Product Type      | Data Feed | Trading | Notes                                 |
+| ----------------- | --------- | ------- | ------------------------------------- |
 | Futures contracts | ✓         | ✓       | Contract symbols map to `*.PROJECTX`. |
 
 ## Data capability
 
 ### Subscriptions (real-time)
 
-| Data Type         | Supported | Notes |
-|-------------------|-----------|-------|
-| `QuoteTick`       | ✓         | `SubscribeContractQuotes` |
-| `TradeTick`       | ✓         | `SubscribeContractTrades` |
-| `OrderBookDeltas` | ✓         | `SubscribeContractMarketDepth` |
+| Data Type         | Supported | Notes                                                                                                                   |
+| ----------------- | --------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `QuoteTick`       | ✓         | `SubscribeContractQuotes`                                                                                               |
+| `TradeTick`       | ✓         | `SubscribeContractTrades`                                                                                               |
+| `OrderBookDeltas` | ✓         | `SubscribeContractMarketDepth`                                                                                          |
 | `Bar`             | -         | Venue‑native streaming bars are not currently exposed by ProjectX WebSocket; use INTERNAL bars for live bar strategies. |
 
 ### Requests (historical)
 
-| Data Type | Supported | Notes |
-|----------|-----------|-------|
-| `Bar`    | ✓         | Maps to `/api/History/retrieveBars`. |
+| Data Type | Supported | Notes                                |
+| --------- | --------- | ------------------------------------ |
+| `Bar`     | ✓         | Maps to `/api/History/retrieveBars`. |
 
 Bar requests are built from standard Nautilus `BarType` values. The adapter derives the ProjectX
 request shape from that bar type, so normal `request_bars(...)` calls do not need venue-specific
@@ -483,15 +491,15 @@ bars after startup.
 
 ## Orders capability
 
-| Capability                       | Supported | Notes |
-|----------------------------------|-----------|-------|
-| Submit `MARKET` / `LIMIT`        | ✓         | Quantity must be whole contracts. |
-| Submit stop orders               | ✓         | `STOP_MARKET`, `STOP_LIMIT` |
-| Submit trailing stop orders      | ✓         | `TRAILING_STOP_MARKET`, `TRAILING_STOP_LIMIT` |
-| Modify order                     | ✓         | Via ProjectX modify endpoint. |
-| Cancel order                     | ✓         | Via ProjectX cancel endpoint. |
-| Reconciliation                   | ✓         | Startup + reconnect with monotonic diff emission. |
-| Position close surface           | ✓         | Use standard `close_position(...)` / `close_all_positions(...)`. |
+| Capability                        | Supported | Notes                                                                                    |
+| --------------------------------- | --------- | ---------------------------------------------------------------------------------------- |
+| Submit `MARKET` / `LIMIT`         | ✓         | Quantity must be whole contracts; GTC only.                                              |
+| Submit `STOP_MARKET`              | ✓         | Requires a trigger price; GTC only.                                                      |
+| Submit stop-limit/trailing orders | -         | Rejected before `OrderSubmitted`; upstream v2 placement cannot preserve these semantics. |
+| Modify order                      | ✓         | Via ProjectX modify endpoint.                                                            |
+| Cancel order                      | ✓         | Via ProjectX cancel endpoint.                                                            |
+| Reconciliation                    | ✓         | Startup + reconnect with monotonic diff emission.                                        |
+| Position close surface            | ✓         | Use standard `close_position(...)` / `close_all_positions(...)`.                         |
 
 ## Live node setup
 
@@ -501,14 +509,14 @@ with instantiated ProjectX factory objects rather than the pure-Python `TradingN
 ProjectX is pinned to Topstep, so no environment value is required in config.
 
 ```python
-from nautilus_trader.adapters.projectx import PROJECTX
 from nautilus_trader.adapters.projectx import ProjectXDataClientConfig
 from nautilus_trader.adapters.projectx import ProjectXDataClientFactory
 from nautilus_trader.adapters.projectx import ProjectXExecClientConfig
 from nautilus_trader.adapters.projectx import ProjectXExecutionClientFactory
-from nautilus_trader.core.nautilus_pyo3.common import Environment
-from nautilus_trader.core.nautilus_pyo3.model import TraderId
+from nautilus_trader.common import Environment
 from nautilus_trader.live import LiveNode
+from nautilus_trader.model import AccountType
+from nautilus_trader.model import TraderId
 
 trader_id = TraderId("TRADER-001")
 
@@ -531,7 +539,7 @@ node = (
             account_id="PROJECTX-12345",
             user_name=None,  # Uses PROJECTX_USERNAME
             api_key=None,    # Uses PROJECTX_API_KEY
-            account_type="margin",
+            account_type=AccountType.MARGIN,
         ),
     )
     .build()
@@ -562,8 +570,8 @@ The exec tester is now a bounded smoke test rather than a manual `Ctrl-C` flow. 
 `LiveNode`, waits for either a terminal order outcome or a startup/timeout failure, then stops and
 prints a `Status` summary.
 
-During Ctrl-C / stop, the example now skips redundant cancel attempts for IOC and inflight orders.
-This reduces cancel-rejected shutdown noise when a venue-accepted IOC is already resolving.
+During Ctrl-C / stop, the example skips redundant cancel attempts for orders whose submission is
+still in flight. This reduces cancel-rejected shutdown noise while venue state is resolving.
 
 Relevant execution-smoke environment variables:
 
@@ -584,48 +592,51 @@ those fields explicitly.
 Use the standard Nautilus position-close APIs for live/backtest parity:
 
 ```python
-from nautilus_trader.model.enums import TimeInForce
+from nautilus_trader.model import TimeInForce
 
 # Close a single position
 self.close_position(
     position=position,
     client_id=client_id,
-    time_in_force=TimeInForce.IOC,
-    reduce_only=True,
+    time_in_force=TimeInForce.GTC,
+    reduce_only=False,
 )
 
 # Close all open positions for an instrument
 self.close_all_positions(
     instrument_id=instrument_id,
     client_id=client_id,
-    time_in_force=TimeInForce.IOC,
-    reduce_only=True,
+    time_in_force=TimeInForce.GTC,
+    reduce_only=False,
 )
 ```
 
 For a partial reduction, submit a standard market order with the desired reduction size against the
 existing `position_id`.
 
+ProjectX v2 does not expose time-in-force or reduce-only fields on its placement request. The
+adapter therefore supports GTC orders only and denies reduce-only requests before emitting
+`OrderSubmitted`. Position-close helpers use an ordinary opposing market order and callers must
+account for the resulting race risk if the position can change concurrently.
+
 ## Historical bars to Parquet
 
 Use the ProjectX download helpers for the supported historical-catalog flow:
 
 1. `examples/backtest/projectx/projectx_download_bars.py`
-   runs `BacktestNode.setup_download_engine(...)` with `ProjectXLiveDataClientFactory` and
-   requests both the instrument definition and historical bars into a Parquet catalog.
+   uses the async-capable ProjectX HTTP helper and typed `ParquetDataCatalog.write_instruments` /
+   `write_bars` methods to store the instrument definition and historical bars.
 2. `examples/live/projectx/notebooks/projectx_historical_bars_to_parquet.py`
    shows the same bar-request path from a research notebook.
 
-Both examples follow the standard `ParquetDataCatalog.from_env()` layout: set `NAUTILUS_PATH` to
-the parent workspace and the ProjectX catalog will live at `<NAUTILUS_PATH>/catalog`.
+Both examples use the standard catalog layout: set `NAUTILUS_PATH` to the parent workspace and the
+ProjectX catalog will live at `<NAUTILUS_PATH>/catalog`.
 
 For the current helper configuration and the exact catalog object types, see
 [ProjectX data workflows](projectx_data_workflows.md).
 
-`ProjectXLiveDataClientConfig(market_data_live=...)` controls the default `live` flag used for
-both contract catalog loading and historical bar requests in the high-level download path. The
-underlying wrapper translates that config into the raw PyO3 `ProjectXDataClientConfig` used by the
-Rust HTTP client surface.
+The download helper's `market_data_live=...` argument controls the ProjectX contract and history
+source. It is explicit and independent of the `ProjectXDataClientConfig` used by a live node.
 
 Downloaded ProjectX instruments are serialized into the catalog using the same canonical Nautilus
 symbology used by strategies, for example `MNQM26.PROJECTX` with raw symbol `MNQM26`.
@@ -634,21 +645,23 @@ symbology used by strategies, for example `MNQM26.PROJECTX` with raw symbol `MNQ
 
 The ProjectX adapter is a live adapter. A typical research workflow is:
 
-1. Download bars live via `request_bars(..., update_catalog=True)`.
+1. Download instruments and bars with `download_bars_to_catalog(...)` (or its async variant).
 2. Run backtests from the resulting Parquet catalog.
 
 ```python
-from nautilus_trader.config import BacktestDataConfig
-from nautilus_trader.model.data import Bar
-from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.backtest import BacktestDataConfig
+from nautilus_trader.model import BarType
+from nautilus_trader.model import InstrumentId
 
 
+instrument_id = InstrumentId.from_str("MESM26.PROJECTX")
+bar_type = BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL")
 data_config = BacktestDataConfig(
     catalog_path="./catalog_projectx",
-    data_cls=Bar,
-    instrument_id=InstrumentId.from_str("MESM26.PROJECTX"),
-    bar_spec="1-MINUTE-LAST",
-    start_time="2026-04-03T05:00:00Z",
-    end_time="2026-04-03T05:10:00Z",
+    data_type="Bar",
+    instrument_id=instrument_id,
+    bar_spec=bar_type.spec,
+    start_time=1_775_192_400_000_000_000,
+    end_time=1_775_193_000_000_000_000,
 )
 ```

@@ -27,12 +27,14 @@
 
 use std::{
     path::PathBuf,
-    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
 };
+
+#[path = "support/input.rs"]
+mod input;
 
 use nautilus_backtest::{
     config::{BacktestDataConfig, BacktestRunConfig, BacktestVenueConfig, NautilusDataType},
@@ -42,7 +44,7 @@ use nautilus_common::actor::DataActor;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, BarSpecification, BarType},
-    enums::{AccountType, AggregationSource, BarAggregation, BookType, OmsType, PriceType},
+    enums::{AccountType, AggregationSource, BookType, OmsType},
     identifiers::{InstrumentId, StrategyId},
     instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
@@ -62,18 +64,7 @@ fn env_u64(key: &str, default: u64) -> u64 {
 
 fn parse_bar_spec_env() -> anyhow::Result<BarSpecification> {
     let raw = std::env::var("PROJECTX_BAR_SPEC").unwrap_or_else(|_| "1-MINUTE-LAST".to_string());
-    let parts: Vec<_> = raw.split('-').collect();
-
-    if parts.len() != 3 {
-        anyhow::bail!("Invalid PROJECTX_BAR_SPEC '{raw}', expected STEP-AGGREGATION-PRICE_TYPE");
-    }
-
-    let step = parts[0]
-        .parse::<usize>()
-        .map_err(|_| anyhow::anyhow!("Invalid bar step in PROJECTX_BAR_SPEC: {}", parts[0]))?;
-    let aggregation = BarAggregation::from_str(parts[1])?;
-    let price_type = PriceType::from_str(parts[2])?;
-    Ok(BarSpecification::new(step, aggregation, price_type))
+    input::parse_bar_specification("PROJECTX_BAR_SPEC", &raw)
 }
 
 fn example_root_from_env() -> anyhow::Result<PathBuf> {

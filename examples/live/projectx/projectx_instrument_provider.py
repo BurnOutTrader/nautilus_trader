@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import asyncio
 
-from nautilus_trader.adapters.projectx import ProjectXConfig
-from nautilus_trader.adapters.projectx import ProjectXHttpClient
-from nautilus_trader.adapters.projectx import ProjectXInstrumentProvider
-from nautilus_trader.adapters.projectx import load_projectx_env
-
+from nautilus_trader.adapters.projectx import (
+    ProjectXConfig,
+    ProjectXHttpClient,
+    ProjectXInstrumentProvider,
+    load_projectx_env,
+)
 
 load_projectx_env()
 
@@ -37,7 +38,9 @@ async def main() -> None:
         product_root=PRODUCT_ROOT,
         active_only=ACTIVE_ONLY,
     )
-    print(f"Loaded {result['count']} ProjectX instruments for root={PRODUCT_ROOT} live={LIVE}")
+    print(
+        f"Loaded {result['count']} ProjectX instruments for root={PRODUCT_ROOT} live={LIVE}"
+    )
 
     for instrument_id in result["instrument_ids"]:
         print(instrument_id)
@@ -67,7 +70,10 @@ async def load_provider_snapshot(
         )
 
         loaded = provider.get_all()
-        instrument_ids = [item.value for item in sorted(loaded, key=lambda item: item.value)]
+        instrument_ids = [
+            instrument.id.value
+            for instrument in sorted(loaded, key=lambda item: item.id.value)
+        ]
         return {
             "live": live,
             "product_root": (product_root or "").strip().upper() or None,

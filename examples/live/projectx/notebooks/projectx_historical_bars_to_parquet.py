@@ -1,4 +1,5 @@
 # ---
+# ruff: noqa: F704, PLE1142 -- Jupyter supports top-level await in notebook cells.
 # jupyter:
 #   jupytext:
 #     formats: py:percent
@@ -34,19 +35,17 @@
 
 # %%
 import os
-from datetime import UTC
-from datetime import datetime
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from nautilus_trader.adapters.projectx import build_external_bar_type
-from nautilus_trader.adapters.projectx import download_bars_to_catalog
-from nautilus_trader.adapters.projectx import load_projectx_env
-from nautilus_trader.config import BacktestDataConfig
-from nautilus_trader.model import Bar
+from nautilus_trader.adapters.projectx import (
+    build_external_bar_type,
+    download_bars_to_catalog_async,
+    load_projectx_env,
+)
+from nautilus_trader.backtest import BacktestDataConfig
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.persistence import ParquetDataCatalog
-
 
 load_projectx_env()
 
@@ -90,6 +89,14 @@ def default_request_window() -> tuple[str, str]:
     )
 
 
+def iso8601_to_unix_nanos(value: str) -> int:
+    timestamp = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+    delta = timestamp - datetime(1970, 1, 1, tzinfo=UTC)
+    return (
+        delta.days * 86_400 + delta.seconds
+    ) * 1_000_000_000 + delta.microseconds * 1_000
+
+
 request_start, request_end = default_request_window()
 request_limit = 500
 
@@ -98,7 +105,7 @@ request_limit = 500
 # ## download bars into catalog
 
 # %%
-result = download_bars_to_catalog(
+result = await download_bars_to_catalog_async(
     catalog_path=catalog_path,
     instrument_id=instrument_id,
     bar_spec=bar_spec,
@@ -117,10 +124,10 @@ print(f"Bars stored: {result.bar_count}")
 
 # %%
 catalog = ParquetDataCatalog(str(catalog_path))
-bars = catalog.bars(
-    bar_types=[str(bar_type)],
-    start=request_start,
-    end=request_end,
+bars = catalog.query_bars(
+    identifiers=[str(bar_type)],
+    start=iso8601_to_unix_nanos(request_start),
+    end=iso8601_to_unix_nanos(request_end),
 )
 print(f"Bars loaded back from catalog: {len(bars)}")
 
@@ -134,9 +141,9 @@ parquet_files[:5]
 # %%
 backtest_data_config = BacktestDataConfig(
     catalog_path=str(catalog_path),
-    data_cls=Bar,
+    data_type="Bar",
     instrument_id=instrument_id,
-    bar_spec=bar_spec,
-    start_time=request_start,
-    end_time=request_end,
+    bar_spec=bar_type.spec,
+    start_time=iso8601_to_unix_nanos(request_start),
+    end_time=iso8601_to_unix_nanos(request_end),
 )

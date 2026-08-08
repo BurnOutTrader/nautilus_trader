@@ -17,17 +17,17 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import dataclass, field
 from typing import Any
 
-from nautilus_trader._libnautilus.model import BookType
-from nautilus_trader._libnautilus.model import ClientId
-from nautilus_trader._libnautilus.model import InstrumentId
-from nautilus_trader._libnautilus.model import StrategyId
-from nautilus_trader._libnautilus.model import TimeInForce
-from nautilus_trader._libnautilus.trading import Strategy
-from nautilus_trader._libnautilus.trading import StrategyConfig
+from nautilus_trader._libnautilus.model import (
+    BookType,
+    ClientId,
+    InstrumentId,
+    StrategyId,
+    TimeInForce,
+)
+from nautilus_trader._libnautilus.trading import Strategy, StrategyConfig
 
 
 @dataclass
@@ -225,8 +225,8 @@ class ProjectXDataProbeStrategyConfig(StrategyConfig):
             strategy_id=parsed_strategy_id,
             external_order_claims=[parsed_instrument_id],
             manage_stop=False,
-            market_exit_time_in_force=TimeInForce.IOC,
-            market_exit_reduce_only=True,
+            market_exit_time_in_force=TimeInForce.GTC,
+            market_exit_reduce_only=False,
             log_events=log_events,
             log_commands=log_commands,
         )
@@ -245,7 +245,6 @@ class ProjectXDataProbeStrategyConfig(StrategyConfig):
 class ProjectXDataProbeStrategy(Strategy):
     def __init__(self, config: ProjectXDataProbeStrategyConfig):
         super().__init__(config)
-        self.config = config
 
     def on_start(self):
         _mark_started(self.config.state_key)
@@ -306,25 +305,25 @@ class ProjectXDataProbeStrategy(Strategy):
         _mark_instrument(self.config.state_key)
 
         if self.config.log_data:
-            self._info(f"Instrument: {instrument}")
+            self.log.info(f"Instrument: {instrument}")
 
     def on_quote(self, tick):
         _mark_quote(self.config.state_key)
 
         if self.config.log_data:
-            self._info(f"Quote: {tick}")
+            self.log.info(f"Quote: {tick}")
 
     def on_trade(self, tick):
         _mark_trade(self.config.state_key)
 
         if self.config.log_data:
-            self._info(f"Trade: {tick}")
+            self.log.info(f"Trade: {tick}")
 
     def on_book_deltas(self, deltas):
         _mark_book_deltas(self.config.state_key)
 
         if self.config.log_data:
-            self._info(f"Book deltas: {deltas}")
+            self.log.info(f"Book deltas: {deltas}")
 
     def on_reset(self):
         _append_lifecycle(self.config.state_key, "reset")

@@ -33,36 +33,41 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from examples.live.live_node_run_helpers import schedule_live_node_interrupt
+_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+sys.path[:] = [_REPO_ROOT, *(path for path in sys.path if path != _REPO_ROOT)]
 
-from nautilus_trader._libnautilus.common import Environment
-from nautilus_trader._libnautilus.common import LogColor
-from nautilus_trader._libnautilus.common import LoggerConfig
+from nautilus_trader._libnautilus.common import Environment, LogColor, LoggerConfig
 from nautilus_trader._libnautilus.core import UUID4
-from nautilus_trader._libnautilus.model import AccountId
-from nautilus_trader._libnautilus.model import AggregationSource
-from nautilus_trader._libnautilus.model import Bar
-from nautilus_trader._libnautilus.model import BarType
-from nautilus_trader._libnautilus.model import ClientId
-from nautilus_trader._libnautilus.model import ClientOrderId
-from nautilus_trader._libnautilus.model import InstrumentId
-from nautilus_trader._libnautilus.model import MarketOrder
-from nautilus_trader._libnautilus.model import OrderSide
-from nautilus_trader._libnautilus.model import Quantity
-from nautilus_trader._libnautilus.model import StrategyId
-from nautilus_trader._libnautilus.model import TimeInForce
-from nautilus_trader._libnautilus.model import TraderId
-from nautilus_trader._libnautilus.trading import Strategy
-from nautilus_trader._libnautilus.trading import StrategyConfig
-from nautilus_trader.adapters.projectx import PROJECTX_CLIENT_ID
-from nautilus_trader.adapters.projectx import ProjectXDataClientConfig
-from nautilus_trader.adapters.projectx import ProjectXDataClientFactory
-from nautilus_trader.adapters.projectx import ProjectXExecClientConfig
-from nautilus_trader.adapters.projectx import ProjectXExecutionClientFactory
-from nautilus_trader.adapters.projectx import load_projectx_env
-from nautilus_trader.config import LiveDataEngineConfig
+from nautilus_trader._libnautilus.model import (
+    AccountId,
+    AccountType,
+    AggregationSource,
+    Bar,
+    BarType,
+    ClientId,
+    ClientOrderId,
+    InstrumentId,
+    MarketOrder,
+    OrderSide,
+    Quantity,
+    StrategyId,
+    TimeInForce,
+    TraderId,
+)
+from nautilus_trader._libnautilus.trading import Strategy, StrategyConfig
+from nautilus_trader.adapters.projectx import (
+    PROJECTX_CLIENT_ID,
+    ProjectXDataClientConfig,
+    ProjectXDataClientFactory,
+    ProjectXExecClientConfig,
+    ProjectXExecutionClientFactory,
+    load_projectx_env,
+)
+from nautilus_trader.config import LiveDataEngineConfig, LiveExecEngineConfig
+from nautilus_trader.core.datetime import unix_nanos_to_dt
 from nautilus_trader.live import LiveNode
 
+from examples.live.live_node_run_helpers import schedule_live_node_interrupt
 
 if TYPE_CHECKING:
     from nautilus_trader.config import ImportableStrategyConfig
@@ -104,13 +109,6 @@ _LOGGING_SPEC = (
     "nautilus_portfolio::portfolio=Warn;"
     "nautilus_trading::strategy=Warn"
 )
-
-
-def _ensure_repo_root_on_sys_path() -> None:
-    repo_root = str(Path(__file__).resolve().parents[3])
-
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
 
 
 def _build_example_logging() -> LoggerConfig:
@@ -191,7 +189,9 @@ class ProjectXEMACrossStrategyConfig(StrategyConfig):
         parsed_strategy_id = _coerce_strategy_id(strategy_id)
         parsed_bar_type = _coerce_bar_type(bar_type)
         parsed_trade_size = (
-            trade_size if isinstance(trade_size, Quantity) else Quantity.from_str(str(trade_size))
+            trade_size
+            if isinstance(trade_size, Quantity)
+            else Quantity.from_str(str(trade_size))
         )
 
         config = super().__new__(
@@ -199,8 +199,8 @@ class ProjectXEMACrossStrategyConfig(StrategyConfig):
             strategy_id=parsed_strategy_id,
             external_order_claims=[parsed_instrument_id],
             manage_stop=cleanup_on_stop,
-            market_exit_time_in_force=TimeInForce.IOC,
-            market_exit_reduce_only=True,
+            market_exit_time_in_force=TimeInForce.GTC,
+            market_exit_reduce_only=False,
             log_events=log_events,
             log_commands=log_commands,
         )
@@ -224,7 +224,6 @@ class ProjectXEMACrossStrategyConfig(StrategyConfig):
 class ProjectXEMACrossStrategy(Strategy):
     def __init__(self, config: ProjectXEMACrossStrategyConfig):
         super().__init__(config)
-        self.config = config
         self._started = False
         self._instrument_ready = False
         self._warmup_complete = not config.request_bars or config.warmup_minutes <= 0
@@ -385,7 +384,8 @@ class ProjectXEMACrossStrategy(Strategy):
             request_started_ns = self.clock.timestamp_ns()
             self.request_bars(
                 bar_type=self._warmup_bar_type,
-                start=request_started_ns - warmup_ns,
+                start=unix_nanos_to_dt(request_started_ns - warmup_ns),
+                end=unix_nanos_to_dt(request_started_ns),
                 client_id=self.config.client_id,
                 params={
                     "live": self.config.warmup_history_live,
@@ -408,7 +408,7 @@ class ProjectXEMACrossStrategy(Strategy):
             quantity=self.config.trade_size,
             init_id=UUID4(),
             ts_init=self.clock.timestamp_ns(),
-            time_in_force=TimeInForce.IOC,
+            time_in_force=TimeInForce.GTC,
             reduce_only=False,
             quote_quantity=False,
             tags=["projectx", "ema", "example"],
@@ -456,7 +456,13 @@ class ProjectXEMACrossStrategy(Strategy):
                 )
             return None
 
-        return ema_state[0], ema_state[1], portfolio_state, open_positions, active_orders
+        return (
+            ema_state[0],
+            ema_state[1],
+            portfolio_state,
+            open_positions,
+            active_orders,
+        )
 
     def _advance_ema(self, close: float) -> tuple[float, float] | None:
         self._bar_count += 1
@@ -519,16 +525,16 @@ class ProjectXEMACrossStrategy(Strategy):
                     "action": "close_position",
                     "account_id": self.config.account_id,
                     "client_id": self.config.client_id,
-                    "time_in_force": TimeInForce.IOC,
-                    "reduce_only": True,
+                    "time_in_force": TimeInForce.GTC,
+                    "reduce_only": False,
                 },
             )
             self._emit_structured("POSITION_REQUEST", payload, LogColor.YELLOW)
             self.close_position(
                 position=position,
                 client_id=self.config.client_id,
-                time_in_force=TimeInForce.IOC,
-                reduce_only=True,
+                time_in_force=TimeInForce.GTC,
+                reduce_only=False,
             )
 
     def _cancel_active_orders(self):
@@ -549,7 +555,7 @@ class ProjectXEMACrossStrategy(Strategy):
             self._emit_structured("ORDER_REQUEST", payload, LogColor.YELLOW)
 
         self.cancel_orders(
-            orders=orders,
+            client_order_ids=[order.client_order_id for order in orders],
             client_id=self.config.client_id,
         )
 
@@ -622,7 +628,9 @@ class ProjectXEMACrossStrategy(Strategy):
         color,
         level: str = "info",
     ) -> None:
-        self._emit_structured("ORDER_EVENT", self._object_payload(event), color, level=level)
+        self._emit_structured(
+            "ORDER_EVENT", self._object_payload(event), color, level=level
+        )
 
     def _log_position_event(self, event, *, color) -> None:
         self._emit_structured("POSITION_EVENT", self._object_payload(event), color)
@@ -656,7 +664,6 @@ def schedule_stop(node: LiveNode, run_seconds: int):
 
 
 def main() -> None:
-    _ensure_repo_root_on_sys_path()
     instrument_id = INSTRUMENT_ID
     bar_spec = BAR_SPEC.strip().upper()
     run_seconds = int(RUN_SECONDS)
@@ -679,8 +686,12 @@ def main() -> None:
                 time_bars_build_with_no_updates=False,
             ),
         )
-        .with_reconciliation(True)
-        .with_position_check_interval_secs(30.0)
+        .with_exec_engine_config(
+            LiveExecEngineConfig(
+                reconciliation=True,
+                position_check_interval_secs=30.0,
+            ),
+        )
         .with_timeout_connection(20)
         .with_timeout_reconciliation(10)
         .with_timeout_portfolio(10)
@@ -705,7 +716,7 @@ def main() -> None:
                 user_name=None,
                 api_key=None,
                 http_timeout_secs=30,
-                account_type="margin",
+                account_type=AccountType.MARGIN,
             ),
         )
         .build()

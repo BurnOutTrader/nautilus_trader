@@ -158,9 +158,9 @@ nautilus-kraken = { workspace = true, features = ["python"] }
 nautilus-lighter = { workspace = true, features = ["python"] }
 nautilus-okx = { workspace = true, features = ["python"] }
 nautilus-polymarket = { workspace = true, features = ["python"] }
-projectx-nt = { workspace = true, features = ["python"] }
 nautilus-sandbox = { workspace = true, features = ["python"] }
 nautilus-tardis = { workspace = true, features = ["python", "replay"] }
+projectx-nt = { workspace = true, features = ["python"] }
 rithmic-nt = { workspace = true, features = ["python"] }
 
 # local_dynamic_tls avoids exhausting static TLS space when the extension is dlopen'd

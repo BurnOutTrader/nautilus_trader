@@ -12,41 +12,5 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use crate::common::urls::ProjectXUrls;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ProjectXEnvironment {
-    TopstepX,
-    Custom(ProjectXUrls),
-}
-
-impl ProjectXEnvironment {
-    #[must_use]
-    pub fn urls(&self) -> ProjectXUrls {
-        match self {
-            Self::TopstepX => ProjectXUrls::topstep(),
-            Self::Custom(urls) => urls.clone(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProjectXHub {
-    User,
-    Market,
-}
-
-impl ProjectXHub {
-    #[must_use]
-    pub const fn path(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::Market => "market",
-        }
-    }
-
-    #[must_use]
-    pub const fn requires_authentication(self) -> bool {
-        matches!(self, Self::User)
-    }
-}
+#[path = "../examples/support/input.rs"]
+mod example_input;

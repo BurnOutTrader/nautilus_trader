@@ -28,6 +28,7 @@ from nautilus_trader._libnautilus.projectx import *  # noqa: F403 (undefined-loc
 from nautilus_trader.adapters.projectx.backtest import ProjectXCatalogDownloadResult
 from nautilus_trader.adapters.projectx.backtest import build_external_bar_type
 from nautilus_trader.adapters.projectx.backtest import download_bars_to_catalog
+from nautilus_trader.adapters.projectx.backtest import download_bars_to_catalog_async
 from nautilus_trader.adapters.projectx.providers import ProjectXInstrumentProvider
 
 
@@ -42,14 +43,12 @@ __all__ = [
     "ProjectXExecClientConfig",
     "ProjectXExecutionClientFactory",
     "ProjectXHttpClient",
-    "ProjectXHub",
     "ProjectXInstrumentProvider",
-    "ProjectXSubscription",
-    "ProjectXWsClient",
     "build_external_bar_type",
     "databento_to_projectx_adapter_symbol",
     "databento_to_projectx_contract_id",
     "download_bars_to_catalog",
+    "download_bars_to_catalog_async",
     "load_projectx_env",
     "projectx_to_databento_symbol",
     "projectx_to_databento_symbol_with_year",

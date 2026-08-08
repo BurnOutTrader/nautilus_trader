@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # mypy: disable-error-code="arg-type,index"
+
 # -------------------------------------------------------------------------------------------------
 #  Copyright (C) 2026 Kevin Monaghan. All rights reserved.
 #
@@ -15,34 +16,47 @@
 # -------------------------------------------------------------------------------------------------
 
 import os
+import sys
 import threading
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from examples.live.live_node_run_helpers import interrupt_live_node_run
-from examples.live.live_node_run_helpers import sleep_or_cancel
-from examples.live.live_node_run_helpers import start_live_node_monitor
-from examples.live.live_node_run_helpers import wait_for_event_or_cancel
-from examples.live.projectx.projectx_exec_strategy import clear_exec_state
-from examples.live.projectx.projectx_exec_strategy import register_exec_state
-from examples.live.projectx.projectx_exec_strategy import snapshot_exec_state
-from examples.live.projectx.projectx_exec_strategy import wait_for_exec_instrument
-from examples.live.projectx.projectx_exec_strategy import wait_for_exec_stop
-from examples.live.projectx.projectx_exec_strategy import wait_for_exec_terminal
+_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+sys.path[:] = [_REPO_ROOT, *(path for path in sys.path if path != _REPO_ROOT)]
 
 from nautilus_trader._libnautilus.common import Environment
-from nautilus_trader._libnautilus.model import OrderSide
-from nautilus_trader._libnautilus.model import TimeInForce
-from nautilus_trader._libnautilus.model import TraderId
-from nautilus_trader.adapters.projectx import PROJECTX_CLIENT_ID
-from nautilus_trader.adapters.projectx import ProjectXDataClientConfig
-from nautilus_trader.adapters.projectx import ProjectXDataClientFactory
-from nautilus_trader.adapters.projectx import ProjectXExecClientConfig
-from nautilus_trader.adapters.projectx import ProjectXExecutionClientFactory
-from nautilus_trader.adapters.projectx import load_projectx_env
+from nautilus_trader._libnautilus.model import (
+    AccountType,
+    OrderSide,
+    TimeInForce,
+    TraderId,
+)
+from nautilus_trader.adapters.projectx import (
+    PROJECTX_CLIENT_ID,
+    ProjectXDataClientConfig,
+    ProjectXDataClientFactory,
+    ProjectXExecClientConfig,
+    ProjectXExecutionClientFactory,
+    load_projectx_env,
+)
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import InstrumentId
 
+from examples.live.live_node_run_helpers import (
+    interrupt_live_node_run,
+    sleep_or_cancel,
+    start_live_node_monitor,
+    wait_for_event_or_cancel,
+)
+from examples.live.projectx.projectx_exec_strategy import (
+    clear_exec_state,
+    register_exec_state,
+    snapshot_exec_state,
+    wait_for_exec_instrument,
+    wait_for_exec_stop,
+    wait_for_exec_terminal,
+)
 
 if TYPE_CHECKING:
     from nautilus_trader.config import ImportableStrategyConfig
@@ -69,7 +83,7 @@ INSTRUMENT_ID = InstrumentId.from_str("MNQM26.PROJECTX")
 ACCOUNT_ID = _resolve_exec_account_id()
 ORDER_QTY = "1"
 ENTRY_SIDE = OrderSide.BUY
-ENTRY_TIME_IN_FORCE = TimeInForce.IOC
+ENTRY_TIME_IN_FORCE = TimeInForce.GTC
 FLATTEN_AFTER_FILL = True
 LOG_DATA = False
 READY_TIMEOUT_SECONDS = 30.0
@@ -92,7 +106,7 @@ def _build_node(instrument_id: InstrumentId, state_key: str) -> LiveNode:
         user_name=None,  # Uses PROJECTX_USERNAME
         api_key=None,  # Uses PROJECTX_API_KEY
         http_timeout_secs=30,
-        account_type="margin",
+        account_type=AccountType.MARGIN,
     )
 
     node = (
@@ -174,7 +188,7 @@ def _print_exec_summary(summary: dict[str, object]) -> None:
         print(f"Errors: {summary['errors']}")
 
 
-def run_exec_smoke(instrument_id: InstrumentId) -> dict[str, object]:  # noqa: C901
+def run_exec_smoke(instrument_id: InstrumentId) -> dict[str, object]:
     state_key = f"projectx-exec-smoke-{int(time.time() * 1_000_000)}"
     register_exec_state(
         key=state_key,
@@ -286,12 +300,16 @@ def run_exec_smoke(instrument_id: InstrumentId) -> dict[str, object]:  # noqa: C
 if __name__ == "__main__":
     instrument_id = INSTRUMENT_ID
     print("ProjectX environment: topstep (pinned)")
-    print("ProjectX accepts raw Topstep account labels and canonicalizes them internally.")
+    print(
+        "ProjectX accepts raw Topstep account labels and canonicalizes them internally."
+    )
     print("ProjectX execution subscribes and reconciles only the configured account.")
     print(
         "ProjectX startup cleanup is account-scoped and waits for prior exposure to flatten before submitting a new entry order.",
     )
-    print("ProjectX stop cleanup skips redundant IOC/inflight cancels to reduce shutdown noise.")
+    print(
+        "ProjectX stop cleanup skips redundant inflight cancels to reduce shutdown noise."
+    )
     print(
         "ProjectX contracts are translated from venue IDs like CON.F.US.MES.M26 "
         "into Nautilus IDs using the resolved public contract symbol before the strategy starts.",

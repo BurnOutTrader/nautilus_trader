@@ -21,7 +21,6 @@ pub mod config;
 pub mod factories;
 pub mod http;
 pub mod symbols;
-pub mod websocket;
 
 use nautilus_common::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
@@ -29,11 +28,9 @@ use nautilus_system::get_global_pyo3_registry;
 use pyo3::prelude::*;
 
 use crate::{
-    common::enums::ProjectXHub,
     config::{ProjectXConfig, ProjectXDataClientConfig, ProjectXExecClientConfig},
     factories::{ProjectXDataClientFactory, ProjectXExecutionClientFactory},
     http::client::ProjectXHttpClient,
-    websocket::client::{ProjectXSubscription, ProjectXWsClient},
 };
 
 #[allow(clippy::needless_pass_by_value)]
@@ -100,15 +97,12 @@ pub fn projectx(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(stringify!(PROJECTX), PROJECT_X)?;
     m.add(stringify!(PROJECTX_CLIENT_ID), *PROJECTX_CLIENT_ID)?;
     m.add(stringify!(PROJECTX_VENUE), *PROJECTX_VENUE)?;
-    m.add_class::<ProjectXHub>()?;
     m.add_class::<ProjectXConfig>()?;
     m.add_class::<ProjectXDataClientConfig>()?;
     m.add_class::<ProjectXExecClientConfig>()?;
     m.add_class::<ProjectXDataClientFactory>()?;
     m.add_class::<ProjectXExecutionClientFactory>()?;
     m.add_class::<ProjectXHttpClient>()?;
-    m.add_class::<ProjectXWsClient>()?;
-    m.add_class::<ProjectXSubscription>()?;
     m.add_function(wrap_pyfunction!(config::load_projectx_env, m)?)?;
     m.add_function(wrap_pyfunction!(
         symbols::databento_to_projectx_adapter_symbol,

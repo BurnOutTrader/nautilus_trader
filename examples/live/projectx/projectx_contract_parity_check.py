@@ -16,10 +16,11 @@ import asyncio
 import json
 from pathlib import Path
 
-from nautilus_trader.adapters.projectx import ProjectXConfig
-from nautilus_trader.adapters.projectx import ProjectXHttpClient
-from nautilus_trader.adapters.projectx import load_projectx_env
-
+from nautilus_trader.adapters.projectx import (
+    ProjectXConfig,
+    ProjectXHttpClient,
+    load_projectx_env,
+)
 
 load_projectx_env()
 
@@ -29,26 +30,16 @@ PRODUCT_ROOT = "MNQ"
 OUTPUT_PATH = ""
 
 
-def _normalize_root(name: str, symbol_id: str) -> str | None:
-    candidate = (name or symbol_id or "").strip().upper()
-
-    if not candidate:
-        return None
-
-    for idx, ch in enumerate(candidate):
-        if ch in "FGHJKMNQUVXZ" and idx > 0:
-            return candidate[:idx]
-    return None
-
-
 async def main() -> None:
     result = await run_contract_parity_check(
         live=LIVE,
         product_root=PRODUCT_ROOT or None,
         limit=LIMIT,
-        output_path=Path(OUTPUT_PATH).expanduser() if OUTPUT_PATH else None,  # noqa: ASYNC240
+        output_path=Path(OUTPUT_PATH).expanduser() if OUTPUT_PATH else None,
     )
-    print(f"Checked {result['checked']} contracts (live={LIVE}, root={PRODUCT_ROOT or 'ALL'})")
+    print(
+        f"Checked {result['checked']} contracts (live={LIVE}, root={PRODUCT_ROOT or 'ALL'})"
+    )
     mismatches = result["mismatches"]
 
     if mismatches:
@@ -82,20 +73,14 @@ async def run_contract_parity_check(
         available = await client.available_instruments(
             live=live,
             active_only=False,
+            product_root=(product_root or "").strip().upper() or None,
         )
 
         normalized_root = (product_root or "").strip().upper()
-
-        if normalized_root:
-            available = [
-                inst
-                for inst in available
-                if _normalize_root(
-                    inst.info.get("projectx_name", ""),
-                    inst.info.get("projectx_symbol_id", ""),
-                )
-                == normalized_root
-            ]
+        if normalized_root and not available:
+            raise RuntimeError(
+                f"ProjectX returned no contracts for requested product root {normalized_root}",
+            )
 
         if limit > 0:
             available = available[:limit]
@@ -111,7 +96,7 @@ async def run_contract_parity_check(
 
             try:
                 by_id = await client.contract_by_id(contract_id=contract_id)
-            except Exception:
+            except Exception:  # noqa: BLE001 - parity reporting must capture provider failures
                 mismatches.append(f"{contract_id}: missing from byId response")
                 continue
 
@@ -135,6 +120,11 @@ async def run_contract_parity_check(
                     f"available={left_tick!r} byId={right_tick!r}",
                 )
 
+        if normalized_root and checked == 0:
+            raise RuntimeError(
+                f"ProjectX parity check could not validate any contracts for root {normalized_root}",
+            )
+
         result = {
             "live": live,
             "product_root": normalized_root or None,
@@ -144,7 +134,7 @@ async def run_contract_parity_check(
 
         if output_path is not None:
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(  # noqa: ASYNC240
+            output_path.write_text(
                 json.dumps(
                     result,
                     indent=2,

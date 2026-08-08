@@ -3,12 +3,14 @@ name = "projectx-nt"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-authors = ["Kevin Monaghan"]
+authors.workspace = true
 license.workspace = true
 description = "Independent ProjectX adapter primitives for NautilusTrader-compatible integrations"
 categories.workspace = true
 keywords.workspace = true
-repository = "https://github.com/BurnOutTrader/nautilus_trader"
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [lints]
 workspace = true
@@ -28,6 +30,7 @@ extension-module = [
   "pyo3/extension-module",
 ]
 python = [
+  "dep:nautilus-system",
   "nautilus-common/python",
   "nautilus-core/python",
   "nautilus-model/python",
@@ -37,31 +40,39 @@ python = [
   "pyo3-stub-gen",
 ]
 
+[package.metadata.cargo-machete]
+ignored = [
+  "nautilus-system",
+] # Optional dependency activated only by the python feature
+
+[package.metadata.docs.rs]
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["high-precision"]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
-nautilus-live = { workspace = true, features = ["node", "examples"] }
+nautilus-live = { workspace = true, features = ["node"] }
 nautilus-model = { workspace = true }
-nautilus-network = { workspace = true }
-nautilus-system = { workspace = true }
+nautilus-system = { workspace = true, optional = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+bon = { workspace = true }
 chrono = { version = "0.4.45", default-features = false, features = ["serde", "std", "clock"] }
 dashmap = { workspace = true }
-futures-util = { workspace = true }
 jiff = { version = "0.2.35", default-features = false, features = ["perf-inline", "serde", "std", "tzdb-zoneinfo"] }
 log = { workspace = true }
 parking_lot = "0.12"
 projectx-client = "2"
-reqwest = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-tungstenite = { workspace = true }
+zeroize = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
 pyo3-async-runtimes = { workspace = true, optional = true }
@@ -85,6 +96,7 @@ name = "projectx-rust-quote-probe"
 path = "examples/node_quote_probe.rs"
 required-features = []
 doc = false
+test = false
 
 # cargo run --example projectx-rust-exec-tester -p projectx-nt
 [[example]]
@@ -92,6 +104,7 @@ name = "projectx-rust-exec-tester"
 path = "examples/node_exec_tester.rs"
 required-features = []
 doc = false
+test = false
 
 # cargo run --example projectx-rust-backtest-bars -p projectx-nt
 [[example]]
@@ -99,6 +112,7 @@ name = "projectx-rust-backtest-bars"
 path = "examples/backtest_bar_strategy.rs"
 required-features = []
 doc = false
+test = false
 
 # cargo run --example projectx-rust-download-bars -p projectx-nt
 [[example]]
@@ -106,6 +120,7 @@ name = "projectx-rust-download-bars"
 path = "examples/download_bars.rs"
 required-features = []
 doc = false
+test = false
 
 # cargo run --example projectx-rust-backtest-ema-cross -p projectx-nt
 [[example]]
@@ -113,6 +128,7 @@ name = "projectx-rust-backtest-ema-cross"
 path = "examples/backtest_ema_cross.rs"
 required-features = []
 doc = false
+test = false
 
 # cargo run --example projectx-rust-live-ema-cross -p projectx-nt
 [[example]]
@@ -120,3 +136,4 @@ name = "projectx-rust-live-ema-cross"
 path = "examples/node_ema_cross.rs"
 required-features = []
 doc = false
+test = false

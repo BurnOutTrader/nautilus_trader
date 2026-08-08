@@ -16,10 +16,11 @@ import asyncio
 import json
 from pathlib import Path
 
-from nautilus_trader.adapters.projectx import ProjectXConfig
-from nautilus_trader.adapters.projectx import ProjectXHttpClient
-from nautilus_trader.adapters.projectx import load_projectx_env
-
+from nautilus_trader.adapters.projectx import (
+    ProjectXConfig,
+    ProjectXHttpClient,
+    load_projectx_env,
+)
 
 load_projectx_env()
 
@@ -57,7 +58,7 @@ async def main() -> None:
         ]
 
         OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        OUTPUT_PATH.write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")  # noqa: ASYNC240
+        OUTPUT_PATH.write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
         print(f"Wrote {len(rows)} instrument rows to {OUTPUT_PATH}")
     finally:
         client.stop()

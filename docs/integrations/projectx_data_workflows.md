@@ -46,7 +46,7 @@ Example API usage:
 from pathlib import Path
 
 from nautilus_trader.adapters.projectx import download_bars_to_catalog
-from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model import InstrumentId
 
 
 result = download_bars_to_catalog(

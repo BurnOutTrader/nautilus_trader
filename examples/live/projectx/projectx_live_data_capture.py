@@ -17,32 +17,41 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from examples.live.live_node_run_helpers import interrupt_live_node_run
-from examples.live.live_node_run_helpers import sleep_or_cancel
-from examples.live.live_node_run_helpers import start_live_node_monitor
-from examples.live.live_node_run_helpers import wait_for_event_or_cancel
-from examples.live.projectx.projectx_data_capture import clear_capture_state
-from examples.live.projectx.projectx_data_capture import register_capture_state
-from examples.live.projectx.projectx_data_capture import snapshot_capture_state
-from examples.live.projectx.projectx_data_capture import wait_for_capture_data
-from examples.live.projectx.projectx_data_capture import wait_for_capture_instrument
-from examples.live.projectx.projectx_data_capture import wait_for_capture_stop
+_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+sys.path[:] = [_REPO_ROOT, *(path for path in sys.path if path != _REPO_ROOT)]
 
 from nautilus_trader._libnautilus.common import Environment
 from nautilus_trader._libnautilus.model import TraderId
-from nautilus_trader.adapters.projectx import PROJECTX_CLIENT_ID
-from nautilus_trader.adapters.projectx import ProjectXDataClientConfig
-from nautilus_trader.adapters.projectx import ProjectXDataClientFactory
-from nautilus_trader.adapters.projectx import load_projectx_env
+from nautilus_trader.adapters.projectx import (
+    PROJECTX_CLIENT_ID,
+    ProjectXDataClientConfig,
+    ProjectXDataClientFactory,
+    load_projectx_env,
+)
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.persistence import ParquetDataCatalog
 
+from examples.live.live_node_run_helpers import (
+    interrupt_live_node_run,
+    sleep_or_cancel,
+    start_live_node_monitor,
+    wait_for_event_or_cancel,
+)
+from examples.live.projectx.projectx_data_capture import (
+    clear_capture_state,
+    register_capture_state,
+    snapshot_capture_state,
+    wait_for_capture_data,
+    wait_for_capture_instrument,
+    wait_for_capture_stop,
+)
 
 if TYPE_CHECKING:
     from nautilus_trader.config import ImportableStrategyConfig
@@ -78,8 +87,12 @@ UNSUBSCRIBE_ON_STOP = True
 LOG_DATA = False
 FAIL_ON_TIMEOUT = False
 TRADER_ID = TraderId("TESTER-001")
-_STRATEGY_PATH = "examples.live.projectx.projectx_data_capture:ProjectXDataCaptureStrategy"
-_CONFIG_PATH = "examples.live.projectx.projectx_data_capture:ProjectXDataCaptureStrategyConfig"
+_STRATEGY_PATH = (
+    "examples.live.projectx.projectx_data_capture:ProjectXDataCaptureStrategy"
+)
+_CONFIG_PATH = (
+    "examples.live.projectx.projectx_data_capture:ProjectXDataCaptureStrategyConfig"
+)
 
 
 def _catalog_counts(path: Path, instrument_id: InstrumentId) -> dict[str, int]:
@@ -95,9 +108,9 @@ def _catalog_counts(path: Path, instrument_id: InstrumentId) -> dict[str, int]:
     identifier = instrument_id.value
     return {
         "instruments": len(catalog.instruments(instrument_ids=[identifier])),
-        "quotes": len(catalog.quote_ticks(instrument_ids=[identifier])),
-        "trades": len(catalog.trade_ticks(instrument_ids=[identifier])),
-        "book_deltas": len(catalog.order_book_deltas(instrument_ids=[identifier])),
+        "quotes": len(catalog.query_quote_ticks(identifiers=[identifier])),
+        "trades": len(catalog.query_trade_ticks(identifiers=[identifier])),
+        "book_deltas": len(catalog.query_order_book_deltas(identifiers=[identifier])),
     }
 
 
@@ -170,22 +183,22 @@ def _write_capture_to_catalog(
     captured_instrument = snapshot["instrument"]
 
     if captured_instrument is not None and before_counts["instruments"] == 0:
-        catalog.write_data([captured_instrument])
+        catalog.write_instruments([captured_instrument])
 
     captured_quotes = snapshot["quotes"]
 
     if captured_quotes:
-        catalog.write_data(captured_quotes)
+        catalog.write_quote_ticks(captured_quotes)
 
     captured_trades = snapshot["trades"]
 
     if captured_trades:
-        catalog.write_data(captured_trades)
+        catalog.write_trade_ticks(captured_trades)
 
     captured_book_deltas = snapshot["book_deltas"]
 
     if captured_book_deltas:
-        catalog.write_data(captured_book_deltas)
+        catalog.write_order_book_deltas(captured_book_deltas)
 
 
 def run_capture(
@@ -340,7 +353,9 @@ def run_capture(
         "depth_levels": depth_levels,
         "before_counts": before_counts,
         "after_counts": after_counts,
-        "catalog_delta": {key: after_counts[key] - before_counts[key] for key in before_counts},
+        "catalog_delta": {
+            key: after_counts[key] - before_counts[key] for key in before_counts
+        },
         "strategy_counts": {
             "instruments": 1 if snapshot["instrument"] is not None else 0,
             "instrument_events": snapshot["instrument_events"],
@@ -368,8 +383,8 @@ def run_capture(
 def main() -> None:
     try:
         instrument_id = INSTRUMENT_ID
-    except Exception as exc:
-        print(f"ProjectX instrument resolution failed: {exc}")
+    except Exception as e:  # noqa: BLE001 - CLI boundary reports startup failures
+        print(f"ProjectX instrument resolution failed: {e}")
 
         if FAIL_ON_TIMEOUT:
             raise SystemExit(1) from None

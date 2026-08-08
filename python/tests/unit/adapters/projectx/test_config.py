@@ -12,10 +12,12 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import pytest
+
 from nautilus_trader.adapters.projectx import ProjectXConfig
 from nautilus_trader.adapters.projectx import ProjectXDataClientConfig as PackageDataClientConfig
 from nautilus_trader.adapters.projectx import ProjectXExecClientConfig as PackageExecClientConfig
-from nautilus_trader.adapters.projectx import ProjectXHub
+from nautilus_trader.model import AccountType
 
 
 def test_public_generic_configs_are_pyo3_exports():
@@ -28,8 +30,16 @@ def test_projectx_config_constructs_with_environment():
         environment="TopstepX",
         user_name="test-user",
         api_key="test-api-key",
+        http_proxy_url="http://proxy-user:proxy-secret@example.com",
     )
-    assert config is not None
+    assert config.http_timeout_secs == 60
+    assert config.max_retries == 3
+    assert config.retry_delay_initial_ms == 1_000
+    assert config.retry_delay_max_ms == 10_000
+    assert config.http_proxy_url == "http://proxy-user:proxy-secret@example.com"
+    assert "test-user" not in repr(config)
+    assert "test-api-key" not in repr(config)
+    assert "proxy-secret" not in repr(config)
 
 
 def test_data_client_config_fields_round_trip():
@@ -50,9 +60,49 @@ def test_exec_client_config_constructs():
         trader_id="TRADER-001",
     )
 
+    assert str(config.trader_id) == "TRADER-001"
+    assert str(config.account_id) == "PROJECTX-PRAC-V2-64413-98419885"
+    assert config.account_type == AccountType.MARGIN
     assert config.transport is not None
 
 
-def test_projectx_hub_enum_values():
-    assert ProjectXHub.Market is not None
-    assert ProjectXHub.User is not None
+def test_exec_client_config_rejects_non_margin_account_type():
+    with pytest.raises(ValueError, match="require AccountType::Margin"):
+        PackageExecClientConfig(
+            user_name="test-user",
+            api_key="test-api-key",
+            account_id="PRAC-V2-64413-98419885",
+            trader_id="TRADER-001",
+            account_type=AccountType.CASH,
+        )
+
+
+@pytest.mark.parametrize("trader_id", ["", "bad", "💥"])
+def test_exec_client_config_rejects_invalid_trader_id(trader_id):
+    with pytest.raises(ValueError, match="value"):
+        PackageExecClientConfig(
+            user_name="test-user",
+            api_key="test-api-key",
+            account_id="PRAC-V2-64413-98419885",
+            trader_id=trader_id,
+        )
+
+
+@pytest.mark.parametrize("account_id", ["", "PROJECTX-", "💥"])
+def test_exec_client_config_rejects_invalid_account_id(account_id):
+    with pytest.raises(ValueError, match="value"):
+        PackageExecClientConfig(
+            user_name="test-user",
+            api_key="test-api-key",
+            account_id=account_id,
+            trader_id="TRADER-001",
+        )
+
+
+def test_config_constructors_reject_unknown_fields():
+    with pytest.raises(TypeError):
+        ProjectXConfig(
+            user_name="test-user",
+            api_key="test-api-key",
+            unknown_setting=True,
+        )

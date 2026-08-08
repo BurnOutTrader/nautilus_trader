@@ -37,7 +37,7 @@ use nautilus_backtest::{
 use nautilus_model::{
     enums::{AccountType, BookType, OmsType},
     identifiers::StrategyId,
-    types::{Currency, Quantity},
+    types::Currency,
 };
 use nautilus_persistence::backend::catalog::ParquetDataCatalog;
 use ustr::Ustr;
@@ -45,7 +45,7 @@ use ustr::Ustr;
 use crate::support::{
     bar_ema_cross::{ProjectXBarEmaCrossConfig, ProjectXBarEmaCrossStrategy},
     common::{
-        env_string, example_root_from_env, format_utc_nanos, load_env,
+        env_string, example_root_from_env, format_utc_nanos, load_env, positive_quantity_from_env,
         resolve_catalog_backtest_window, resolve_catalog_instrument_id,
     },
     downloader::build_external_bar_type,
@@ -56,10 +56,6 @@ fn env_usize(key: &str, default: usize) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
-}
-
-fn env_quantity(key: &str, default: &str) -> Quantity {
-    Quantity::from(env_string(key, default).as_str())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -74,7 +70,7 @@ fn main() -> anyhow::Result<()> {
     let bar_spec = env_string("PROJECTX_BAR_SPEC", "1-MINUTE-LAST");
     let fast_ema = env_usize("PROJECTX_FAST_EMA", 10);
     let slow_ema = env_usize("PROJECTX_SLOW_EMA", 20);
-    let trade_size = env_quantity("PROJECTX_TRADE_SIZE", "1");
+    let trade_size = positive_quantity_from_env("PROJECTX_TRADE_SIZE", "1")?;
 
     let mut catalog = ParquetDataCatalog::new(&catalog_path, None, None, None, None);
     let instrument_id = resolve_catalog_instrument_id(&catalog)?;

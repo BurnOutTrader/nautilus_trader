@@ -19,10 +19,20 @@ use projectx_client::{
 };
 
 use crate::{
-    common::urls::ProjectXUrls,
+    common::{enums::ProjectXEnvironment, urls::ProjectXUrls},
     config::ProjectXConfig,
     http::{credentials::ProjectXCredential, error::ProjectXHttpError},
 };
+
+fn endpoints_for_environment(
+    environment: &ProjectXEnvironment,
+    urls: &ProjectXUrls,
+) -> Result<Endpoints, ProjectXHttpError> {
+    match environment {
+        ProjectXEnvironment::TopstepX => Ok(Endpoints::topstepx()),
+        ProjectXEnvironment::Custom(_) => Ok(Endpoints::custom(&urls.api_base, &urls.rtc_base)?),
+    }
+}
 
 /// Nautilus-compatible wrapper around the published `projectx-client` (v2) crate.
 ///
@@ -39,7 +49,6 @@ use crate::{
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.projectx")
 )]
 pub struct ProjectXHttpClient {
-    credential: ProjectXCredential,
     urls: ProjectXUrls,
     inner: Client,
 }
@@ -47,7 +56,6 @@ pub struct ProjectXHttpClient {
 impl Clone for ProjectXHttpClient {
     fn clone(&self) -> Self {
         Self {
-            credential: self.credential.clone(),
             urls: self.urls.clone(),
             inner: self.inner.clone(),
         }
@@ -67,7 +75,7 @@ impl ProjectXHttpClient {
     ///
     /// Returns an error if the credentials or client configuration are invalid.
     pub fn new(
-        credential: ProjectXCredential,
+        credential: &ProjectXCredential,
         timeout_secs: Option<u64>,
         max_retries: Option<u32>,
         retry_delay_initial_ms: Option<u64>,
@@ -77,11 +85,7 @@ impl ProjectXHttpClient {
         let urls = credential.environment.urls();
         let credentials = Credentials::new(&credential.user_name, &credential.api_key)?;
 
-        let endpoints = if urls.api_base.starts_with("https://api.topstepx") {
-            Endpoints::topstepx()
-        } else {
-            Endpoints::custom(&urls.api_base, &urls.rtc_base)?
-        };
+        let endpoints = endpoints_for_environment(&credential.environment, &urls)?;
 
         let mut builder = Client::builder(credentials).endpoints(endpoints);
 
@@ -106,11 +110,7 @@ impl ProjectXHttpClient {
 
         let inner = builder.build()?;
 
-        Ok(Self {
-            credential,
-            urls,
-            inner,
-        })
+        Ok(Self { urls, inner })
     }
 
     /// Creates a new ProjectX HTTP client from an adapter configuration.
@@ -118,14 +118,16 @@ impl ProjectXHttpClient {
     /// # Errors
     ///
     /// Returns an error if the credentials or client configuration are invalid.
-    pub fn from_config(config: ProjectXConfig) -> Result<Self, ProjectXHttpError> {
+    pub fn from_config(mut config: ProjectXConfig) -> Result<Self, ProjectXHttpError> {
+        let http_proxy_url = config.http_proxy_url.take();
+
         Self::new(
-            config.credential,
+            &config.credential,
             Some(config.http_timeout_secs),
             Some(config.max_retries),
             Some(config.retry_delay_initial_ms),
             Some(config.retry_delay_max_ms),
-            config.http_proxy_url,
+            http_proxy_url,
         )
     }
 
@@ -141,6 +143,16 @@ impl ProjectXHttpClient {
     /// Returns an error if authentication fails.
     pub async fn start(&self) -> Result<(), ProjectXHttpError> {
         Ok(self.inner.authenticate().await?)
+    }
+
+    /// Validates the currently authenticated ProjectX session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no authenticated session exists, the provider rejects
+    /// validation, or the validation outcome cannot be trusted.
+    pub async fn validate_session(&self) -> Result<(), ProjectXHttpError> {
+        Ok(self.inner.validate_session().await?)
     }
 
     /// Stops the client.
@@ -327,12 +339,15 @@ impl ProjectXHttpClient {
 
 #[cfg(test)]
 mod tests {
-    use super::ProjectXHttpClient;
-    use crate::{common::enums::ProjectXEnvironment, http::credentials::ProjectXCredential};
+    use super::{ProjectXHttpClient, endpoints_for_environment};
+    use crate::{
+        common::{enums::ProjectXEnvironment, urls::ProjectXUrls},
+        http::{credentials::ProjectXCredential, error::ProjectXHttpError},
+    };
 
     fn test_client() -> ProjectXHttpClient {
         ProjectXHttpClient::new(
-            ProjectXCredential::new(ProjectXEnvironment::TopstepX, "test-user", "test-key"),
+            &ProjectXCredential::new(ProjectXEnvironment::TopstepX, "test-user", "test-key"),
             None,
             None,
             None,
@@ -350,9 +365,37 @@ mod tests {
     }
 
     #[rstest::rstest]
+    fn custom_environment_with_topstep_prefix_preserves_custom_endpoints() {
+        let urls = ProjectXUrls::new(
+            "https://api.topstepx.internal",
+            "https://rtc.topstepx.internal",
+        );
+        let environment = ProjectXEnvironment::Custom(urls.clone());
+
+        let endpoints =
+            endpoints_for_environment(&environment, &urls).expect("valid custom endpoints");
+
+        assert_eq!(endpoints.api_base(), "https://api.topstepx.internal/");
+        assert_eq!(endpoints.realtime_base(), "https://rtc.topstepx.internal/");
+    }
+
+    #[rstest::rstest]
     fn client_is_cloneable_and_authenticates_lazily() {
         let client = test_client();
         let cloned = client.clone();
         assert_eq!(cloned.urls().api_base, client.urls().api_base);
+    }
+
+    #[tokio::test]
+    async fn validate_session_does_not_authenticate() {
+        let error = test_client()
+            .validate_session()
+            .await
+            .expect_err("an unauthenticated client must not be authenticated by validation");
+
+        assert!(matches!(
+            error,
+            ProjectXHttpError::Client(projectx_client::Error::NotAuthenticated)
+        ));
     }
 }

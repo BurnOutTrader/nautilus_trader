@@ -392,6 +392,7 @@ okx nautilus_okx::python::okx
 persistence nautilus_persistence::python::persistence
 polymarket nautilus_polymarket::python::polymarket
 portfolio nautilus_portfolio::python::portfolio
+projectx projectx_nt::python::projectx
 rithmic rithmic_nt::python::rithmic
 risk nautilus_risk::python::risk
 sandbox nautilus_sandbox::python::sandbox

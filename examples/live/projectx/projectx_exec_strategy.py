@@ -17,24 +17,24 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
 from nautilus_trader._libnautilus.common import LogColor
 from nautilus_trader._libnautilus.core import UUID4
-from nautilus_trader._libnautilus.model import AccountId
-from nautilus_trader._libnautilus.model import ClientId
-from nautilus_trader._libnautilus.model import ClientOrderId
-from nautilus_trader._libnautilus.model import InstrumentId
-from nautilus_trader._libnautilus.model import MarketOrder
-from nautilus_trader._libnautilus.model import OrderSide
-from nautilus_trader._libnautilus.model import Quantity
-from nautilus_trader._libnautilus.model import StrategyId
-from nautilus_trader._libnautilus.model import TimeInForce
-from nautilus_trader._libnautilus.trading import Strategy
-from nautilus_trader._libnautilus.trading import StrategyConfig
+from nautilus_trader._libnautilus.model import (
+    AccountId,
+    ClientId,
+    ClientOrderId,
+    InstrumentId,
+    MarketOrder,
+    OrderSide,
+    Quantity,
+    StrategyId,
+    TimeInForce,
+)
+from nautilus_trader._libnautilus.trading import Strategy, StrategyConfig
 
 
 @dataclass
@@ -65,7 +65,9 @@ _STATE_LOCK = threading.Lock()
 _EXEC_STATES: dict[str, _ExecState] = {}
 
 
-def register_exec_state(*, key: str, instrument_id: str, account_id: str | None) -> None:
+def register_exec_state(
+    *, key: str, instrument_id: str, account_id: str | None
+) -> None:
     with _STATE_LOCK:
         _EXEC_STATES[key] = _ExecState(
             instrument_id=instrument_id,
@@ -262,7 +264,7 @@ class ProjectXExecStrategyConfig(StrategyConfig):
         state_key: str = "projectx-exec-smoke",
         entry_side: str | OrderSide = "BUY",
         entry_qty: str | Quantity = "1",
-        entry_time_in_force: str | TimeInForce = "IOC",
+        entry_time_in_force: str | TimeInForce = "GTC",
         cleanup_on_start: bool = True,
         cleanup_on_stop: bool = True,
         flatten_after_fill: bool = True,
@@ -279,11 +281,17 @@ class ProjectXExecStrategyConfig(StrategyConfig):
             else InstrumentId.from_str(instrument_id)
         )
         parsed_strategy_id = (
-            strategy_id if isinstance(strategy_id, StrategyId) else StrategyId(strategy_id)
+            strategy_id
+            if isinstance(strategy_id, StrategyId)
+            else StrategyId(strategy_id)
         )
-        parsed_client_id = client_id if isinstance(client_id, ClientId) else ClientId(client_id)
+        parsed_client_id = (
+            client_id if isinstance(client_id, ClientId) else ClientId(client_id)
+        )
         parsed_entry_qty = (
-            entry_qty if isinstance(entry_qty, Quantity) else Quantity.from_str(str(entry_qty))
+            entry_qty
+            if isinstance(entry_qty, Quantity)
+            else Quantity.from_str(str(entry_qty))
         )
         parsed_entry_side = _coerce_order_side(entry_side)
         parsed_time_in_force = _coerce_time_in_force(entry_time_in_force)
@@ -293,8 +301,8 @@ class ProjectXExecStrategyConfig(StrategyConfig):
             strategy_id=parsed_strategy_id,
             external_order_claims=[parsed_instrument_id],
             manage_stop=False,
-            market_exit_time_in_force=TimeInForce.IOC,
-            market_exit_reduce_only=True,
+            market_exit_time_in_force=TimeInForce.GTC,
+            market_exit_reduce_only=False,
             log_events=log_events,
             log_commands=log_commands,
         )
@@ -318,7 +326,6 @@ class ProjectXExecStrategyConfig(StrategyConfig):
 class ProjectXExecStrategy(Strategy):
     def __init__(self, config: ProjectXExecStrategyConfig):
         super().__init__(config)
-        self.config = config
         self._entry_submitted = False
         self._flatten_requested = False
         self._instrument_ready = False
@@ -365,7 +372,9 @@ class ProjectXExecStrategy(Strategy):
             self._error(f"Instrument not found in cache: {self.config.instrument_id}")
 
     def on_stop(self):
-        self._info(f"Stopping ProjectX execution strategy snapshot={self._runtime_snapshot()}")
+        self._info(
+            f"Stopping ProjectX execution strategy snapshot={self._runtime_snapshot()}"
+        )
 
         if self.config.cleanup_on_stop:
             self._cancel_open_orders(stop_phase=True)
@@ -389,7 +398,9 @@ class ProjectXExecStrategy(Strategy):
         return None
 
     def on_instrument(self, instrument):
-        self._info(f"Instrument ready: {instrument} snapshot={self._runtime_snapshot()}")
+        self._info(
+            f"Instrument ready: {instrument} snapshot={self._runtime_snapshot()}"
+        )
         self._instrument_ready = True
         _mark_instrument_ready(self.config.state_key)
         self._maybe_submit_entry_order()
@@ -421,7 +432,9 @@ class ProjectXExecStrategy(Strategy):
         )
         self._cleanup_close_requests.clear()
         self._refresh_cleanup_state()
-        self._error(self._format_order_event("Order rejected", event, include_reason=True))
+        self._error(
+            self._format_order_event("Order rejected", event, include_reason=True)
+        )
         self._maybe_submit_entry_order()
 
     def on_order_canceled(self, event):
@@ -431,7 +444,9 @@ class ProjectXExecStrategy(Strategy):
         )
         self._cleanup_close_requests.clear()
         self._refresh_cleanup_state()
-        self._info(self._format_order_event("Order canceled", event, include_reason=True))
+        self._info(
+            self._format_order_event("Order canceled", event, include_reason=True)
+        )
         self._maybe_submit_entry_order()
 
     def on_order_filled(self, event):
@@ -448,8 +463,8 @@ class ProjectXExecStrategy(Strategy):
             self.close_all_positions(
                 instrument_id=self.config.instrument_id,
                 client_id=self.config.client_id,
-                time_in_force=TimeInForce.IOC,
-                reduce_only=True,
+                time_in_force=TimeInForce.GTC,
+                reduce_only=False,
             )
         self._maybe_submit_entry_order()
 
@@ -521,7 +536,8 @@ class ProjectXExecStrategy(Strategy):
         if stop_phase:
             cache_kwargs = self._cache_query_kwargs()
             inflight_order_ids = {
-                order.client_order_id.value for order in self.cache.orders_inflight(**cache_kwargs)
+                order.client_order_id.value
+                for order in self.cache.orders_inflight(**cache_kwargs)
             }
 
         if not orders:
@@ -531,15 +547,13 @@ class ProjectXExecStrategy(Strategy):
             )
             return
 
-        skipped_ioc = 0
         skipped_inflight = 0
 
         for order in orders:
-            if stop_phase and order.client_order_id.value in self._cleanup_cancel_requests:
-                continue
-
-            if stop_phase and getattr(order, "time_in_force", None) == TimeInForce.IOC:
-                skipped_ioc += 1
+            if (
+                stop_phase
+                and order.client_order_id.value in self._cleanup_cancel_requests
+            ):
                 continue
 
             if stop_phase and order.client_order_id.value in inflight_order_ids:
@@ -554,13 +568,13 @@ class ProjectXExecStrategy(Strategy):
                 f"client_order_id={order.client_order_id} tif={getattr(order, 'time_in_force', None)} "
                 f"snapshot={self._runtime_snapshot()}",
             )
-            self.cancel_order(order, client_id=self.config.client_id)
+            self.cancel_order(order.client_order_id, client_id=self.config.client_id)
             self._cleanup_cancel_requests.add(key)
 
-        if stop_phase and (skipped_ioc > 0 or skipped_inflight > 0):
+        if stop_phase and skipped_inflight > 0:
             self._info(
                 "Shutdown cleanup skipped redundant cancels for "
-                f"{skipped_ioc} IOC and {skipped_inflight} inflight orders "
+                f"{skipped_inflight} inflight orders "
                 f"snapshot={self._runtime_snapshot()}",
             )
 
@@ -590,8 +604,8 @@ class ProjectXExecStrategy(Strategy):
             self.close_position(
                 position=position,
                 client_id=self.config.client_id,
-                time_in_force=TimeInForce.IOC,
-                reduce_only=True,
+                time_in_force=TimeInForce.GTC,
+                reduce_only=False,
             )
             self._cleanup_close_requests.add(key)
 
@@ -765,8 +779,12 @@ class ProjectXExecStrategy(Strategy):
         return " ".join(parts)
 
     def _refresh_cleanup_state(self):
-        current_order_ids = {order.client_order_id.value for order in self._open_orders()}
-        current_position_ids = {position.id.value for position in self._open_positions()}
+        current_order_ids = {
+            order.client_order_id.value for order in self._open_orders()
+        }
+        current_position_ids = {
+            position.id.value for position in self._open_positions()
+        }
         self._cleanup_cancel_requests.intersection_update(current_order_ids)
         self._cleanup_close_requests.intersection_update(current_position_ids)
 

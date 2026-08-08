@@ -40,14 +40,15 @@ use std::str::FromStr;
 
 use nautilus_common::{enums::Environment, live::get_runtime};
 use nautilus_live::node::LiveNode;
-use nautilus_model::{data::BarType, identifiers::StrategyId, types::Quantity};
+use nautilus_model::identifiers::InstrumentId;
+use nautilus_model::{data::BarType, identifiers::StrategyId};
 use projectx_nt::{ProjectXDataClientFactory, ProjectXExecutionClientFactory};
 
 use crate::support::{
     bar_ema_cross::{ProjectXBarEmaCrossConfig, ProjectXBarEmaCrossStrategy},
     common::{
         data_config_from_env, env_bool, env_string, env_u64, exec_config_from_env, load_env,
-        resolve_instrument_id_from_env, trader_id_from_env,
+        positive_quantity_from_env, resolve_instrument_id_from_env, trader_id_from_env,
     },
 };
 
@@ -59,7 +60,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 fn bar_type_from_spec(
-    instrument_id: nautilus_model::identifiers::InstrumentId,
+    instrument_id: InstrumentId,
     bar_spec: &str,
     source: &str,
 ) -> anyhow::Result<BarType> {
@@ -71,14 +72,14 @@ async fn main() -> anyhow::Result<()> {
     load_env();
 
     let market_data_live = env_bool("PROJECTX_MARKET_DATA_LIVE", false);
-    let trader_id = trader_id_from_env("PROJECTX_TRADER_ID", "RUST-PROJECTX-EMA-001");
+    let trader_id = trader_id_from_env("PROJECTX_TRADER_ID", "RUST-PROJECTX-EMA-001")?;
     let instrument_id = resolve_instrument_id_from_env(market_data_live).await?;
     let bar_spec = env_string("PROJECTX_LIVE_BAR_SPEC", "15-SECOND-LAST");
     let live_bar_type = bar_type_from_spec(instrument_id, &bar_spec, "INTERNAL")?;
     let history_bar_type = bar_type_from_spec(instrument_id, &bar_spec, "EXTERNAL")?;
     let fast_ema = env_usize("PROJECTX_FAST_EMA", 10);
     let slow_ema = env_usize("PROJECTX_SLOW_EMA", 20);
-    let trade_size = Quantity::from(env_string("PROJECTX_TRADE_SIZE", "1").as_str());
+    let trade_size = positive_quantity_from_env("PROJECTX_TRADE_SIZE", "1")?;
     let warmup_minutes = env_usize("PROJECTX_WARMUP_MINUTES", 30);
     let run_seconds = env_u64("PROJECTX_RUN_SECONDS", 0);
 

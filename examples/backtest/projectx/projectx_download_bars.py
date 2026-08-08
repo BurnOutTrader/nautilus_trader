@@ -29,9 +29,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import UTC
-from datetime import datetime
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
@@ -43,10 +41,11 @@ def _ensure_repo_root_on_sys_path() -> None:
 
 _ensure_repo_root_on_sys_path()
 
-from nautilus_trader.adapters.projectx import download_bars_to_catalog  # noqa: E402
-from nautilus_trader.adapters.projectx import load_projectx_env  # noqa: E402
-from nautilus_trader.model import InstrumentId  # noqa: E402
-
+from nautilus_trader.adapters.projectx import (
+    download_bars_to_catalog,
+    load_projectx_env,
+)
+from nautilus_trader.model import InstrumentId
 
 load_projectx_env()
 

@@ -16,15 +16,31 @@
 
 from __future__ import annotations
 
-from examples.live.projectx.projectx_instrument_provider import load_provider_snapshot
+import sys
+from pathlib import Path
 
-from nautilus_trader.adapters.projectx import ProjectXConfig
-from nautilus_trader.adapters.projectx import ProjectXHttpClient
+_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+sys.path[:] = [_REPO_ROOT, *(path for path in sys.path if path != _REPO_ROOT)]
+
+from nautilus_trader.adapters.projectx import ProjectXConfig, ProjectXHttpClient
 from nautilus_trader.model import InstrumentId
+
+from examples.live.projectx.projectx_instrument_provider import load_provider_snapshot
 
 
 def _instrument_id_from_front_month(instrument: object) -> InstrumentId | None:
     instrument_id = str(getattr(instrument, "id", "") or "").strip().upper()
+
+    if instrument_id:
+        return InstrumentId.from_str(instrument_id)
+
+    return None
+
+
+def _instrument_id_from_contract(contract: dict[str, object]) -> InstrumentId | None:
+    instrument_id = (
+        str(contract.get("instrument_id") or contract.get("id") or "").strip().upper()
+    )
 
     if instrument_id:
         return InstrumentId.from_str(instrument_id)

@@ -15,7 +15,7 @@
 //! Live market data client implementation for ProjectX.
 
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     sync::{
         Arc,
@@ -23,13 +23,13 @@ use std::{
     },
 };
 
-use ahash::AHashMap;
+use ahash::AHashSet;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use jiff::Timestamp;
 use nautilus_common::{
     clients::DataClient,
-    live::{get_runtime, runner::get_data_event_sender},
+    live::{get_runtime, runner::get_data_event_sender, task::TaskHandles},
     messages::{
         DataEvent,
         data::{
@@ -40,10 +40,7 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    Params, UnixNanos,
-    correctness::{CorrectnessResultExt, FAILED},
-    datetime::datetime_to_unix_nanos,
-    time::get_atomic_clock_realtime,
+    Params, UnixNanos, datetime::datetime_to_unix_nanos, time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
     data::{
@@ -56,7 +53,7 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use parking_lot::RwLock as ParkingRwLock;
-use rust_decimal::{Decimal, prelude::ToPrimitive};
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 use crate::{
@@ -77,7 +74,7 @@ use crate::{
 };
 use projectx_client::{
     Bar as PxApiBar, BarUnit, Contract, ContractId, DepthType, HistoryRequest, MarketDepth,
-    MarketTrade, TradeLogType,
+    MarketQuote, MarketTrade, TradeLogType,
 };
 
 struct BarRequestSpec {
@@ -99,8 +96,8 @@ type MappedBarRequest = (
     Option<UnixNanos>,
 );
 
-fn provider_error_code(error: &ProjectXHttpError) -> Option<i32> {
-    match error {
+fn provider_error_code(e: &ProjectXHttpError) -> Option<i32> {
+    match e {
         ProjectXHttpError::Client(projectx_client::Error::Provider(provider_error)) => {
             Some(provider_error.code)
         }
@@ -123,12 +120,13 @@ fn build_history_request(
     )
     .unit_number(request.unit_number())
     .limit(request.limit())
-    .include_partial_bar(true)
+    .include_partial_bar(request.includes_partial_bar())
     .build()
     .map_err(anyhow::Error::from)
 }
 
-type ContractCache = Arc<ParkingRwLock<AHashMap<String, Contract>>>;
+type ContractCache = Arc<ParkingRwLock<HashMap<String, Contract>>>;
+type SubscriptionAliases = Arc<DashMap<String, AHashSet<InstrumentId>>>;
 
 const MAX_HISTORICAL_BAR_PAGES: usize = 256;
 const ALLOW_LIVE_HISTORY_FALLBACK_PARAM: &str = "allow_live_history_fallback";
@@ -140,8 +138,14 @@ const HISTORY_SOURCE_LIVE_PARAM: &str = "history_source_live";
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct DepthSlotKey {
     instrument_id: InstrumentId,
-    side: u8,
+    side: OrderSide,
     index: i32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BboState {
+    bid: Option<Decimal>,
+    ask: Option<Decimal>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -152,10 +156,187 @@ struct DepthDeltaContext {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct HistoricalBarsMetadata {
-    live_history_fallback_used: bool,
-    requested_live: bool,
-    history_source_live: bool,
+pub(crate) struct HistoricalBarsMetadata {
+    pub(crate) live_history_fallback_used: bool,
+    pub(crate) requested_live: bool,
+    pub(crate) history_source_live: bool,
+}
+
+fn projectx_bar_unit_from_code(unit: i32) -> anyhow::Result<BarUnit> {
+    match unit {
+        1 => Ok(BarUnit::Second),
+        2 => Ok(BarUnit::Minute),
+        3 => Ok(BarUnit::Hour),
+        4 => Ok(BarUnit::Day),
+        5 => Ok(BarUnit::Week),
+        6 => Ok(BarUnit::Month),
+        _ => anyhow::bail!("Invalid ProjectX bar unit code: {unit}"),
+    }
+}
+
+/// Returns the ProjectX unit and step represented by a Nautilus bar type.
+///
+/// # Errors
+///
+/// Returns an error when the bar type is not a supported standard external aggregation.
+pub(crate) fn projectx_expected_history_bar_unit(
+    bar_type: BarType,
+) -> anyhow::Result<(BarUnit, i32)> {
+    anyhow::ensure!(
+        bar_type.is_standard() && bar_type.is_externally_aggregated(),
+        "ProjectX historical bars require a standard externally aggregated BarType",
+    );
+
+    let spec = bar_type.spec();
+    let unit = match spec.aggregation {
+        BarAggregation::Second => BarUnit::Second,
+        BarAggregation::Minute => BarUnit::Minute,
+        BarAggregation::Hour => BarUnit::Hour,
+        BarAggregation::Day => BarUnit::Day,
+        BarAggregation::Week => BarUnit::Week,
+        BarAggregation::Month => BarUnit::Month,
+        aggregation => {
+            anyhow::bail!("Unsupported ProjectX historical bar aggregation: {aggregation:?}")
+        }
+    };
+    let unit_number = i32::try_from(spec.step.get())
+        .map_err(|_| anyhow::anyhow!("ProjectX bar step exceeds the provider range"))?;
+    Ok((unit, unit_number))
+}
+
+/// Validates that explicit ProjectX history fields match the Nautilus bar type.
+///
+/// # Errors
+///
+/// Returns an error when the unit code is invalid or the explicit fields do not match the bar type.
+pub(crate) fn projectx_validate_history_bar_semantics(
+    bar_type: BarType,
+    unit: i32,
+    unit_number: i32,
+) -> anyhow::Result<BarUnit> {
+    let requested_unit = projectx_bar_unit_from_code(unit)?;
+    let (expected_unit, expected_unit_number) = projectx_expected_history_bar_unit(bar_type)?;
+
+    anyhow::ensure!(
+        requested_unit == expected_unit,
+        "ProjectX bar unit code {unit} does not match BarType aggregation {:?}",
+        bar_type.spec().aggregation,
+    );
+    anyhow::ensure!(
+        unit_number == expected_unit_number,
+        "ProjectX unit_number {unit_number} does not match BarType step {expected_unit_number}",
+    );
+    Ok(requested_unit)
+}
+
+fn projectx_map_historical_bar(bar_type: BarType, bar: &PxApiBar) -> anyhow::Result<Bar> {
+    let ts_event = projectx_timestamp_to_unix_nanos(&bar.t)?;
+    let precision = u8::try_from(
+        [bar.o, bar.h, bar.l, bar.c]
+            .into_iter()
+            .map(|price| price.scale())
+            .max()
+            .unwrap_or_default(),
+    )?;
+    let open = Price::from_decimal_dp(bar.o, precision)?;
+    let high = Price::from_decimal_dp(bar.h, precision)?;
+    let low = Price::from_decimal_dp(bar.l, precision)?;
+    let close = Price::from_decimal_dp(bar.c, precision)?;
+    let volume = Quantity::from_decimal(Decimal::from(bar.v))?;
+    Bar::new_checked(bar_type, open, high, low, close, volume, ts_event, ts_event)
+}
+
+fn projectx_timestamp_to_unix_nanos(
+    timestamp: &projectx_client::Timestamp,
+) -> anyhow::Result<UnixNanos> {
+    let timestamp_ns = timestamp.as_jiff().as_nanosecond();
+    let timestamp_ns = u64::try_from(timestamp_ns).map_err(|_| {
+        anyhow::anyhow!("ProjectX timestamp {timestamp} is outside the supported UnixNanos range")
+    })?;
+    Ok(UnixNanos::from(timestamp_ns))
+}
+
+/// Converts provider bars exactly, then returns them sorted and timestamp-deduplicated.
+///
+/// # Errors
+///
+/// Returns an error when a timestamp, price, volume, or bar invariant is invalid.
+pub(crate) fn projectx_map_historical_bars(
+    bar_type: BarType,
+    bars: &[PxApiBar],
+) -> anyhow::Result<Vec<Bar>> {
+    let mut mapped = bars
+        .iter()
+        .map(|bar| projectx_map_historical_bar(bar_type, bar))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    mapped.sort_by_key(|bar| bar.ts_event);
+    mapped.dedup_by_key(|bar| bar.ts_event);
+    Ok(mapped)
+}
+
+fn should_retry_live_history_with_sim(
+    request: &HistoryRequest,
+    error_code: Option<i32>,
+    allow_live_history_fallback: bool,
+) -> bool {
+    allow_live_history_fallback && request.is_live() && error_code == Some(1)
+}
+
+/// Retrieves history and optionally retries a provider-rejected live request against sim.
+///
+/// # Errors
+///
+/// Returns an error when the provider request or fallback request fails.
+pub(crate) async fn projectx_retrieve_bars_with_optional_live_fallback(
+    http: &ProjectXHttpClient,
+    request: &HistoryRequest,
+    allow_live_history_fallback: bool,
+) -> Result<(Vec<PxApiBar>, HistoricalBarsMetadata), ProjectXHttpError> {
+    match http.retrieve_bars(request).await {
+        Err(e)
+            if should_retry_live_history_with_sim(
+                request,
+                provider_error_code(&e),
+                allow_live_history_fallback,
+            ) =>
+        {
+            log::info!(
+                "ProjectX live historical bars request rejected for {:?}: {e}; retrying with live=false because {ALLOW_LIVE_HISTORY_FALLBACK_PARAM}=true",
+                request.contract_id(),
+            );
+            let fallback_request = HistoryRequest::builder(
+                request.contract_id().clone(),
+                false,
+                request.start_time(),
+                request.end_time(),
+                request.unit(),
+            )
+            .unit_number(request.unit_number())
+            .limit(request.limit())
+            .include_partial_bar(request.includes_partial_bar())
+            .build()
+            .map_err(anyhow::Error::from)?;
+            http.retrieve_bars(&fallback_request).await.map(|bars| {
+                (
+                    bars,
+                    HistoricalBarsMetadata {
+                        live_history_fallback_used: true,
+                        requested_live: true,
+                        history_source_live: false,
+                    },
+                )
+            })
+        }
+        Ok(bars) => Ok((
+            bars,
+            HistoricalBarsMetadata {
+                live_history_fallback_used: false,
+                requested_live: request.is_live(),
+                history_source_live: request.is_live(),
+            },
+        )),
+        Err(e) => Err(e),
+    }
 }
 
 #[derive(Debug)]
@@ -165,11 +346,14 @@ pub struct ProjectXDataClient {
     market_data_live: bool,
     ws_market: Option<ProjectXWsClient>,
     ws_event_task: Option<tokio::task::JoinHandle<()>>,
-    is_connected: AtomicBool,
+    pending_tasks: TaskHandles,
+    cleanup_tasks: TaskHandles,
+    is_connected: Arc<AtomicBool>,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    quote_subs: Arc<DashMap<String, InstrumentId>>,
-    trade_subs: Arc<DashMap<String, InstrumentId>>,
-    depth_subs: Arc<DashMap<String, InstrumentId>>,
+    quote_subs: SubscriptionAliases,
+    trade_subs: SubscriptionAliases,
+    depth_subs: SubscriptionAliases,
+    quote_bbo: Arc<DashMap<InstrumentId, BboState>>,
     depth_sequence: Arc<DashMap<InstrumentId, u64>>,
     depth_ts_last: Arc<DashMap<InstrumentId, UnixNanos>>,
     depth_slots: Arc<DashMap<DepthSlotKey, Decimal>>,
@@ -183,30 +367,68 @@ impl ProjectXDataClient {
     /// # Errors
     ///
     /// Returns an error if the transport client cannot be created.
-    #[allow(clippy::needless_pass_by_value)]
     pub fn new(client_id: ClientId, config: ProjectXDataClientConfig) -> anyhow::Result<Self> {
-        let http_client = ProjectXHttpClient::from_config(config.transport.clone())?;
+        let ProjectXDataClientConfig {
+            transport,
+            market_data_live,
+        } = config;
+        let http_client = ProjectXHttpClient::from_config(transport)?;
         Ok(Self {
             client_id,
             http_client,
-            market_data_live: config.market_data_live,
+            market_data_live,
             ws_market: None,
             ws_event_task: None,
-            is_connected: AtomicBool::new(false),
+            pending_tasks: TaskHandles::default(),
+            cleanup_tasks: TaskHandles::default(),
+            is_connected: Arc::new(AtomicBool::new(false)),
             data_sender: get_data_event_sender(),
             quote_subs: Arc::new(DashMap::new()),
             trade_subs: Arc::new(DashMap::new()),
             depth_subs: Arc::new(DashMap::new()),
+            quote_bbo: Arc::new(DashMap::new()),
             depth_sequence: Arc::new(DashMap::new()),
             depth_ts_last: Arc::new(DashMap::new()),
             depth_slots: Arc::new(DashMap::new()),
-            contracts_by_symbol_live: Arc::new(ParkingRwLock::new(AHashMap::new())),
-            contracts_by_symbol_sim: Arc::new(ParkingRwLock::new(AHashMap::new())),
+            contracts_by_symbol_live: Arc::new(ParkingRwLock::new(HashMap::new())),
+            contracts_by_symbol_sim: Arc::new(ParkingRwLock::new(HashMap::new())),
         })
     }
 
     fn contract_from_symbol(symbol: &str) -> String {
         databento_to_projectx_symbol(symbol).unwrap_or_else(|_| symbol.to_string())
+    }
+
+    fn spawn_task<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.pending_tasks.push(get_runtime().spawn(future));
+    }
+
+    fn spawn_cleanup_task<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.cleanup_tasks.push(get_runtime().spawn(future));
+    }
+
+    fn abort_pending_tasks(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let tasks = self.pending_tasks.take_all();
+        for task in &tasks {
+            task.abort();
+        }
+        tasks
+    }
+
+    async fn join_tasks(tasks: Vec<tokio::task::JoinHandle<()>>) {
+        for task in tasks {
+            if let Err(e) = task.await
+                && !e.is_cancelled()
+            {
+                log::warn!("ProjectX data task failed during shutdown: {e}");
+            }
+        }
     }
 
     fn normalize_symbol_key(value: &str) -> String {
@@ -225,12 +447,7 @@ impl ProjectXDataClient {
         let mut hasher = DefaultHasher::new();
         trade.symbol_id.to_string().hash(&mut hasher);
         ts_event.as_u64().hash(&mut hasher);
-        trade
-            .price
-            .to_f64()
-            .unwrap_or_default()
-            .to_bits()
-            .hash(&mut hasher);
+        trade.price.hash(&mut hasher);
         trade.volume.hash(&mut hasher);
         trade.trade_type.code().hash(&mut hasher);
         TradeId::new(format!("PXM-{:016X}", hasher.finish()))
@@ -261,35 +478,48 @@ impl ProjectXDataClient {
     }
 
     fn register_contract_mapping(
-        map: &DashMap<String, InstrumentId>,
+        map: &DashMap<String, AHashSet<InstrumentId>>,
         contract_id: &str,
         instrument_id: InstrumentId,
     ) {
-        map.insert(contract_id.to_string(), instrument_id);
-        map.insert(projectx_contract_root(contract_id), instrument_id);
+        Self::register_subscription_alias(map, contract_id, instrument_id);
+        Self::register_subscription_alias(map, &projectx_contract_root(contract_id), instrument_id);
     }
 
     fn register_contract_aliases(
-        map: &DashMap<String, InstrumentId>,
+        map: &DashMap<String, AHashSet<InstrumentId>>,
         contract: Option<&Contract>,
         instrument_id: InstrumentId,
     ) {
-        map.insert(instrument_id.symbol.inner().to_string(), instrument_id);
-        map.insert(
-            projectx_contract_root(instrument_id.symbol.inner().as_str()),
+        Self::register_subscription_alias(
+            map,
+            instrument_id.symbol.inner().as_str(),
+            instrument_id,
+        );
+        Self::register_subscription_alias(
+            map,
+            &projectx_contract_root(instrument_id.symbol.inner().as_str()),
             instrument_id,
         );
 
         if let Some(contract) = contract {
             Self::register_contract_mapping(map, contract.id.as_ref(), instrument_id);
-            map.insert(Self::normalize_symbol_key(&contract.name), instrument_id);
-            map.insert(
-                Self::normalize_symbol_key(contract.symbol_id.as_ref()),
-                instrument_id,
-            );
+            Self::register_subscription_alias(map, &contract.name, instrument_id);
+            Self::register_subscription_alias(map, contract.symbol_id.as_ref(), instrument_id);
         } else {
             let contract_id = Self::contract_from_symbol(instrument_id.symbol.inner().as_str());
             Self::register_contract_mapping(map, &contract_id, instrument_id);
+        }
+    }
+
+    fn register_subscription_alias(
+        map: &DashMap<String, AHashSet<InstrumentId>>,
+        alias: &str,
+        instrument_id: InstrumentId,
+    ) {
+        let key = Self::normalize_symbol_key(alias);
+        if !key.is_empty() {
+            map.entry(key).or_default().insert(instrument_id);
         }
     }
 
@@ -382,43 +612,87 @@ impl ProjectXDataClient {
         Ok(contract)
     }
 
-    fn remove_contract_mapping(map: &DashMap<String, InstrumentId>, contract_id: &str) {
-        map.remove(contract_id);
-        map.remove(&projectx_contract_root(contract_id));
+    fn remove_instrument_aliases(
+        map: &DashMap<String, AHashSet<InstrumentId>>,
+        instrument_id: InstrumentId,
+    ) {
+        map.retain(|_, instrument_ids| {
+            instrument_ids.remove(&instrument_id);
+            !instrument_ids.is_empty()
+        });
     }
 
     fn resolve_instrument_id(
-        map: &DashMap<String, InstrumentId>,
+        map: &DashMap<String, AHashSet<InstrumentId>>,
         primary: Option<&str>,
         fallback: Option<&str>,
     ) -> Option<InstrumentId> {
         if let Some(primary) = primary {
-            if let Some(instrument_id) = map.get(primary).map(|v| *v) {
+            if let Some(instrument_id) = Self::resolve_subscription_alias(map, primary) {
                 return Some(instrument_id);
             }
             let root = projectx_contract_root(primary);
 
-            if let Some(instrument_id) = map.get(&root).map(|v| *v) {
+            if let Some(instrument_id) = Self::resolve_subscription_alias(map, &root) {
                 return Some(instrument_id);
             }
         }
 
         if let Some(fallback) = fallback {
-            if let Some(instrument_id) = map.get(fallback).map(|v| *v) {
+            if let Some(instrument_id) = Self::resolve_subscription_alias(map, fallback) {
                 return Some(instrument_id);
             }
             let root = projectx_contract_root(fallback);
 
-            if let Some(instrument_id) = map.get(&root).map(|v| *v) {
+            if let Some(instrument_id) = Self::resolve_subscription_alias(map, &root) {
                 return Some(instrument_id);
             }
         }
 
-        if map.len() == 1 {
-            return map.iter().next().map(|entry| *entry.value());
+        None
+    }
+
+    fn resolve_subscription_alias(
+        map: &DashMap<String, AHashSet<InstrumentId>>,
+        alias: &str,
+    ) -> Option<InstrumentId> {
+        let key = Self::normalize_symbol_key(alias);
+        let instrument_ids = map.get(&key)?;
+        (instrument_ids.len() == 1)
+            .then(|| instrument_ids.iter().next().copied())
+            .flatten()
+    }
+
+    fn subscribed_instrument_ids(
+        map: &DashMap<String, AHashSet<InstrumentId>>,
+    ) -> Vec<InstrumentId> {
+        let mut unique_ids = AHashSet::new();
+        for entry in map {
+            unique_ids.extend(entry.value().iter().copied());
+        }
+        let mut instrument_ids = unique_ids.into_iter().collect::<Vec<_>>();
+        instrument_ids.sort_unstable_by_key(ToString::to_string);
+        instrument_ids
+    }
+
+    fn consolidate_quote_bbo(
+        quote_bbo: &DashMap<InstrumentId, BboState>,
+        instrument_id: InstrumentId,
+        quote: &MarketQuote,
+    ) -> Option<(Decimal, Decimal)> {
+        if quote.best_bid.is_none() && quote.best_ask.is_none() {
+            return None;
         }
 
-        None
+        let mut state = quote_bbo.entry(instrument_id).or_default();
+        if let Some(best_bid) = quote.best_bid {
+            state.bid = Some(best_bid);
+        }
+        if let Some(best_ask) = quote.best_ask {
+            state.ask = Some(best_ask);
+        }
+
+        state.bid.zip(state.ask)
     }
 
     fn contract_to_instrument(contract: &Contract) -> anyhow::Result<InstrumentAny> {
@@ -464,18 +738,10 @@ impl ProjectXDataClient {
         }
     }
 
-    fn depth_slot_side_key(side: OrderSide) -> u8 {
-        match side {
-            OrderSide::Buy => 0,
-            OrderSide::Sell => 1,
-            _ => unreachable!("depth slot side must be buy or sell"),
-        }
-    }
-
     fn depth_slot_key(instrument_id: InstrumentId, side: OrderSide, index: i32) -> DepthSlotKey {
         DepthSlotKey {
             instrument_id,
-            side: Self::depth_slot_side_key(side),
+            side,
             index,
         }
     }
@@ -508,19 +774,10 @@ impl ProjectXDataClient {
         }
     }
 
-    fn depth_level_size(depth: &MarketDepth) -> f64 {
-        // ProjectX emits both `volume` and `currentVolume`; for MBP state we prioritize the
-        // current level quantity and only fall back to `volume` when current level is absent.
-
-        if depth.current_volume > 0 {
-            return depth.current_volume as f64;
-        }
-
-        if depth.current_volume == 0 && depth.volume > 0 {
-            return depth.volume as f64;
-        }
-
-        0.0
+    fn depth_level_size(depth: &MarketDepth) -> i64 {
+        // `currentVolume` is the authoritative resting size. In particular,
+        // zero means delete even when the incremental `volume` field is positive.
+        depth.current_volume.max(0)
     }
 
     fn next_depth_sequence(
@@ -547,26 +804,25 @@ impl ProjectXDataClient {
         instrument_id: InstrumentId,
         side: OrderSide,
         price: Decimal,
-        size: f64,
+        size: i64,
         action: BookAction,
         is_last: bool,
         context: DepthDeltaContext,
-    ) -> OrderBookDelta {
+    ) -> anyhow::Result<OrderBookDelta> {
         let mut flags = RecordFlag::F_MBP as u8;
         if is_last {
             flags |= RecordFlag::F_LAST as u8;
         }
 
-        let price_bits = price.to_f64().unwrap_or_default().to_bits();
-        OrderBookDelta::new(
+        let mut hasher = DefaultHasher::new();
+        price.hash(&mut hasher);
+        let price_key = hasher.finish();
+        let price = Price::from_decimal(price)?;
+        let size = Quantity::from_decimal(Decimal::from(size.max(0)))?;
+        OrderBookDelta::new_checked(
             instrument_id,
             action,
-            BookOrder::new(
-                side,
-                Price::from_decimal(price).expect_display(FAILED),
-                Quantity::new(size.max(0.0), 0),
-                price_bits,
-            ),
+            BookOrder::new(side, price, size, price_key),
             flags,
             context.seq,
             context.ts_event,
@@ -581,14 +837,19 @@ impl ProjectXDataClient {
         seq: u64,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
-    ) -> Vec<OrderBookDelta> {
+    ) -> anyhow::Result<Vec<OrderBookDelta>> {
         if depth.depth_type == DepthType::Reset {
             Self::clear_depth_slots_for_instrument(depth_slots, instrument_id);
-            return vec![OrderBookDelta::clear(instrument_id, seq, ts_event, ts_init)];
+            return Ok(vec![OrderBookDelta::clear(
+                instrument_id,
+                seq,
+                ts_event,
+                ts_init,
+            )]);
         }
 
         let Some(side) = Self::parse_depth_side(depth.depth_type) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
 
         let level_size = Self::depth_level_size(depth);
@@ -602,7 +863,7 @@ impl ProjectXDataClient {
         };
         let mut deltas = Vec::new();
 
-        if level_size > 0.0 {
+        if level_size > 0 {
             if let Some(slot_key) = slot_key {
                 if let Some(mut entry) = depth_slots.get_mut(&slot_key) {
                     let previous_price = *entry;
@@ -611,11 +872,11 @@ impl ProjectXDataClient {
                             instrument_id,
                             side,
                             previous_price,
-                            0.0,
+                            0,
                             BookAction::Delete,
                             false,
                             context,
-                        ));
+                        )?);
                     }
                     *entry = depth_price;
                 } else {
@@ -631,9 +892,9 @@ impl ProjectXDataClient {
                 BookAction::Update,
                 true,
                 context,
-            ));
+            )?);
 
-            return deltas;
+            return Ok(deltas);
         }
 
         let delete_price = if let Some(slot_key) = slot_key {
@@ -644,15 +905,15 @@ impl ProjectXDataClient {
             depth_price
         };
 
-        vec![Self::build_depth_delta(
+        Ok(vec![Self::build_depth_delta(
             instrument_id,
             side,
             delete_price,
-            0.0,
+            0,
             BookAction::Delete,
             true,
             context,
-        )]
+        )?])
     }
 
     fn map_bar_request(
@@ -661,43 +922,29 @@ impl ProjectXDataClient {
         default_live: bool,
     ) -> anyhow::Result<MappedBarRequest> {
         let bar_type = request.bar_type;
-        let spec = bar_type.spec();
         let instrument_id = bar_type.instrument_id();
         let params = request.params.as_ref();
-        let step =
-            i32::try_from(spec.step.get()).map_err(|_| anyhow::anyhow!("Invalid bar step"))?;
-
-        let default_unit = match spec.aggregation {
-            // ProjectX API enum: 1=Second, 2=Minute, 3=Hour, 4=Day, 5=Week, 6=Month.
-            BarAggregation::Second => 1,
-            BarAggregation::Minute => 2,
-            BarAggregation::Hour => 3,
-            BarAggregation::Day => 4,
-            BarAggregation::Week => 5,
-            BarAggregation::Month => 6,
-            _ => anyhow::bail!(
-                "Unsupported ProjectX bar aggregation: {:?}",
-                spec.aggregation
-            ),
+        let (expected_unit, expected_step) = projectx_expected_history_bar_unit(bar_type)?;
+        // ProjectX API enum: 1=Second, 2=Minute, 3=Hour, 4=Day, 5=Week, 6=Month.
+        let default_unit = match expected_unit {
+            BarUnit::Second => 1,
+            BarUnit::Minute => 2,
+            BarUnit::Hour => 3,
+            BarUnit::Day => 4,
+            BarUnit::Week => 5,
+            BarUnit::Month => 6,
+            _ => anyhow::bail!("Unsupported ProjectX bar unit: {expected_unit:?}"),
         };
 
         let unit = params
             .and_then(|p| p.get_i64("unit"))
             .and_then(|v| i32::try_from(v).ok())
             .unwrap_or(default_unit);
-        let bar_unit = match unit {
-            1 => BarUnit::Second,
-            2 => BarUnit::Minute,
-            3 => BarUnit::Hour,
-            4 => BarUnit::Day,
-            5 => BarUnit::Week,
-            6 => BarUnit::Month,
-            _ => anyhow::bail!("Unsupported ProjectX bar unit code: {unit}"),
-        };
         let unit_number = params
             .and_then(|p| p.get_i64("unit_number"))
             .and_then(|v| i32::try_from(v).ok())
-            .unwrap_or(step);
+            .unwrap_or(expected_step);
+        let bar_unit = projectx_validate_history_bar_semantics(bar_type, unit, unit_number)?;
         let limit = request
             .limit
             .map(|n| n.get() as i32)
@@ -741,35 +988,6 @@ impl ProjectXDataClient {
             datetime_to_unix_nanos(Some(start)),
             datetime_to_unix_nanos(Some(end)),
         ))
-    }
-
-    fn map_historical_bars(bar_type: BarType, bars: Vec<PxApiBar>) -> Vec<Bar> {
-        let mut mapped = bars
-            .into_iter()
-            .filter_map(|bar| {
-                let ts_event = u64::try_from(bar.t.as_jiff().as_nanosecond())
-                    .ok()
-                    .map(UnixNanos::from)?;
-                let precision = [bar.o, bar.h, bar.l, bar.c]
-                    .into_iter()
-                    .map(|px| px.scale() as u8)
-                    .max()
-                    .unwrap_or(0);
-                Some(Bar::new(
-                    bar_type,
-                    Price::from_decimal_dp(bar.o, precision).expect_display(FAILED),
-                    Price::from_decimal_dp(bar.h, precision).expect_display(FAILED),
-                    Price::from_decimal_dp(bar.l, precision).expect_display(FAILED),
-                    Price::from_decimal_dp(bar.c, precision).expect_display(FAILED),
-                    Quantity::new(bar.v as f64, 0),
-                    ts_event,
-                    ts_event,
-                ))
-            })
-            .collect::<Vec<_>>();
-        mapped.sort_by_key(|bar| bar.ts_event);
-        mapped.dedup_by_key(|bar| bar.ts_event);
-        mapped
     }
 
     fn normalize_historical_bars(mut bars: Vec<Bar>) -> Vec<Bar> {
@@ -844,66 +1062,6 @@ impl ProjectXDataClient {
         response_params
     }
 
-    fn should_retry_live_history_with_sim(
-        request: &HistoryRequest,
-        error_code: Option<i32>,
-        allow_live_history_fallback: bool,
-    ) -> bool {
-        allow_live_history_fallback && request.is_live() && error_code == Some(1)
-    }
-
-    async fn retrieve_bars_page(
-        http: &ProjectXHttpClient,
-        request: &HistoryRequest,
-        instrument_symbol: &str,
-        allow_live_history_fallback: bool,
-    ) -> Result<(Vec<PxApiBar>, HistoricalBarsMetadata), ProjectXHttpError> {
-        match http.retrieve_bars(request).await {
-            Err(e)
-                if Self::should_retry_live_history_with_sim(
-                    request,
-                    provider_error_code(&e),
-                    allow_live_history_fallback,
-                ) =>
-            {
-                log::info!(
-                    "ProjectX live historical bars request rejected for {instrument_symbol}: {e}; retrying with live=false because {ALLOW_LIVE_HISTORY_FALLBACK_PARAM}=true",
-                );
-                let fallback_request = HistoryRequest::builder(
-                    request.contract_id().clone(),
-                    false,
-                    request.start_time(),
-                    request.end_time(),
-                    request.unit(),
-                )
-                .unit_number(request.unit_number())
-                .limit(request.limit())
-                .include_partial_bar(true)
-                .build()
-                .map_err(anyhow::Error::from)?;
-                http.retrieve_bars(&fallback_request).await.map(|response| {
-                    (
-                        response,
-                        HistoricalBarsMetadata {
-                            live_history_fallback_used: true,
-                            requested_live: true,
-                            history_source_live: false,
-                        },
-                    )
-                })
-            }
-            Ok(response) => Ok((
-                response,
-                HistoricalBarsMetadata {
-                    live_history_fallback_used: false,
-                    requested_live: request.is_live(),
-                    history_source_live: request.is_live(),
-                },
-            )),
-            Err(e) => Err(e),
-        }
-    }
-
     fn send_bars_response(
         sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
         context: &BarsResponseContext,
@@ -926,6 +1084,127 @@ impl ProjectXDataClient {
         }
     }
 
+    fn quote_tick_from_update(
+        quote_bbo: &DashMap<InstrumentId, BboState>,
+        instrument_id: InstrumentId,
+        quote: &MarketQuote,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<Option<QuoteTick>> {
+        let Some((best_bid, best_ask)) =
+            Self::consolidate_quote_bbo(quote_bbo, instrument_id, quote)
+        else {
+            return Ok(None);
+        };
+
+        anyhow::ensure!(
+            best_bid <= best_ask,
+            "crossed ProjectX BBO for {instrument_id}: bid={best_bid}, ask={best_ask}"
+        );
+        let precision = u8::try_from(best_bid.scale().max(best_ask.scale()))?;
+        let bid_price = Price::from_decimal_dp(best_bid, precision)?;
+        let ask_price = Price::from_decimal_dp(best_ask, precision)?;
+        let zero_size = Quantity::zero(0);
+        QuoteTick::new_checked(
+            instrument_id,
+            bid_price,
+            ask_price,
+            zero_size,
+            zero_size,
+            ts_event,
+            ts_init,
+        )
+        .map(Some)
+    }
+
+    fn trade_tick_from_update(
+        instrument_id: InstrumentId,
+        trade: &MarketTrade,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<TradeTick> {
+        let price = Price::from_decimal(trade.price)?;
+        let size = Quantity::from_decimal(Decimal::from(trade.volume))?;
+        TradeTick::new_checked(
+            instrument_id,
+            price,
+            size,
+            Self::map_trade_aggressor(trade.trade_type),
+            Self::market_trade_id(trade, ts_event),
+            ts_event,
+            ts_init,
+        )
+    }
+
+    fn quote_timestamp_to_unix_nanos(quote: &MarketQuote) -> anyhow::Result<UnixNanos> {
+        if let Some(timestamp) = quote.timestamp.as_ref()
+            && let Ok(ts_event) = projectx_timestamp_to_unix_nanos(timestamp)
+        {
+            return Ok(ts_event);
+        }
+
+        projectx_timestamp_to_unix_nanos(&quote.last_updated)
+    }
+
+    fn reset_market_stream_state(
+        sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        quote_bbo: &DashMap<InstrumentId, BboState>,
+        depth_subs: &DashMap<String, AHashSet<InstrumentId>>,
+        depth_sequence: &DashMap<InstrumentId, u64>,
+        depth_ts_last: &DashMap<InstrumentId, UnixNanos>,
+        depth_slots: &DashMap<DepthSlotKey, Decimal>,
+    ) {
+        let mut subscribed_depth_ids = AHashSet::new();
+        for entry in depth_subs {
+            subscribed_depth_ids.extend(entry.value().iter().copied());
+        }
+        let mut depth_instrument_ids = depth_sequence
+            .iter()
+            .map(|entry| *entry.key())
+            .chain(depth_ts_last.iter().map(|entry| *entry.key()))
+            .chain(depth_slots.iter().map(|entry| entry.key().instrument_id))
+            .collect::<AHashSet<_>>();
+        depth_instrument_ids.retain(|instrument_id| subscribed_depth_ids.contains(instrument_id));
+
+        quote_bbo.clear();
+        depth_sequence.clear();
+        depth_ts_last.clear();
+        depth_slots.clear();
+
+        let ts_init = get_atomic_clock_realtime().get_time_ns();
+        for instrument_id in depth_instrument_ids {
+            let clear = OrderBookDelta::clear(instrument_id, 0, ts_init, ts_init);
+            let Ok(deltas) = OrderBookDeltas::new_checked(instrument_id, vec![clear]) else {
+                log::error!("ProjectX failed to build non-empty depth reset for {instrument_id}");
+                continue;
+            };
+            if let Err(e) = sender.send(DataEvent::Data(Data::Deltas(Box::new(deltas)))) {
+                log::warn!("ProjectX depth reset send failed: {e}");
+                break;
+            }
+        }
+    }
+
+    fn fence_market_stream_state(
+        is_connected: &AtomicBool,
+        sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        quote_bbo: &DashMap<InstrumentId, BboState>,
+        depth_subs: &DashMap<String, AHashSet<InstrumentId>>,
+        depth_sequence: &DashMap<InstrumentId, u64>,
+        depth_ts_last: &DashMap<InstrumentId, UnixNanos>,
+        depth_slots: &DashMap<DepthSlotKey, Decimal>,
+    ) {
+        is_connected.store(false, Ordering::Release);
+        Self::reset_market_stream_state(
+            sender,
+            quote_bbo,
+            depth_subs,
+            depth_sequence,
+            depth_ts_last,
+            depth_slots,
+        );
+    }
+
     fn spawn_ws_event_task(&mut self, ws_market: &ProjectXWsClient) {
         let ws_market = ws_market.clone();
         let sender = self.data_sender.clone();
@@ -935,15 +1214,65 @@ impl ProjectXDataClient {
         let depth_sequence = Arc::clone(&self.depth_sequence);
         let depth_ts_last = Arc::clone(&self.depth_ts_last);
         let depth_slots = Arc::clone(&self.depth_slots);
+        let quote_bbo = Arc::clone(&self.quote_bbo);
+        let is_connected = Arc::clone(&self.is_connected);
 
         let handle = get_runtime().spawn(async move {
             let Some(mut rx) = ws_market.take_event_receiver().await else {
+                Self::fence_market_stream_state(
+                    &is_connected,
+                    &sender,
+                    &quote_bbo,
+                    &depth_subs,
+                    &depth_sequence,
+                    &depth_ts_last,
+                    &depth_slots,
+                );
                 return;
             };
 
-            while let Some(event) = rx.recv().await {
+            'events: while let Some(event) = rx.recv().await {
                 match event {
+                    ProjectXWsEvent::Connected => {
+                        is_connected.store(true, Ordering::Release);
+                    }
+                    ProjectXWsEvent::Disconnected => {
+                        Self::fence_market_stream_state(
+                            &is_connected,
+                            &sender,
+                            &quote_bbo,
+                            &depth_subs,
+                            &depth_sequence,
+                            &depth_ts_last,
+                            &depth_slots,
+                        );
+                    }
+                    ProjectXWsEvent::Reconnected => {
+                        Self::reset_market_stream_state(
+                            &sender,
+                            &quote_bbo,
+                            &depth_subs,
+                            &depth_sequence,
+                            &depth_ts_last,
+                            &depth_slots,
+                        );
+                        is_connected.store(true, Ordering::Release);
+                    }
+                    ProjectXWsEvent::ReconciliationRequired => {
+                        Self::fence_market_stream_state(
+                            &is_connected,
+                            &sender,
+                            &quote_bbo,
+                            &depth_subs,
+                            &depth_sequence,
+                            &depth_ts_last,
+                            &depth_slots,
+                        );
+                    }
                     ProjectXWsEvent::MarketQuote(quote) => {
+                        if !is_connected.load(Ordering::Acquire) {
+                            continue;
+                        }
                         let instrument_id = Self::resolve_instrument_id(
                             &quote_subs,
                             Some(quote.raw_symbol.as_ref()),
@@ -953,34 +1282,43 @@ impl ProjectXDataClient {
                             continue;
                         };
 
-                        let ts_event = quote
-                            .timestamp
-                            .and_then(|ts| {
-                                u64::try_from(ts.as_jiff().as_nanosecond())
-                                    .ok()
-                                    .map(UnixNanos::from)
-                            })
-                            .or_else(|| {
-                                u64::try_from(quote.last_updated.as_jiff().as_nanosecond())
-                                    .ok()
-                                    .map(UnixNanos::from)
-                            })
-                            .unwrap_or_else(|| get_atomic_clock_realtime().get_time_ns());
-                        let best_bid = quote.best_bid.unwrap_or_default();
-                        let best_ask = quote.best_ask.unwrap_or_default();
-                        let px_precision = best_bid.scale().max(best_ask.scale()) as u8;
-                        let quote_tick = QuoteTick::new(
+                        let ts_event = match Self::quote_timestamp_to_unix_nanos(&quote) {
+                            Ok(ts_event) => ts_event,
+                            Err(e) => {
+                                log::warn!("ProjectX quote timestamp invalid: {e}");
+                                continue;
+                            }
+                        };
+                        let ts_init = get_atomic_clock_realtime().get_time_ns();
+                        match Self::quote_tick_from_update(
+                            &quote_bbo,
                             instrument_id,
-                            Price::from_decimal_dp(best_bid, px_precision).expect_display(FAILED),
-                            Price::from_decimal_dp(best_ask, px_precision).expect_display(FAILED),
-                            Quantity::new(0.0, 0),
-                            Quantity::new(0.0, 0),
+                            &quote,
                             ts_event,
-                            get_atomic_clock_realtime().get_time_ns(),
-                        );
-                        let _ = sender.send(DataEvent::Data(Data::Quote(quote_tick)));
+                            ts_init,
+                        ) {
+                            Ok(Some(quote_tick)) => {
+                                if sender
+                                    .send(DataEvent::Data(Data::Quote(quote_tick)))
+                                    .is_err()
+                                {
+                                    log::warn!(
+                                        "ProjectX data receiver dropped, stopping event task"
+                                    );
+                                    break 'events;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                quote_bbo.remove(&instrument_id);
+                                log::warn!("ProjectX quote conversion failed: {e}");
+                            }
+                        }
                     }
                     ProjectXWsEvent::MarketTrade(trade) => {
+                        if !is_connected.load(Ordering::Acquire) {
+                            continue;
+                        }
                         let instrument_id = Self::resolve_instrument_id(
                             &trade_subs,
                             Some(trade.symbol_id.as_ref()),
@@ -994,25 +1332,31 @@ impl ProjectXDataClient {
                             continue;
                         }
 
-                        let ts_event = u64::try_from(trade.timestamp.as_jiff().as_nanosecond())
-                            .ok()
-                            .map_or_else(
-                                || get_atomic_clock_realtime().get_time_ns(),
-                                UnixNanos::from,
-                            );
-                        let price = trade.price;
-                        let tick = TradeTick::new(
-                            instrument_id,
-                            Price::from_decimal(price).expect_display(FAILED),
-                            Quantity::new(trade.volume as f64, 0),
-                            Self::map_trade_aggressor(trade.trade_type),
-                            Self::market_trade_id(&trade, ts_event),
-                            ts_event,
-                            get_atomic_clock_realtime().get_time_ns(),
-                        );
-                        let _ = sender.send(DataEvent::Data(Data::Trade(tick)));
+                        let ts_event = match projectx_timestamp_to_unix_nanos(&trade.timestamp) {
+                            Ok(ts_event) => ts_event,
+                            Err(e) => {
+                                log::warn!("ProjectX trade timestamp invalid: {e}");
+                                continue;
+                            }
+                        };
+                        let ts_init = get_atomic_clock_realtime().get_time_ns();
+                        match Self::trade_tick_from_update(instrument_id, &trade, ts_event, ts_init)
+                        {
+                            Ok(tick) => {
+                                if sender.send(DataEvent::Data(Data::Trade(tick))).is_err() {
+                                    log::warn!(
+                                        "ProjectX data receiver dropped, stopping event task"
+                                    );
+                                    break 'events;
+                                }
+                            }
+                            Err(e) => log::warn!("ProjectX trade conversion failed: {e}"),
+                        }
                     }
                     ProjectXWsEvent::MarketDepth(depth) => {
+                        if !is_connected.load(Ordering::Acquire) {
+                            continue;
+                        }
                         let instrument_id = Self::resolve_instrument_id(
                             &depth_subs,
                             depth.symbol_id.as_ref().map(ToString::to_string).as_deref(),
@@ -1022,35 +1366,112 @@ impl ProjectXDataClient {
                             continue;
                         };
 
-                        let raw_ts_event = u64::try_from(depth.timestamp.as_jiff().as_nanosecond())
-                            .ok()
-                            .map_or_else(
-                                || get_atomic_clock_realtime().get_time_ns(),
-                                UnixNanos::from,
-                            );
+                        let raw_ts_event = match projectx_timestamp_to_unix_nanos(&depth.timestamp)
+                        {
+                            Ok(ts_event) => ts_event,
+                            Err(e) => {
+                                log::warn!("ProjectX depth timestamp invalid: {e}");
+                                continue;
+                            }
+                        };
                         let ts_event =
                             Self::clamp_depth_ts_event(&depth_ts_last, instrument_id, raw_ts_event);
                         let seq = Self::next_depth_sequence(&depth_sequence, instrument_id);
                         let ts_init = get_atomic_clock_realtime().get_time_ns();
-                        let deltas = Self::map_depth_event(
+                        let deltas = match Self::map_depth_event(
                             &depth_slots,
                             instrument_id,
                             &depth,
                             seq,
                             ts_event,
                             ts_init,
-                        );
+                        ) {
+                            Ok(deltas) => deltas,
+                            Err(e) => {
+                                Self::clear_depth_slots_for_instrument(&depth_slots, instrument_id);
+                                log::warn!("ProjectX depth conversion failed: {e}");
+                                continue;
+                            }
+                        };
 
-                        if !deltas.is_empty() {
-                            let grouped = OrderBookDeltas::new(instrument_id, deltas);
-                            let _ = sender.send(DataEvent::Data(Data::Deltas(Box::new(grouped))));
+                        if deltas.is_empty() {
+                            continue;
+                        }
+                        let grouped = match OrderBookDeltas::new_checked(instrument_id, deltas) {
+                            Ok(grouped) => grouped,
+                            Err(e) => {
+                                log::warn!("ProjectX depth grouping failed: {e}");
+                                continue;
+                            }
+                        };
+                        if sender
+                            .send(DataEvent::Data(Data::Deltas(Box::new(grouped))))
+                            .is_err()
+                        {
+                            log::warn!("ProjectX data receiver dropped, stopping event task");
+                            break 'events;
                         }
                     }
                     _ => {}
                 }
             }
+
+            Self::fence_market_stream_state(
+                &is_connected,
+                &sender,
+                &quote_bbo,
+                &depth_subs,
+                &depth_sequence,
+                &depth_ts_last,
+                &depth_slots,
+            );
         });
         self.ws_event_task = Some(handle);
+    }
+
+    async fn replay_market_subscription_set(
+        &self,
+        ws_market: &ProjectXWsClient,
+        subscriptions: &DashMap<String, AHashSet<InstrumentId>>,
+        target: &'static str,
+    ) -> anyhow::Result<()> {
+        for instrument_id in Self::subscribed_instrument_ids(subscriptions) {
+            let public_symbol = instrument_id.symbol.inner().to_string();
+            let contract = self.find_contract(&public_symbol);
+            let contract_id = if let Some(contract) = contract.as_ref() {
+                contract.id.to_string()
+            } else {
+                Self::resolve_contract_id_for_symbol(
+                    &self.http_client,
+                    self.contract_cache(self.market_data_live),
+                    &public_symbol,
+                    self.market_data_live,
+                )
+                .await
+            };
+            Self::register_contract_aliases(subscriptions, contract.as_ref(), instrument_id);
+            Self::register_contract_mapping(subscriptions, &contract_id, instrument_id);
+            ws_market
+                .invoke(target, vec![Value::String(contract_id)], true)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn replay_market_subscriptions(
+        &self,
+        ws_market: &ProjectXWsClient,
+    ) -> anyhow::Result<()> {
+        self.replay_market_subscription_set(ws_market, &self.quote_subs, "SubscribeContractQuotes")
+            .await?;
+        self.replay_market_subscription_set(ws_market, &self.trade_subs, "SubscribeContractTrades")
+            .await?;
+        self.replay_market_subscription_set(
+            ws_market,
+            &self.depth_subs,
+            "SubscribeContractMarketDepth",
+        )
+        .await
     }
 
     fn find_contract(&self, symbol: &str) -> Option<Contract> {
@@ -1103,20 +1524,30 @@ impl DataClient for ProjectXDataClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        drop(self.abort_pending_tasks());
+        self.is_connected.store(false, Ordering::Release);
+
         if let Some(task) = self.ws_event_task.take() {
             task.abort();
         }
 
+        Self::reset_market_stream_state(
+            &self.data_sender,
+            &self.quote_bbo,
+            &self.depth_subs,
+            &self.depth_sequence,
+            &self.depth_ts_last,
+            &self.depth_slots,
+        );
+
         if let Some(ws_market) = self.ws_market.take() {
-            get_runtime().spawn(async move {
-                let _ = ws_market.disconnect().await;
+            self.spawn_cleanup_task(async move {
+                if let Err(e) = ws_market.disconnect().await {
+                    log::warn!("ProjectX market websocket cleanup failed: {e}");
+                }
             });
         }
         self.http_client.stop();
-        self.is_connected.store(false, Ordering::Release);
-        self.depth_slots.clear();
-        self.depth_sequence.clear();
-        self.depth_ts_last.clear();
         Ok(())
     }
 
@@ -1141,10 +1572,32 @@ impl DataClient for ProjectXDataClient {
             return Ok(());
         }
 
+        Self::join_tasks(self.cleanup_tasks.take_all()).await;
+
         self.http_client.start().await?;
-        self.load_instruments().await?;
+        if let Err(e) = self.load_instruments().await {
+            self.http_client.stop();
+            return Err(e);
+        }
         let ws_market = self.http_client.create_ws_client(ProjectXHub::Market);
-        ws_market.connect().await?;
+        if let Err(e) = ws_market.connect().await {
+            if let Err(cleanup_e) = ws_market.disconnect().await {
+                log::debug!(
+                    "ProjectX failed to close market stream after connect rollback: {cleanup_e}"
+                );
+            }
+            self.http_client.stop();
+            return Err(e.into());
+        }
+        if let Err(e) = self.replay_market_subscriptions(&ws_market).await {
+            if let Err(cleanup_e) = ws_market.disconnect().await {
+                log::debug!(
+                    "ProjectX failed to close market stream after subscription replay rollback: {cleanup_e}"
+                );
+            }
+            self.http_client.stop();
+            return Err(e);
+        }
         self.spawn_ws_event_task(&ws_market);
         self.ws_market = Some(ws_market);
         self.is_connected.store(true, Ordering::Release);
@@ -1153,21 +1606,33 @@ impl DataClient for ProjectXDataClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.is_connected.store(false, Ordering::Release);
+
         if let Some(task) = self.ws_event_task.take() {
             task.abort();
         }
 
-        if let Some(ws_market) = &self.ws_market {
-            ws_market.disconnect().await?;
-        }
-        self.ws_market = None;
+        Self::reset_market_stream_state(
+            &self.data_sender,
+            &self.quote_bbo,
+            &self.depth_subs,
+            &self.depth_sequence,
+            &self.depth_ts_last,
+            &self.depth_slots,
+        );
+
+        let pending_tasks = self.abort_pending_tasks();
+        Self::join_tasks(pending_tasks).await;
+        Self::join_tasks(self.cleanup_tasks.take_all()).await;
+
+        let disconnect_result = if let Some(ws_market) = self.ws_market.take() {
+            ws_market.disconnect().await.map_err(anyhow::Error::from)
+        } else {
+            Ok(())
+        };
         self.http_client.stop();
-        self.is_connected.store(false, Ordering::Release);
-        self.depth_slots.clear();
-        self.depth_sequence.clear();
-        self.depth_ts_last.clear();
         log::info!("ProjectX data client disconnected");
-        Ok(())
+        disconnect_result
     }
 
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
@@ -1182,8 +1647,10 @@ impl DataClient for ProjectXDataClient {
         let public_symbol = cmd.instrument_id.symbol.inner().to_string();
         let contract = self.find_contract(&public_symbol);
         Self::register_contract_aliases(&self.quote_subs, contract.as_ref(), cmd.instrument_id);
+        let quote_subs = Arc::clone(&self.quote_subs);
+        let instrument_id = cmd.instrument_id;
 
-        get_runtime().spawn(async move {
+        self.spawn_task(async move {
             let contract_id = if let Some(contract) = contract {
                 contract.id.to_string()
             } else {
@@ -1195,6 +1662,7 @@ impl DataClient for ProjectXDataClient {
                 )
                 .await
             };
+            Self::register_contract_mapping(&quote_subs, &contract_id, instrument_id);
 
             if let Err(e) = ws_market
                 .invoke(
@@ -1222,8 +1690,10 @@ impl DataClient for ProjectXDataClient {
         let public_symbol = cmd.instrument_id.symbol.inner().to_string();
         let contract = self.find_contract(&public_symbol);
         Self::register_contract_aliases(&self.trade_subs, contract.as_ref(), cmd.instrument_id);
+        let trade_subs = Arc::clone(&self.trade_subs);
+        let instrument_id = cmd.instrument_id;
 
-        get_runtime().spawn(async move {
+        self.spawn_task(async move {
             let contract_id = if let Some(contract) = contract {
                 contract.id.to_string()
             } else {
@@ -1235,6 +1705,7 @@ impl DataClient for ProjectXDataClient {
                 )
                 .await
             };
+            Self::register_contract_mapping(&trade_subs, &contract_id, instrument_id);
 
             if let Err(e) = ws_market
                 .invoke(
@@ -1262,8 +1733,10 @@ impl DataClient for ProjectXDataClient {
         let public_symbol = cmd.instrument_id.symbol.inner().to_string();
         let contract = self.find_contract(&public_symbol);
         Self::register_contract_aliases(&self.depth_subs, contract.as_ref(), cmd.instrument_id);
+        let depth_subs = Arc::clone(&self.depth_subs);
+        let instrument_id = cmd.instrument_id;
 
-        get_runtime().spawn(async move {
+        self.spawn_task(async move {
             let contract_id = if let Some(contract) = contract {
                 contract.id.to_string()
             } else {
@@ -1275,6 +1748,7 @@ impl DataClient for ProjectXDataClient {
                 )
                 .await
             };
+            Self::register_contract_mapping(&depth_subs, &contract_id, instrument_id);
 
             if let Err(e) = ws_market
                 .invoke(
@@ -1291,16 +1765,16 @@ impl DataClient for ProjectXDataClient {
     }
 
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
+        let contract_id =
+            self.resolve_unsubscribe_contract_id(cmd.instrument_id.symbol.inner().as_str());
+        Self::remove_instrument_aliases(&self.quote_subs, cmd.instrument_id);
+        self.quote_bbo.remove(&cmd.instrument_id);
         let Some(ws_market) = &self.ws_market else {
             return Ok(());
         };
-
         let ws_market = ws_market.clone();
-        let contract_id =
-            self.resolve_unsubscribe_contract_id(cmd.instrument_id.symbol.inner().as_str());
-        Self::remove_contract_mapping(&self.quote_subs, &contract_id);
 
-        get_runtime().spawn(async move {
+        self.spawn_task(async move {
             let tracked_args = vec![Value::String(contract_id.clone())];
 
             if let Err(e) = ws_market
@@ -1319,16 +1793,15 @@ impl DataClient for ProjectXDataClient {
     }
 
     fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
+        let contract_id =
+            self.resolve_unsubscribe_contract_id(cmd.instrument_id.symbol.inner().as_str());
+        Self::remove_instrument_aliases(&self.trade_subs, cmd.instrument_id);
         let Some(ws_market) = &self.ws_market else {
             return Ok(());
         };
-
         let ws_market = ws_market.clone();
-        let contract_id =
-            self.resolve_unsubscribe_contract_id(cmd.instrument_id.symbol.inner().as_str());
-        Self::remove_contract_mapping(&self.trade_subs, &contract_id);
 
-        get_runtime().spawn(async move {
+        self.spawn_task(async move {
             let tracked_args = vec![Value::String(contract_id.clone())];
 
             if let Err(e) = ws_market
@@ -1347,19 +1820,18 @@ impl DataClient for ProjectXDataClient {
     }
 
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
-        let Some(ws_market) = &self.ws_market else {
-            return Ok(());
-        };
-
-        let ws_market = ws_market.clone();
         let contract_id =
             self.resolve_unsubscribe_contract_id(cmd.instrument_id.symbol.inner().as_str());
-        Self::remove_contract_mapping(&self.depth_subs, &contract_id);
+        Self::remove_instrument_aliases(&self.depth_subs, cmd.instrument_id);
         self.depth_sequence.remove(&cmd.instrument_id);
         self.depth_ts_last.remove(&cmd.instrument_id);
         Self::clear_depth_slots_for_instrument(&self.depth_slots, cmd.instrument_id);
+        let Some(ws_market) = &self.ws_market else {
+            return Ok(());
+        };
+        let ws_market = ws_market.clone();
 
-        get_runtime().spawn(async move {
+        self.spawn_task(async move {
             let tracked_args = vec![Value::String(contract_id.clone())];
 
             if let Err(e) = ws_market
@@ -1394,7 +1866,7 @@ impl DataClient for ProjectXDataClient {
         ) = Self::map_bar_request(&request, self.client_id, self.market_data_live)?;
         let contracts_by_symbol = self.clone_contract_cache(contract_live);
 
-        get_runtime().spawn(async move {
+        self.spawn_task(async move {
             let contract_id = Self::resolve_contract_id_for_symbol(
                 &http,
                 &contracts_by_symbol,
@@ -1435,7 +1907,7 @@ impl DataClient for ProjectXDataClient {
             let mut current_start_nanos = start_nanos;
             let mut bars = Vec::new();
             let mut page_count = 0usize;
-            let error_code = None;
+            let mut error_code = None;
             let mut error_message: Option<String> = None;
             let mut response_metadata = HistoricalBarsMetadata {
                 requested_live: page_request.is_live(),
@@ -1453,10 +1925,9 @@ impl DataClient for ProjectXDataClient {
                 }
                 page_count += 1;
 
-                match Self::retrieve_bars_page(
+                match projectx_retrieve_bars_with_optional_live_fallback(
                     &http,
                     &page_request,
-                    &instrument_symbol,
                     allow_live_history_fallback,
                 )
                 .await
@@ -1473,9 +1944,16 @@ impl DataClient for ProjectXDataClient {
                                 }
                             }
                         }
-                        let page_bars = Self::normalize_historical_bars(
-                            Self::map_historical_bars(bar_type, page_bars),
-                        );
+                        let page_bars = match projectx_map_historical_bars(bar_type, &page_bars) {
+                            Ok(bars) => bars,
+                            Err(e) => {
+                                log::warn!(
+                                    "ProjectX historical bar conversion failed for {instrument_symbol}: {e}"
+                                );
+                                error_message = Some(e.to_string());
+                                break;
+                            }
+                        };
 
                         if page_bars.is_empty() {
                             break;
@@ -1488,8 +1966,7 @@ impl DataClient for ProjectXDataClient {
                             end_nanos,
                         );
                         bars.extend(page_bars);
-                        bars.sort_by_key(|bar| bar.ts_event);
-                        bars.dedup_by_key(|bar| bar.ts_event);
+                        bars = Self::normalize_historical_bars(bars);
 
                         let Some(next_start) = next_start else {
                             if let (Some(last_bar), Some(end_nanos)) = (bars.last(), end_nanos)
@@ -1524,6 +2001,7 @@ impl DataClient for ProjectXDataClient {
                     }
                     Err(e) => {
                         log::warn!("ProjectX bars request failed: {e}");
+                        error_code = provider_error_code(&e);
                         error_message = Some(e.to_string());
                         break;
                     }
@@ -1555,7 +2033,7 @@ impl DataClient for ProjectXDataClient {
         let end_nanos = datetime_to_unix_nanos(request.end);
         let market_data_live = self.market_data_live;
 
-        get_runtime().spawn(async move {
+        self.spawn_task(async move {
             match Self::resolve_contract_for_symbol(
                 &http,
                 &contracts_by_symbol,
@@ -1593,15 +2071,22 @@ impl DataClient for ProjectXDataClient {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, num::NonZeroUsize, sync::Arc};
+    use std::{
+        collections::HashMap,
+        fs,
+        num::NonZeroUsize,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
-    use ahash::AHashMap;
     use dashmap::DashMap;
     use jiff::civil::date;
-    use nautilus_common::messages::data::RequestBars;
+    use nautilus_common::messages::{DataEvent, data::RequestBars};
     use nautilus_core::{Params, UUID4, UnixNanos};
     use nautilus_model::{
-        data::BarType,
+        data::{BarType, Data},
         enums::{BookAction, OrderSide, RecordFlag},
         identifiers::{ClientId, InstrumentId},
     };
@@ -1611,7 +2096,8 @@ mod tests {
     use super::{
         ALLOW_LIVE_HISTORY_FALLBACK_PARAM, HISTORY_SOURCE_LIVE_PARAM, HISTORY_SOURCE_PARAM,
         HistoricalBarsMetadata, LIVE_HISTORY_FALLBACK_USED_PARAM, ProjectXDataClient,
-        REQUESTED_LIVE_PARAM,
+        REQUESTED_LIVE_PARAM, projectx_map_historical_bars, projectx_timestamp_to_unix_nanos,
+        projectx_validate_history_bar_semantics, should_retry_live_history_with_sim,
     };
     use projectx_client::{
         Bar, Contract, ContractId, DepthType, HistoryRequest, MarketDepth, MarketQuote,
@@ -1752,18 +2238,57 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case("1969-12-31T23:59:59Z")]
+    #[case("3000-01-01T00:00:00Z")]
+    fn provider_timestamp_outside_unix_nanos_range_is_rejected(#[case] value: &str) {
+        let timestamp = ts(value);
+
+        assert!(projectx_timestamp_to_unix_nanos(&timestamp).is_err());
+    }
+
+    #[rstest::rstest]
+    fn quote_timestamp_falls_back_to_valid_last_updated() {
+        let quote: MarketQuote = serde_json::from_value(json!({
+            "symbol": "MESM6",
+            "lastUpdated": "2026-04-02T00:00:00Z",
+            "timestamp": "1969-12-31T23:59:59Z"
+        }))
+        .expect("quote");
+
+        let ts_event = ProjectXDataClient::quote_timestamp_to_unix_nanos(&quote)
+            .expect("valid last-updated fallback");
+
+        assert_eq!(
+            ts_event,
+            projectx_timestamp_to_unix_nanos(&quote.last_updated).expect("valid last updated")
+        );
+    }
+
+    #[rstest::rstest]
+    fn quote_timestamp_rejects_invalid_required_last_updated() {
+        let quote: MarketQuote = serde_json::from_value(json!({
+            "symbol": "MESM6",
+            "lastUpdated": "1969-12-31T23:59:59Z",
+            "timestamp": "3000-01-01T00:00:00Z"
+        }))
+        .expect("quote");
+
+        assert!(ProjectXDataClient::quote_timestamp_to_unix_nanos(&quote).is_err());
+    }
+
+    #[rstest::rstest]
     fn projectx_historical_bars_fixture_maps_into_sorted_bars() {
         let fixture = load_fixture("historical_bars_response.json");
         let bars: Vec<Bar> = serde_json::from_value(fixture["bars"].clone())
             .expect("historical bars fixture should deserialize");
         let bar_type = BarType::from("MNQM26.PROJECTX-1-MINUTE-LAST-EXTERNAL");
 
-        let bars = ProjectXDataClient::map_historical_bars(bar_type, bars);
+        let bars = projectx_map_historical_bars(bar_type, &bars).expect("valid bars");
 
         assert_eq!(bars.len(), 2);
         assert!(bars[0].ts_event < bars[1].ts_event);
-        assert_eq!(bars[0].close.as_f64(), 21214.0);
-        assert_eq!(bars[1].close.as_f64(), 21217.5);
+        assert_eq!(bars[0].close.as_decimal(), Decimal::from(21_214));
+        assert_eq!(bars[1].close.as_decimal(), Decimal::new(212_175, 1));
     }
 
     #[rstest::rstest]
@@ -1777,6 +2302,165 @@ mod tests {
             .expect("invocation frame should parse")
             .expect("type-1 frame");
         assert_eq!(invocation.target(), "GatewayQuote");
+    }
+
+    #[rstest::rstest]
+    fn sparse_quotes_are_consolidated_without_zero_price_substitution() {
+        let instrument_id = InstrumentId::from("MESM26.PROJECTX");
+        let quote_bbo = DashMap::new();
+        let bid_only: MarketQuote = serde_json::from_value(json!({
+            "symbol": "MESM6",
+            "bestBid": 5200.0,
+            "lastUpdated": "2026-04-02T00:00:00Z"
+        }))
+        .expect("bid quote");
+        let ask_only: MarketQuote = serde_json::from_value(json!({
+            "symbol": "MESM6",
+            "bestAsk": 5200.25,
+            "lastUpdated": "2026-04-02T00:00:01Z"
+        }))
+        .expect("ask quote");
+        let newer_bid: MarketQuote = serde_json::from_value(json!({
+            "symbol": "MESM6",
+            "bestBid": 5200.10,
+            "lastUpdated": "2026-04-02T00:00:02Z"
+        }))
+        .expect("newer bid quote");
+        let ts_event = UnixNanos::from(1_u64);
+        let ts_init = UnixNanos::from(2_u64);
+
+        assert!(
+            ProjectXDataClient::quote_tick_from_update(
+                &quote_bbo,
+                instrument_id,
+                &bid_only,
+                ts_event,
+                ts_init,
+            )
+            .expect("valid bid")
+            .is_none()
+        );
+        let complete = ProjectXDataClient::quote_tick_from_update(
+            &quote_bbo,
+            instrument_id,
+            &ask_only,
+            ts_event,
+            ts_init,
+        )
+        .expect("valid ask")
+        .expect("complete BBO");
+        assert_eq!(complete.bid_price.as_decimal(), Decimal::from(5200));
+        assert_eq!(complete.ask_price.as_decimal(), Decimal::new(520_025, 2));
+
+        let updated = ProjectXDataClient::quote_tick_from_update(
+            &quote_bbo,
+            instrument_id,
+            &newer_bid,
+            ts_event,
+            ts_init,
+        )
+        .expect("valid newer bid")
+        .expect("consolidated BBO");
+        assert_eq!(updated.bid_price.as_decimal(), Decimal::new(52_001, 1));
+        assert_eq!(updated.ask_price.as_decimal(), Decimal::new(520_025, 2));
+    }
+
+    #[rstest::rstest]
+    fn symbol_resolution_requires_a_known_unambiguous_alias() {
+        let aliases = DashMap::new();
+        let front = InstrumentId::from("MESM26.PROJECTX");
+        let next = InstrumentId::from("MESU26.PROJECTX");
+        ProjectXDataClient::register_subscription_alias(&aliases, "MESM6", front);
+
+        assert_eq!(
+            ProjectXDataClient::resolve_instrument_id(&aliases, Some("UNKNOWN"), None),
+            None,
+        );
+
+        ProjectXDataClient::register_subscription_alias(&aliases, "F.US.MES", front);
+        ProjectXDataClient::register_subscription_alias(&aliases, "F.US.MES", next);
+        assert_eq!(
+            ProjectXDataClient::resolve_instrument_id(&aliases, Some("F.US.MES"), None),
+            None,
+        );
+        let subscribed = ProjectXDataClient::subscribed_instrument_ids(&aliases);
+        assert_eq!(subscribed.len(), 2);
+        assert!(subscribed.contains(&front));
+        assert!(subscribed.contains(&next));
+
+        ProjectXDataClient::remove_instrument_aliases(&aliases, front);
+        assert_eq!(
+            ProjectXDataClient::resolve_instrument_id(&aliases, Some("F.US.MES"), None),
+            Some(next),
+        );
+        assert_eq!(
+            ProjectXDataClient::resolve_instrument_id(&aliases, Some("MESM6"), None),
+            None,
+        );
+    }
+
+    #[rstest::rstest]
+    fn recovery_fence_marks_disconnected_clears_state_and_emits_book_clear() {
+        let instrument_id = InstrumentId::from("MESM26.PROJECTX");
+        let quote_bbo = DashMap::new();
+        quote_bbo.insert(
+            instrument_id,
+            super::BboState {
+                bid: Some(Decimal::from(5200)),
+                ask: Some(Decimal::from(5201)),
+            },
+        );
+        let depth_subs = DashMap::new();
+        ProjectXDataClient::register_subscription_alias(
+            &depth_subs,
+            "CON.F.US.MES.M26",
+            instrument_id,
+        );
+        let depth_sequence = DashMap::new();
+        depth_sequence.insert(instrument_id, 8);
+        let depth_ts_last = DashMap::new();
+        depth_ts_last.insert(instrument_id, UnixNanos::from(10_u64));
+        let depth_slots = DashMap::new();
+        depth_slots.insert(
+            ProjectXDataClient::depth_slot_key(instrument_id, OrderSide::Buy, 0),
+            Decimal::from(5200),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let is_connected = AtomicBool::new(true);
+
+        ProjectXDataClient::fence_market_stream_state(
+            &is_connected,
+            &sender,
+            &quote_bbo,
+            &depth_subs,
+            &depth_sequence,
+            &depth_ts_last,
+            &depth_slots,
+        );
+
+        assert!(!is_connected.load(Ordering::Acquire));
+        assert!(quote_bbo.is_empty());
+        assert!(depth_sequence.is_empty());
+        assert!(depth_ts_last.is_empty());
+        assert!(depth_slots.is_empty());
+        let event = receiver.try_recv().expect("book clear event");
+        let DataEvent::Data(Data::Deltas(deltas)) = event else {
+            panic!("expected order book deltas");
+        };
+        assert_eq!(deltas.instrument_id, instrument_id);
+        assert_eq!(deltas.deltas.len(), 1);
+        assert_eq!(deltas.deltas[0].action, BookAction::Clear);
+
+        ProjectXDataClient::fence_market_stream_state(
+            &is_connected,
+            &sender,
+            &quote_bbo,
+            &depth_subs,
+            &depth_sequence,
+            &depth_ts_last,
+            &depth_slots,
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[rstest::rstest]
@@ -1809,7 +2493,7 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn depth_level_size_prefers_current_volume_with_safe_fallback() {
+    fn depth_level_size_uses_authoritative_current_volume() {
         let with_current: MarketDepth = serde_json::from_value(json!({
             "symbolId": "CON.F.US.MES.M26",
             "timestamp": "2026-04-02T00:00:00Z",
@@ -1820,7 +2504,7 @@ mod tests {
             "index": 1
         }))
         .expect("depth");
-        assert_eq!(ProjectXDataClient::depth_level_size(&with_current), 5.0);
+        assert_eq!(ProjectXDataClient::depth_level_size(&with_current), 5);
 
         let fallback_volume: MarketDepth = serde_json::from_value(json!({
             "symbolId": "CON.F.US.MES.M26",
@@ -1832,7 +2516,7 @@ mod tests {
             "index": 1
         }))
         .expect("depth");
-        assert_eq!(ProjectXDataClient::depth_level_size(&fallback_volume), 3.0);
+        assert_eq!(ProjectXDataClient::depth_level_size(&fallback_volume), 0);
 
         let delete_level: MarketDepth = serde_json::from_value(json!({
             "symbolId": "CON.F.US.MES.M26",
@@ -1844,7 +2528,7 @@ mod tests {
             "index": 1
         }))
         .expect("depth");
-        assert_eq!(ProjectXDataClient::depth_level_size(&delete_level), 0.0);
+        assert_eq!(ProjectXDataClient::depth_level_size(&delete_level), 0);
     }
 
     #[rstest::rstest]
@@ -1872,7 +2556,8 @@ mod tests {
             7,
             UnixNanos::from(11_u64),
             UnixNanos::from(12_u64),
-        );
+        )
+        .expect("valid depth event");
 
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].action, BookAction::Clear);
@@ -1889,7 +2574,7 @@ mod tests {
             "symbolId": "CON.F.US.MES.M26",
             "timestamp": "2026-04-02T00:00:00Z",
             "price": 5200.0,
-            "volume": 0,
+            "volume": 3,
             "currentVolume": 0,
             "index": 3
         }))
@@ -1902,12 +2587,13 @@ mod tests {
             8,
             UnixNanos::from(21_u64),
             UnixNanos::from(22_u64),
-        );
+        )
+        .expect("valid depth event");
 
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].action, BookAction::Delete);
         assert_eq!(deltas[0].order.side, OrderSide::Buy);
-        assert_eq!(deltas[0].order.size.as_f64(), 0.0);
+        assert_eq!(deltas[0].order.size.as_decimal(), Decimal::ZERO);
         assert_eq!(
             deltas[0].flags,
             RecordFlag::F_LAST as u8 | RecordFlag::F_MBP as u8,
@@ -1939,18 +2625,19 @@ mod tests {
             9,
             UnixNanos::from(31_u64),
             UnixNanos::from(32_u64),
-        );
+        )
+        .expect("valid depth event");
 
         assert_eq!(deltas.len(), 2);
         assert_eq!(deltas[0].action, BookAction::Delete);
         assert_eq!(deltas[0].order.side, OrderSide::Buy);
-        assert_eq!(deltas[0].order.price.as_f64(), 5200.0);
-        assert_eq!(deltas[0].order.size.as_f64(), 0.0);
+        assert_eq!(deltas[0].order.price.as_decimal(), Decimal::from(5200));
+        assert_eq!(deltas[0].order.size.as_decimal(), Decimal::ZERO);
         assert_eq!(deltas[0].flags, RecordFlag::F_MBP as u8);
         assert_eq!(deltas[1].action, BookAction::Update);
         assert_eq!(deltas[1].order.side, OrderSide::Buy);
-        assert_eq!(deltas[1].order.price.as_f64(), 5200.25);
-        assert_eq!(deltas[1].order.size.as_f64(), 4.0);
+        assert_eq!(deltas[1].order.price.as_decimal(), Decimal::new(520_025, 2));
+        assert_eq!(deltas[1].order.size.as_decimal(), Decimal::from(4));
         assert_eq!(
             deltas[1].flags,
             RecordFlag::F_LAST as u8 | RecordFlag::F_MBP as u8,
@@ -1982,17 +2669,18 @@ mod tests {
             10,
             UnixNanos::from(41_u64),
             UnixNanos::from(42_u64),
-        );
+        )
+        .expect("valid depth event");
 
         assert_eq!(deltas.len(), 2);
         assert_eq!(deltas[0].action, BookAction::Delete);
         assert_eq!(deltas[0].order.side, OrderSide::Sell);
-        assert_eq!(deltas[0].order.price.as_f64(), 5201.0);
-        assert_eq!(deltas[0].order.size.as_f64(), 0.0);
+        assert_eq!(deltas[0].order.price.as_decimal(), Decimal::from(5201));
+        assert_eq!(deltas[0].order.size.as_decimal(), Decimal::ZERO);
         assert_eq!(deltas[1].action, BookAction::Update);
         assert_eq!(deltas[1].order.side, OrderSide::Sell);
-        assert_eq!(deltas[1].order.price.as_f64(), 5201.25);
-        assert_eq!(deltas[1].order.size.as_f64(), 3.0);
+        assert_eq!(deltas[1].order.price.as_decimal(), Decimal::new(520_125, 2));
+        assert_eq!(deltas[1].order.size.as_decimal(), Decimal::from(3));
         assert_eq!(
             deltas[1].flags,
             RecordFlag::F_LAST as u8 | RecordFlag::F_MBP as u8,
@@ -2024,12 +2712,13 @@ mod tests {
             10,
             UnixNanos::from(41_u64),
             UnixNanos::from(42_u64),
-        );
+        )
+        .expect("valid depth event");
 
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].action, BookAction::Delete);
         assert_eq!(deltas[0].order.side, OrderSide::Sell);
-        assert_eq!(deltas[0].order.price.as_f64(), 5201.0);
+        assert_eq!(deltas[0].order.price.as_decimal(), Decimal::from(5201));
         assert!(depth_slots.is_empty());
     }
 
@@ -2058,13 +2747,14 @@ mod tests {
             11,
             UnixNanos::from(51_u64),
             UnixNanos::from(52_u64),
-        );
+        )
+        .expect("valid depth event");
 
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].action, BookAction::Delete);
         assert_eq!(deltas[0].order.side, OrderSide::Buy);
-        assert_eq!(deltas[0].order.price.as_f64(), 5200.25);
-        assert_eq!(deltas[0].order.size.as_f64(), 0.0);
+        assert_eq!(deltas[0].order.price.as_decimal(), Decimal::new(520_025, 2));
+        assert_eq!(deltas[0].order.size.as_decimal(), Decimal::ZERO);
         assert!(depth_slots.is_empty());
     }
 
@@ -2112,7 +2802,8 @@ mod tests {
             newer_seq,
             newer_ts,
             UnixNanos::from(210_u64),
-        );
+        )
+        .expect("valid newer depth event");
         let older = ProjectXDataClient::map_depth_event(
             &depth_slots,
             instrument_id,
@@ -2120,7 +2811,8 @@ mod tests {
             older_seq,
             older_ts,
             UnixNanos::from(220_u64),
-        );
+        )
+        .expect("valid older depth event");
 
         assert_eq!(newer_seq, 1);
         assert_eq!(older_seq, 2);
@@ -2146,7 +2838,7 @@ mod tests {
 
         let mut params = Params::new();
         params.insert("unit".to_string(), json!(2));
-        params.insert("unit_number".to_string(), json!(3));
+        params.insert("unit_number".to_string(), json!(5));
         params.insert("limit".to_string(), json!(120));
         let request = RequestBars::new(
             bar_type,
@@ -2171,7 +2863,7 @@ mod tests {
 
         assert_eq!(mapped.contract_symbol, "CON.F.US.MES.M26");
         assert_eq!(mapped.unit, projectx_client::BarUnit::Minute);
-        assert_eq!(mapped.unit_number, 3);
+        assert_eq!(mapped.unit_number, 5);
         assert_eq!(mapped.limit, 200); // explicit request limit takes precedence
         assert!(!mapped.live);
         assert!(!allow_live_history_fallback);
@@ -2208,9 +2900,18 @@ mod tests {
     }
 
     #[rstest::rstest]
+    fn historical_bar_fields_must_match_bar_type() {
+        let bar_type = BarType::from("MESM26.PROJECTX-5-MINUTE-LAST-EXTERNAL");
+
+        assert!(projectx_validate_history_bar_semantics(bar_type, 2, 5).is_ok());
+        assert!(projectx_validate_history_bar_semantics(bar_type, 2, 3).is_err());
+        assert!(projectx_validate_history_bar_semantics(bar_type, 1, 5).is_err());
+    }
+
+    #[rstest::rstest]
     fn map_bar_request_uses_documented_default_units() {
         let second = RequestBars::new(
-            BarType::from("MESM26.PROJECTX-15-SECOND-LAST-INTERNAL"),
+            BarType::from("MESM26.PROJECTX-15-SECOND-LAST-EXTERNAL"),
             None,
             None,
             None,
@@ -2295,7 +2996,7 @@ mod tests {
             ),
         ];
 
-        let mapped = ProjectXDataClient::map_historical_bars(bar_type, bars);
+        let mapped = projectx_map_historical_bars(bar_type, &bars).expect("valid bars");
 
         assert_eq!(mapped.len(), 2);
         assert!(mapped[0].ts_event < mapped[1].ts_event);
@@ -2304,11 +3005,26 @@ mod tests {
     }
 
     #[rstest::rstest]
+    fn map_historical_bars_rejects_invalid_provider_bar() {
+        let bar_type = BarType::from("MNQM26.PROJECTX-15-SECOND-LAST-EXTERNAL");
+        let bars = [px_bar(
+            "2026-04-08T11:22:00Z",
+            25200.0,
+            25201.0,
+            25199.5,
+            25200.5,
+            -1,
+        )];
+
+        assert!(projectx_map_historical_bars(bar_type, &bars).is_err());
+    }
+
+    #[rstest::rstest]
     fn normalize_historical_bars_keeps_open_bar_at_request_cutoff() {
         let bar_type = BarType::from("MNQM26.PROJECTX-15-SECOND-LAST-EXTERNAL");
-        let bars = ProjectXDataClient::map_historical_bars(
+        let bars = projectx_map_historical_bars(
             bar_type,
-            vec![
+            &[
                 px_bar(
                     "2026-04-08T11:22:00Z",
                     25200.0,
@@ -2326,7 +3042,8 @@ mod tests {
                     10,
                 ),
             ],
-        );
+        )
+        .expect("valid bars");
 
         let filtered = ProjectXDataClient::normalize_historical_bars(bars);
 
@@ -2354,9 +3071,9 @@ mod tests {
         let end = UnixNanos::from(
             u64::try_from(ts("2026-04-08T11:23:00Z").as_jiff().as_nanosecond()).unwrap(),
         );
-        let bars = ProjectXDataClient::map_historical_bars(
+        let bars = projectx_map_historical_bars(
             bar_type,
-            vec![
+            &[
                 px_bar(
                     "2026-04-08T11:22:00Z",
                     25200.0,
@@ -2374,7 +3091,8 @@ mod tests {
                     12,
                 ),
             ],
-        );
+        )
+        .expect("valid bars");
 
         let next_start =
             ProjectXDataClient::next_historical_page_start(bar_type, &bars, Some(start), Some(end))
@@ -2397,9 +3115,9 @@ mod tests {
         let end = UnixNanos::from(
             u64::try_from(ts("2026-04-08T11:23:00Z").as_jiff().as_nanosecond()).unwrap(),
         );
-        let bars = ProjectXDataClient::map_historical_bars(
+        let bars = projectx_map_historical_bars(
             bar_type,
-            vec![
+            &[
                 px_bar(
                     "2026-04-08T11:22:00Z",
                     25200.0,
@@ -2417,7 +3135,8 @@ mod tests {
                     12,
                 ),
             ],
-        );
+        )
+        .expect("valid bars");
 
         assert!(
             ProjectXDataClient::next_historical_page_start(bar_type, &bars, Some(start), Some(end))
@@ -2482,22 +3201,22 @@ mod tests {
         .build()
         .unwrap();
 
-        assert!(ProjectXDataClient::should_retry_live_history_with_sim(
+        assert!(should_retry_live_history_with_sim(
             &live_request,
             Some(1),
             true,
         ));
-        assert!(!ProjectXDataClient::should_retry_live_history_with_sim(
+        assert!(!should_retry_live_history_with_sim(
             &sim_request,
             Some(1),
             true,
         ));
-        assert!(!ProjectXDataClient::should_retry_live_history_with_sim(
+        assert!(!should_retry_live_history_with_sim(
             &live_request,
             Some(2),
             true,
         ));
-        assert!(!ProjectXDataClient::should_retry_live_history_with_sim(
+        assert!(!should_retry_live_history_with_sim(
             &live_request,
             Some(1),
             false,
@@ -2506,7 +3225,7 @@ mod tests {
 
     #[expect(dead_code)]
     fn resolve_unsubscribe_contract_id_falls_back_when_missing_from_cache() {
-        let contracts_by_symbol = Arc::new(ParkingRwLock::new(AHashMap::new()));
+        let contracts_by_symbol = Arc::new(ParkingRwLock::new(HashMap::new()));
         let resolved = ProjectXDataClient::resolve_unsubscribe_contract_id_from_cache(
             &contracts_by_symbol,
             "MESM26",
@@ -2516,8 +3235,8 @@ mod tests {
 
     #[rstest::rstest]
     fn select_contract_cache_keeps_live_and_sim_contract_aliases_separate() {
-        let live_contracts_by_symbol = Arc::new(ParkingRwLock::new(AHashMap::new()));
-        let sim_contracts_by_symbol = Arc::new(ParkingRwLock::new(AHashMap::new()));
+        let live_contracts_by_symbol = Arc::new(ParkingRwLock::new(HashMap::new()));
+        let sim_contracts_by_symbol = Arc::new(ParkingRwLock::new(HashMap::new()));
         let mut live_contract = contract("LIVE-CONTRACT-ID", "MNQM6", true);
         live_contract.symbol_id = SymbolId::new("F.US.MNQ").unwrap();
         let mut sim_contract = contract("SIM-CONTRACT-ID", "MNQM6", true);

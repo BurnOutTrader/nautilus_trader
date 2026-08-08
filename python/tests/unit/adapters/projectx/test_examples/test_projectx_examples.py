@@ -12,15 +12,24 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import asyncio
 import importlib
+import os
+import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+from nautilus_trader.model import AccountType
+from nautilus_trader.model import BookType
 from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import OmsType
 
 
-REPO_ROOT = Path(__file__).resolve().parents[5]
+REPO_ROOT = Path(__file__).resolve().parents[6]
 PROJECTX_EXAMPLES = REPO_ROOT / "examples" / "live" / "projectx"
 
 
@@ -56,7 +65,9 @@ class _FakeBuilder:
     def with_reconciliation(self, _enabled):
         return self
 
-    def with_position_check_interval_secs(self, _secs):
+    def with_exec_engine_config(self, config):
+        self._captured["reconciliation"] = config.reconciliation
+        self._captured["position_check_interval_secs"] = config.position_check_interval_secs
         return self
 
     def with_timeout_connection(self, _secs):
@@ -119,6 +130,283 @@ def test_projectx_importable_strategy_modules_use_generic_names():
     assert ema_module.ProjectXEMACrossStrategy is not None
 
 
+def test_projectx_live_strategies_construct_with_base_owned_config():
+    modules_and_types = [
+        (
+            _reload("examples.live.projectx.projectx_data_capture"),
+            "ProjectXDataCaptureStrategyConfig",
+            "ProjectXDataCaptureStrategy",
+        ),
+        (
+            _reload("examples.live.projectx.projectx_data_probe"),
+            "ProjectXDataProbeStrategyConfig",
+            "ProjectXDataProbeStrategy",
+        ),
+        (
+            _reload("examples.live.projectx.projectx_ema_cross"),
+            "ProjectXEMACrossStrategyConfig",
+            "ProjectXEMACrossStrategy",
+        ),
+        (
+            _reload("examples.live.projectx.projectx_exec_strategy"),
+            "ProjectXExecStrategyConfig",
+            "ProjectXExecStrategy",
+        ),
+        (
+            _reload("examples.live.projectx.projectx_orderbook_probe"),
+            "ProjectXOrderBookProbeStrategyConfig",
+            "ProjectXOrderBookProbeStrategy",
+        ),
+    ]
+
+    for module, config_name, strategy_name in modules_and_types:
+        config = getattr(module, config_name)()
+        strategy = getattr(module, strategy_name)(config)
+        assert strategy.config is config
+
+
+def test_projectx_validation_runner_imports_real_helpers():
+    runner_module = _reload("examples.live.projectx.projectx_validation_runner")
+
+    assert callable(runner_module.resolve_front_month_contract)
+    assert callable(runner_module._instrument_id_from_contract)
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    [
+        "projectx_ema_cross.py",
+        "projectx_exec_tester.py",
+        "projectx_instrument_resolver.py",
+        "projectx_live_data_capture.py",
+        "projectx_live_data_probe.py",
+        "projectx_orderbook_probe.py",
+        "projectx_validation_runner.py",
+    ],
+)
+def test_projectx_runnable_script_imports_outside_repo_root(script_name, tmp_path):
+    script_path = PROJECTX_EXAMPLES / script_name
+    env = {**os.environ, "NAUTILUS_PATH": str(tmp_path)}
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import runpy, sys; runpy.run_path(sys.argv[1], run_name='projectx_smoke')",
+            str(script_path),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_projectx_provider_snapshot_uses_loaded_instrument_ids(monkeypatch):
+    provider_module = _reload("examples.live.projectx.projectx_instrument_provider")
+
+    class FakeHttpClient:
+        def __init__(self, _config):
+            self.started = False
+            self.stopped = False
+
+        async def start(self):
+            self.started = True
+
+        def stop(self):
+            self.stopped = True
+
+    class FakeProvider:
+        def __init__(self, client, live):
+            self.client = client
+            self.live = live
+
+        async def load_all_async(self, filters):
+            self.filters = filters
+
+        def get_all(self):
+            return [
+                SimpleNamespace(id=InstrumentId.from_str("MNQU26.PROJECTX")),
+                SimpleNamespace(id=InstrumentId.from_str("MNQM26.PROJECTX")),
+            ]
+
+    monkeypatch.setattr(provider_module, "ProjectXConfig", lambda **kwargs: kwargs)
+    monkeypatch.setattr(provider_module, "ProjectXHttpClient", FakeHttpClient)
+    monkeypatch.setattr(provider_module, "ProjectXInstrumentProvider", FakeProvider)
+
+    result = asyncio.run(
+        provider_module.load_provider_snapshot(
+            live=False,
+            product_root="MNQ",
+            active_only=True,
+        ),
+    )
+
+    assert result["instrument_ids"] == ["MNQM26.PROJECTX", "MNQU26.PROJECTX"]
+    assert result["count"] == 2
+
+
+def test_projectx_high_level_backtest_uses_v2_config_api(monkeypatch, tmp_path):
+    monkeypatch.setenv("NAUTILUS_PATH", str(tmp_path))
+    backtest_module = _reload("examples.backtest.projectx.projectx_backtest_high_level")
+    instrument_id = InstrumentId.from_str("MNQM26.PROJECTX")
+    bar_type = backtest_module.BarType.from_str(
+        "MNQM26.PROJECTX-1-MINUTE-LAST-EXTERNAL",
+    )
+
+    config, strategies = backtest_module._build_run_config(
+        instrument_id=instrument_id,
+        bar_type=bar_type,
+        start_time=1,
+        end_time=2,
+    )
+
+    venue = config.venues[0]
+    data = config.data[0]
+    assert venue.oms_type == OmsType.NETTING
+    assert venue.account_type == AccountType.MARGIN
+    assert venue.book_type == BookType.L1_MBP
+    assert data.data_type == "Bar"
+    assert data.instrument_id == instrument_id
+    assert data.bar_spec == bar_type.spec
+    assert data.start_time == 1
+    assert data.end_time == 2
+    assert len(strategies) == 1
+    strategy_module_name, strategy_class_name = strategies[0].strategy_path.split(":", 1)
+    config_module_name, config_class_name = strategies[0].config_path.split(":", 1)
+    strategy_class = getattr(importlib.import_module(strategy_module_name), strategy_class_name)
+    config_class = getattr(importlib.import_module(config_module_name), config_class_name)
+    strategy = strategy_class(config_class(**strategies[0].config))
+    assert strategy is not None
+
+
+@pytest.mark.parametrize("product_root", ["MNQ", "NQ"])
+def test_projectx_contract_parity_uses_shared_product_root_filter(monkeypatch, product_root):
+    parity_module = _reload("examples.live.projectx.projectx_contract_parity_check")
+    queries: list[str | None] = []
+    instrument = SimpleNamespace(
+        info={
+            "projectx_contract_id": f"CON.F.US.{product_root}.M26",
+            "projectx_name": f"{product_root}M26",
+            "projectx_symbol_id": f"{product_root}M26",
+            "active_contract": True,
+        },
+        price_increment="0.25",
+    )
+
+    class FakeHttpClient:
+        def __init__(self, _config):
+            pass
+
+        async def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        async def available_instruments(self, *, live, active_only, product_root=None):
+            queries.append(product_root)
+            return [instrument]
+
+        async def contract_by_id(self, *, contract_id):
+            assert contract_id == instrument.info["projectx_contract_id"]
+            return instrument
+
+    monkeypatch.setattr(parity_module, "ProjectXConfig", lambda **kwargs: kwargs)
+    monkeypatch.setattr(parity_module, "ProjectXHttpClient", FakeHttpClient)
+
+    result = asyncio.run(
+        parity_module.run_contract_parity_check(
+            live=False,
+            product_root=product_root,
+        ),
+    )
+
+    assert queries == [product_root]
+    assert result["checked"] == 1
+    assert result["mismatches"] == []
+
+
+def test_projectx_notebook_uses_async_download_and_v2_backtest_config():
+    notebook_path = PROJECTX_EXAMPLES / "notebooks" / "projectx_historical_bars_to_parquet.py"
+    source = notebook_path.read_text(encoding="utf-8")
+
+    assert "await download_bars_to_catalog_async(" in source
+    assert "download_bars_to_catalog," not in source
+    assert 'data_type="Bar"' in source
+    assert "bar_spec=bar_type.spec" in source
+    assert "data_cls=" not in source
+
+
+def test_projectx_live_capture_uses_typed_v2_catalog_methods(monkeypatch, tmp_path):
+    monkeypatch.setenv("NAUTILUS_PATH", str(tmp_path))
+    capture_module = _reload("examples.live.projectx.projectx_live_data_capture")
+    writes: dict[str, list[object]] = {
+        "instruments": [],
+        "quotes": [],
+        "trades": [],
+        "book_deltas": [],
+    }
+    queries: list[tuple[str, list[str]]] = []
+
+    class FakeCatalog:
+        def __init__(self, _path):
+            pass
+
+        def instruments(self, *, instrument_ids):
+            queries.append(("instruments", instrument_ids))
+            return writes["instruments"]
+
+        def query_quote_ticks(self, *, identifiers):
+            queries.append(("quotes", identifiers))
+            return writes["quotes"]
+
+        def query_trade_ticks(self, *, identifiers):
+            queries.append(("trades", identifiers))
+            return writes["trades"]
+
+        def query_order_book_deltas(self, *, identifiers):
+            queries.append(("book_deltas", identifiers))
+            return writes["book_deltas"]
+
+        def write_instruments(self, data):
+            writes["instruments"].extend(data)
+
+        def write_quote_ticks(self, data):
+            writes["quotes"].extend(data)
+
+        def write_trade_ticks(self, data):
+            writes["trades"].extend(data)
+
+        def write_order_book_deltas(self, data):
+            writes["book_deltas"].extend(data)
+
+    monkeypatch.setattr(capture_module, "ParquetDataCatalog", FakeCatalog)
+    instrument_id = InstrumentId.from_str("MNQM26.PROJECTX")
+    capture_module._write_capture_to_catalog(
+        catalog_path=tmp_path,
+        before_counts={"instruments": 0, "quotes": 0, "trades": 0, "book_deltas": 0},
+        snapshot={
+            "instrument": object(),
+            "quotes": [object()],
+            "trades": [object()],
+            "book_deltas": [object()],
+        },
+    )
+
+    counts = capture_module._catalog_counts(tmp_path, instrument_id)
+
+    assert counts == {"instruments": 1, "quotes": 1, "trades": 1, "book_deltas": 1}
+    assert queries == [
+        ("instruments", [instrument_id.value]),
+        ("quotes", [instrument_id.value]),
+        ("trades", [instrument_id.value]),
+        ("book_deltas", [instrument_id.value]),
+    ]
+
+
 def test_projectx_live_wrappers_reference_generic_strategy_paths(monkeypatch, tmp_path):
     monkeypatch.setenv("NAUTILUS_PATH", str(tmp_path))
 
@@ -173,6 +461,17 @@ def test_projectx_instrument_resolver_prefers_front_month_instrument_id():
     assert result.value == "MNQM26.PROJECTX"
 
 
+def test_projectx_instrument_resolver_reads_front_month_contract_snapshot():
+    resolver_module = _reload("examples.live.projectx.projectx_instrument_resolver")
+
+    result = resolver_module._instrument_id_from_contract(
+        {"instrument_id": "MNQM26.PROJECTX"},
+    )
+
+    assert result is not None
+    assert result.value == "MNQM26.PROJECTX"
+
+
 def test_projectx_ema_bar_logger_emits_structured_phase_payload():
     ema_module = _reload("examples.live.projectx.projectx_ema_cross")
     emitted: list[tuple[str, dict, object, str]] = []
@@ -221,9 +520,15 @@ def test_projectx_live_examples_import_public_pyo3_config_types():
     probe_module = _reload("examples.live.projectx.projectx_live_data_probe")
     exec_module = _reload("examples.live.projectx.projectx_exec_tester")
 
-    assert probe_module.ProjectXDataClientConfig.__module__.endswith("nautilus_trader.adapters.projectx")
-    assert exec_module.ProjectXDataClientConfig.__module__.endswith("nautilus_trader.adapters.projectx")
-    assert exec_module.ProjectXExecClientConfig.__module__.endswith("nautilus_trader.adapters.projectx")
+    assert probe_module.ProjectXDataClientConfig.__module__.endswith(
+        "nautilus_trader.adapters.projectx"
+    )
+    assert exec_module.ProjectXDataClientConfig.__module__.endswith(
+        "nautilus_trader.adapters.projectx"
+    )
+    assert exec_module.ProjectXExecClientConfig.__module__.endswith(
+        "nautilus_trader.adapters.projectx"
+    )
 
 
 def test_projectx_ema_defaults_to_sim_history_for_warmup():
@@ -245,6 +550,8 @@ def test_projectx_ema_main_disables_internal_bar_fill_forward(monkeypatch):
     ema_module.main()
 
     assert captured["time_bars_build_with_no_updates"] is False
+    assert captured["reconciliation"] is True
+    assert captured["position_check_interval_secs"] == 30.0
     assert captured["node"].run_called is True
     assert len(captured["node"].strategy_configs) == 1
 
@@ -272,3 +579,86 @@ def test_projectx_ema_historical_bars_prime_without_submitting_signals():
 
     assert logged_phases == ["priming"]
     assert signal_calls == []
+
+
+def test_projectx_ema_warmup_uses_datetime_request_bounds():
+    ema_module = _reload("examples.live.projectx.projectx_ema_cross")
+    captured: dict[str, object] = {}
+    now_ns = 1_775_520_000_000_000_000
+    strategy = SimpleNamespace(
+        _started=False,
+        _instrument_ready=True,
+        _warmup_bar_type=object(),
+        config=SimpleNamespace(
+            request_bars=True,
+            warmup_minutes=30,
+            client_id=ema_module.ClientId("PROJECTX"),
+            warmup_history_live=False,
+            warmup_contract_live=False,
+            bar_type=object(),
+        ),
+        clock=SimpleNamespace(timestamp_ns=lambda: now_ns),
+        request_bars=lambda **kwargs: captured.update({"request": kwargs}),
+        subscribe_bars=lambda **kwargs: captured.update({"subscribe": kwargs}),
+    )
+
+    ema_module.ProjectXEMACrossStrategy._start_strategy(strategy)
+
+    request = captured["request"]
+    assert isinstance(request["start"], datetime)
+    assert isinstance(request["end"], datetime)
+    assert request["start"] < request["end"]
+    assert request["end"] == ema_module.unix_nanos_to_dt(now_ns)
+
+
+def test_projectx_ema_cleanup_passes_client_order_ids():
+    ema_module = _reload("examples.live.projectx.projectx_ema_cross")
+    client_order_ids = [
+        ema_module.ClientOrderId("O-001"),
+        ema_module.ClientOrderId("O-002"),
+    ]
+    captured: dict[str, object] = {}
+    strategy = SimpleNamespace(
+        config=SimpleNamespace(
+            account_id=None,
+            client_id=ema_module.ClientId("PROJECTX"),
+        ),
+        _active_orders=lambda: [
+            SimpleNamespace(client_order_id=client_order_id) for client_order_id in client_order_ids
+        ],
+        _object_payload=lambda _order: {},
+        _emit_structured=lambda *_args: None,
+        cancel_orders=lambda **kwargs: captured.update(kwargs),
+    )
+
+    ema_module.ProjectXEMACrossStrategy._cancel_active_orders(strategy)
+
+    assert captured["client_order_ids"] == client_order_ids
+    assert "orders" not in captured
+
+
+def test_projectx_exec_cleanup_passes_client_order_id():
+    exec_module = _reload("examples.live.projectx.projectx_exec_strategy")
+    client_order_id = exec_module.ClientOrderId("O-001")
+    captured: dict[str, object] = {}
+    strategy = SimpleNamespace(
+        config=SimpleNamespace(
+            account_id=None,
+            client_id=exec_module.ClientId("PROJECTX"),
+            instrument_id=exec_module.InstrumentId.from_str("MNQM26.PROJECTX"),
+        ),
+        _cleanup_cancel_requests=set(),
+        _open_orders=lambda: [
+            SimpleNamespace(client_order_id=client_order_id, time_in_force=None),
+        ],
+        _runtime_snapshot=dict,
+        _info=lambda _message: None,
+        cancel_order=lambda *args, **kwargs: captured.update(
+            {"args": args, "kwargs": kwargs},
+        ),
+    )
+
+    exec_module.ProjectXExecStrategy._cancel_open_orders(strategy)
+
+    assert captured["args"] == (client_order_id,)
+    assert captured["kwargs"]["client_id"] == strategy.config.client_id

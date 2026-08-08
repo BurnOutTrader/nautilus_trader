@@ -116,9 +116,9 @@ nautilus-kraken = { path = "crates/adapters/kraken", version = "0.62.0", default
 nautilus-lighter = { path = "crates/adapters/lighter", version = "0.62.0", default-features = false }
 nautilus-okx = { path = "crates/adapters/okx", version = "0.62.0", default-features = false }
 nautilus-polymarket = { path = "crates/adapters/polymarket", version = "0.62.0", default-features = false }
-projectx-nt = { path = "crates/adapters/projectx", version = "0.62.0", default-features = false }
 nautilus-sandbox = { path = "crates/adapters/sandbox", version = "0.62.0", default-features = false }
 nautilus-tardis = { path = "crates/adapters/tardis", version = "0.62.0", default-features = false }
+projectx-nt = { path = "crates/adapters/projectx", version = "0.62.0", default-features = false }
 rithmic-nt = { path = "crates/adapters/rithmic", version = "0.62.0", default-features = false }
 
 # -----------------------------------------------------------------------------

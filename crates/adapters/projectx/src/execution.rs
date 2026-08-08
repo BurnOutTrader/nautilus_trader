@@ -15,7 +15,7 @@
 //! Live execution client implementation for ProjectX.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -25,11 +25,11 @@ use std::{
 
 use ahash::{AHashMap, AHashSet};
 use async_trait::async_trait;
-use dashmap::{DashMap, DashSet};
+use dashmap::{DashMap, DashSet, mapref::entry::Entry};
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
-    live::{get_runtime, runner::get_exec_event_sender},
+    live::{get_runtime, runner::get_exec_event_sender, task::TaskHandles},
     messages::execution::{
         CancelOrder, GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
         GeneratePositionStatusReports, ModifyOrder, QueryAccount, SubmitOrder,
@@ -45,7 +45,8 @@ use nautilus_model::{
         PositionSideSpecified, TimeInForce,
     },
     events::{
-        AccountState, OrderAccepted, OrderCanceled, OrderEventAny, OrderFilled, OrderRejected,
+        AccountState, OrderAccepted, OrderCanceled, OrderEventAny, OrderExpired, OrderFillVoided,
+        OrderFilled, OrderRejected,
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Symbol, TradeId, TraderId,
@@ -69,15 +70,21 @@ use crate::{
     config::{
         ProjectXExecClientConfig, canonicalize_projectx_account_id, projectx_account_id_from_raw,
     },
-    http::client::ProjectXHttpClient,
+    http::{client::ProjectXHttpClient, error::ProjectXHttpError},
     websocket::client::{ProjectXWsClient, ProjectXWsEvent},
 };
 use projectx_client::{
     Account, AccountId as PxAccountId, CancelOrder as PxCancelOrder, ContractId,
-    ModifyOrder as PxModifyOrder, Order, OrderSearch, OrderType as ProjectXOrderType, PlaceOrder,
-    Position, Side, Timestamp as ProjectXTimestamp, Trade, TradeSearch,
+    ModifyOrder as PxModifyOrder, Order, OrderSearch, OrderStatus as ProjectXOrderStatus,
+    OrderType as ProjectXOrderType, PlaceOrder, Position, Side, Timestamp as ProjectXTimestamp,
+    Trade, TradeSearch,
 };
 use rust_decimal::prelude::ToPrimitive;
+
+const MAX_TRACKED_TRADE_IDS: usize = 65_536;
+const TRADE_ID_PRUNE_BATCH: usize = 4_096;
+const MAX_PENDING_TRADE_ORDERS: usize = 1_024;
+const MAX_PENDING_TRADES_PER_ORDER: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
 struct ProjectXOrderMeta {
@@ -99,14 +106,14 @@ struct ReconciliationSnapshot {
 struct OpenOrderState {
     status: i32,
     fill_volume: i64,
-    filled_price_bits: Option<u64>,
+    filled_price: Option<Decimal>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PositionState {
     size: i64,
     type_: i32,
-    avg_px_bits: u64,
+    average_price: Decimal,
 }
 
 type AccountIdCache = Arc<ParkingRwLock<AHashMap<i64, AccountId>>>;
@@ -122,16 +129,50 @@ pub struct ProjectXExecutionClient {
     account_ids: AccountIdCache,
     subscribed_account_ids: SubscribedAccountIdCache,
     ws_event_task: Option<tokio::task::JoinHandle<()>>,
+    pending_tasks: TaskHandles,
     order_meta_by_client: Arc<DashMap<ClientOrderId, ProjectXOrderMeta>>,
     venue_to_client: Arc<DashMap<i64, ClientOrderId>>,
     last_order_state: Arc<DashMap<ClientOrderId, OpenOrderState>>,
+    last_order_status: Arc<DashMap<ClientOrderId, i32>>,
     seen_trade_ids: Arc<DashSet<i64>>,
+    voided_trade_ids: Arc<DashSet<i64>>,
     pending_trades_by_order_id: Arc<DashMap<i64, Vec<Trade>>>,
     open_order_state: Arc<DashMap<i64, OpenOrderState>>,
     open_position_state: Arc<DashMap<i64, PositionState>>,
     execution_stale: Arc<AtomicBool>,
     reconciliation_in_progress: Arc<AtomicBool>,
     margin_support_warned: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct ReconciliationContext {
+    http_client: ProjectXHttpClient,
+    ws_user: Option<ProjectXWsClient>,
+    emitter: ExecutionEventEmitter,
+    account_ids: AccountIdCache,
+    subscribed_account_ids: SubscribedAccountIdCache,
+    account_issuer: Venue,
+    account_type: AccountType,
+    base_currency: Option<Currency>,
+    order_meta_by_client: Arc<DashMap<ClientOrderId, ProjectXOrderMeta>>,
+    venue_to_client: Arc<DashMap<i64, ClientOrderId>>,
+    seen_trade_ids: Arc<DashSet<i64>>,
+    voided_trade_ids: Arc<DashSet<i64>>,
+    open_order_state: Arc<DashMap<i64, OpenOrderState>>,
+    open_position_state: Arc<DashMap<i64, PositionState>>,
+    execution_stale: Arc<AtomicBool>,
+    reconciliation_in_progress: Arc<AtomicBool>,
+    instrument_aliases: Arc<HashMap<String, InstrumentId>>,
+}
+
+struct ReconciliationFlagGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for ReconciliationFlagGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
 }
 
 struct AccountStateRefreshContext {
@@ -147,19 +188,19 @@ struct AccountStateRefreshContext {
 }
 
 impl AccountStateRefreshContext {
-    fn cache_account_ids(&self, accounts: &[Account]) -> Vec<i64> {
+    fn cache_account_ids(&self, accounts: &[Account]) -> anyhow::Result<Vec<i64>> {
         let mut ids = Vec::with_capacity(accounts.len());
-        let mut account_ids = self.account_ids.write();
-        account_ids.clear();
+        let mut mapped = AHashMap::with_capacity(accounts.len());
 
         for account in accounts {
             ids.push(i64::from(account.id.get()));
-            let cached_account_id = projectx_account_id_from_raw(account.name.as_str());
-            account_ids.insert(i64::from(account.id.get()), cached_account_id);
+            let cached_account_id = projectx_account_id_from_raw(account.name.as_str())?;
+            mapped.insert(i64::from(account.id.get()), cached_account_id);
         }
         ids.sort_unstable();
         ids.dedup();
-        ids
+        *self.account_ids.write() = mapped;
+        Ok(ids)
     }
 
     fn account_num_from_account_id(&self, account_id: AccountId) -> Option<i64> {
@@ -213,8 +254,18 @@ impl AccountStateRefreshContext {
             anyhow::bail!("No ProjectX accounts returned by /api/Account/search");
         }
 
-        let ids = self.cache_account_ids(&accounts);
+        let ids = self.cache_account_ids(&accounts)?;
         let selected = self.select_subscribed_account_id_num(&ids)?;
+        let account = accounts
+            .iter()
+            .find(|account| i64::from(account.id.get()) == selected)
+            .ok_or_else(|| anyhow::anyhow!("Selected ProjectX account {selected} disappeared"))?;
+        if !account.can_trade {
+            anyhow::bail!("Selected ProjectX account {selected} is not permitted to trade");
+        }
+        if !account.is_visible {
+            anyhow::bail!("Selected ProjectX account {selected} is not visible to this login");
+        }
         self.bind_selected_account(selected);
         Ok(vec![selected])
     }
@@ -235,21 +286,33 @@ impl AccountStateRefreshContext {
         if accounts.is_empty() {
             anyhow::bail!("No ProjectX accounts returned by /api/Account/search");
         }
-        self.cache_account_ids(&accounts);
+        self.cache_account_ids(&accounts)?;
         self.bind_selected_account(account_id);
 
         let selected_index = accounts
             .iter()
-            .position(|account| i64::from(account.id.get()) == account_id);
-        let account = accounts.swap_remove(selected_index.unwrap_or(0));
+            .position(|account| i64::from(account.id.get()) == account_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Selected ProjectX account {account_id} was not returned by /api/Account/search"
+                )
+            })?;
+        let account = accounts.swap_remove(selected_index);
+        if !account.can_trade {
+            anyhow::bail!("Selected ProjectX account {account_id} is not permitted to trade");
+        }
+        if !account.is_visible {
+            anyhow::bail!("Selected ProjectX account {account_id} is not visible to this login");
+        }
         let currency = self.base_currency.unwrap_or_else(Currency::USD);
-        let total = Money::new(
-            account
-                .balance
-                .map_or(0.0, |value| value.to_f64().unwrap_or_default()),
-            currency,
-        );
-        let locked = Money::new(0.0, currency);
+        let raw_balance = account.balance.ok_or_else(|| {
+            anyhow::anyhow!(
+                "ProjectX account {} snapshot omitted the account balance",
+                account.id
+            )
+        })?;
+        let total = Money::from_decimal(raw_balance, currency)?;
+        let locked = Money::from_decimal(Decimal::ZERO, currency)?;
         let free = total;
         let balance = AccountBalance::new(total, locked, free);
 
@@ -271,13 +334,118 @@ impl AccountStateRefreshContext {
     }
 }
 
+impl ReconciliationContext {
+    async fn reconcile(&self, reason: &str) -> bool {
+        self.execution_stale.store(true, Ordering::SeqCst);
+
+        if self
+            .reconciliation_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            log::debug!("ProjectX reconciliation already in progress ({reason})");
+            return false;
+        }
+
+        let _flag_guard = ReconciliationFlagGuard {
+            flag: Arc::clone(&self.reconciliation_in_progress),
+        };
+        let account_ids_num = self
+            .subscribed_account_ids
+            .read()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut reconciled = !account_ids_num.is_empty();
+
+        if account_ids_num.is_empty() {
+            log::warn!("ProjectX cannot reconcile {reason}: no subscribed account IDs");
+        }
+
+        for account_id_num in &account_ids_num {
+            match ProjectXExecutionClient::fetch_runtime_reconciliation_snapshot_from_http(
+                &self.http_client,
+                *account_id_num,
+            )
+            .await
+            {
+                Ok(snapshot) => {
+                    if let Err(e) =
+                        ProjectXExecutionClient::apply_reconciliation_snapshot_with_context(
+                            snapshot,
+                            &self.account_ids,
+                            self.account_issuer,
+                            self.base_currency,
+                            &self.emitter,
+                            &self.order_meta_by_client,
+                            &self.venue_to_client,
+                            &self.seen_trade_ids,
+                            &self.voided_trade_ids,
+                            &self.open_order_state,
+                            &self.open_position_state,
+                            get_atomic_clock_realtime().get_time_ns(),
+                            true,
+                            Some(&self.instrument_aliases),
+                        )
+                    {
+                        reconciled = false;
+                        log::warn!(
+                            "ProjectX reconciliation snapshot was incomplete for account {account_id_num} ({reason}): {e}"
+                        );
+                    }
+                }
+                Err(e) => {
+                    reconciled = false;
+                    log::warn!(
+                        "ProjectX reconciliation failed for account {account_id_num} ({reason}): {e}"
+                    );
+                }
+            }
+        }
+
+        if reconciled
+            && let Err(e) = ProjectXExecutionClient::refresh_account_state_with_context(
+                &self.http_client,
+                &account_ids_num,
+                &self.account_ids,
+                self.account_issuer,
+                self.account_type,
+                self.base_currency,
+                &self.emitter,
+            )
+            .await
+        {
+            reconciled = false;
+            log::warn!("ProjectX account refresh failed after reconciliation ({reason}): {e}");
+        }
+
+        if reconciled
+            && !self
+                .ws_user
+                .as_ref()
+                .is_some_and(ProjectXWsClient::is_connected)
+        {
+            reconciled = false;
+            log::warn!(
+                "ProjectX reconciliation completed while the user stream was disconnected ({reason}); execution remains fenced"
+            );
+        }
+
+        if reconciled {
+            self.execution_stale.store(false, Ordering::SeqCst);
+            log::info!("ProjectX reconciliation completed ({reason})");
+        }
+        reconciled
+    }
+}
+
 impl ProjectXExecutionClient {
     fn normalize_projectx_symbol_key(value: &str) -> String {
         value.trim().to_ascii_uppercase()
     }
 
     fn cache_instrument_aliases(
-        aliases: &mut AHashMap<String, InstrumentId>,
+        aliases: &mut HashMap<String, InstrumentId>,
         instrument: &InstrumentAny,
     ) {
         let instrument_id = instrument.id();
@@ -313,8 +481,8 @@ impl ProjectXExecutionClient {
         }
     }
 
-    fn instrument_aliases_from_cache(cache: &Cache) -> AHashMap<String, InstrumentId> {
-        let mut aliases = AHashMap::new();
+    fn instrument_aliases_from_cache(cache: &Cache) -> HashMap<String, InstrumentId> {
+        let mut aliases = HashMap::new();
 
         for instrument in cache.instruments(&PROJECTX_VENUE, None) {
             Self::cache_instrument_aliases(&mut aliases, instrument);
@@ -332,7 +500,7 @@ impl ProjectXExecutionClient {
         config: ProjectXExecClientConfig,
     ) -> anyhow::Result<Self> {
         let mut core = core;
-        core.set_account_id(canonicalize_projectx_account_id(core.account_id));
+        core.set_account_id(canonicalize_projectx_account_id(core.account_id)?);
         let clock = get_atomic_clock_realtime();
         let emitter = ExecutionEventEmitter::new(
             clock,
@@ -352,10 +520,13 @@ impl ProjectXExecutionClient {
             account_ids: Arc::new(ParkingRwLock::new(AHashMap::new())),
             subscribed_account_ids: Arc::new(ParkingRwLock::new(AHashSet::new())),
             ws_event_task: None,
+            pending_tasks: TaskHandles::default(),
             order_meta_by_client: Arc::new(DashMap::new()),
             venue_to_client: Arc::new(DashMap::new()),
             last_order_state: Arc::new(DashMap::new()),
+            last_order_status: Arc::new(DashMap::new()),
             seen_trade_ids: Arc::new(DashSet::new()),
+            voided_trade_ids: Arc::new(DashSet::new()),
             pending_trades_by_order_id: Arc::new(DashMap::new()),
             open_order_state: Arc::new(DashMap::new()),
             open_position_state: Arc::new(DashMap::new()),
@@ -365,41 +536,100 @@ impl ProjectXExecutionClient {
         })
     }
 
-    fn parse_order_side(side: OrderSide) -> anyhow::Result<i32> {
+    fn parse_order_side(side: OrderSide) -> anyhow::Result<Side> {
         match side {
-            OrderSide::Buy => Ok(0),
-            OrderSide::Sell => Ok(1),
+            OrderSide::Buy => Ok(Side::Bid),
+            OrderSide::Sell => Ok(Side::Ask),
             _ => anyhow::bail!("Unsupported ProjectX order side: {side:?}"),
         }
     }
 
-    fn parse_order_type(order_type: OrderType) -> anyhow::Result<i32> {
+    fn parse_order_type(order_type: OrderType) -> anyhow::Result<ProjectXOrderType> {
         match order_type {
-            OrderType::Limit => Ok(1),
-            OrderType::Market => Ok(2),
-            OrderType::StopMarket | OrderType::StopLimit => Ok(4),
-            OrderType::TrailingStopMarket | OrderType::TrailingStopLimit => Ok(5),
-            OrderType::MarketToLimit => Ok(2),
+            OrderType::Limit => Ok(ProjectXOrderType::Limit),
+            OrderType::Market => Ok(ProjectXOrderType::Market),
+            OrderType::StopMarket => Ok(ProjectXOrderType::Stop),
             _ => anyhow::bail!("Unsupported ProjectX order type: {order_type:?}"),
         }
     }
 
     fn quantity_to_i64(quantity: Quantity) -> anyhow::Result<i64> {
-        let value = quantity.as_f64();
+        let value = quantity.as_decimal();
 
-        if value <= 0.0 {
+        if value <= Decimal::ZERO {
             anyhow::bail!("ProjectX quantity must be positive, was {value}");
         }
-        let rounded = value.round();
 
-        if (value - rounded).abs() > 1e-9 {
+        if !value.fract().is_zero() {
             anyhow::bail!("ProjectX quantity must be whole contracts, was {value}");
         }
-        Ok(rounded as i64)
+        value
+            .to_i64()
+            .ok_or_else(|| anyhow::anyhow!("ProjectX quantity is outside the i64 range: {value}"))
     }
 
-    fn price_to_f64(price: Option<Price>) -> Option<f64> {
-        price.map(|p| p.as_f64())
+    fn price_to_decimal(price: Option<Price>) -> Option<Decimal> {
+        price.map(|p| p.as_decimal())
+    }
+
+    fn validate_order_capabilities(order: &OrderAny) -> anyhow::Result<()> {
+        if order.time_in_force() != TimeInForce::Gtc {
+            anyhow::bail!(
+                "ProjectX supports only GTC orders, received {:?}",
+                order.time_in_force()
+            );
+        }
+        if order.is_post_only() {
+            anyhow::bail!("ProjectX post-only orders are not supported");
+        }
+        if order.is_reduce_only() {
+            anyhow::bail!("ProjectX reduce-only orders are not supported");
+        }
+        if order.is_quote_quantity() {
+            anyhow::bail!("ProjectX quote-quantity orders are not supported");
+        }
+
+        match order.order_type() {
+            OrderType::Limit if order.price().is_none() => {
+                anyhow::bail!("ProjectX limit orders require a limit price");
+            }
+            OrderType::StopMarket if order.trigger_price().is_none() => {
+                anyhow::bail!("ProjectX stop-market orders require a trigger price");
+            }
+            OrderType::Limit | OrderType::Market | OrderType::StopMarket => {}
+            unsupported => anyhow::bail!(
+                "ProjectX cannot preserve {unsupported:?} order semantics; the order was not submitted"
+            ),
+        }
+        Ok(())
+    }
+
+    fn build_place_order_request(
+        &self,
+        order: &OrderAny,
+        account_id_num: i64,
+    ) -> anyhow::Result<PlaceOrder> {
+        Self::validate_order_capabilities(order)?;
+        let account_id = Self::to_client_account_id(account_id_num)?;
+        let order_type = Self::parse_order_type(order.order_type())?;
+        let side = Self::parse_order_side(order.order_side())?;
+        let quantity = i32::try_from(Self::quantity_to_i64(order.quantity())?)?;
+        let contract_id = Self::to_client_contract_id(
+            &self.contract_id_from_instrument_id(order.instrument_id()),
+        )?;
+        let mut builder = PlaceOrder::builder(account_id, contract_id, order_type, side, quantity);
+
+        if let Some(limit_price) = Self::price_to_decimal(order.price()) {
+            builder = builder.limit_price(limit_price);
+        }
+        if let Some(stop_price) = Self::price_to_decimal(order.trigger_price()) {
+            builder = builder.stop_price(stop_price);
+        }
+
+        builder
+            .custom_tag(order.client_order_id().to_string())
+            .build()
+            .map_err(anyhow::Error::from)
     }
 
     fn to_client_account_id(value: i64) -> anyhow::Result<PxAccountId> {
@@ -422,19 +652,34 @@ impl ProjectXExecutionClient {
             .map_err(|_| anyhow::anyhow!("Invalid ProjectX venue order id '{order_id}'"))
     }
 
-    fn infer_price_precision(value: f64) -> u8 {
-        let s = format!("{value:.12}");
-        let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-        trimmed
-            .split('.')
-            .nth(1)
-            .map_or(0, |fraction| fraction.len() as u8)
+    fn ensure_response_account(
+        expected_account_id: i64,
+        actual_account_id: i64,
+        entity: &str,
+        entity_id: i64,
+    ) -> anyhow::Result<()> {
+        if actual_account_id != expected_account_id {
+            anyhow::bail!(
+                "ProjectX {entity} {entity_id} belongs to account {actual_account_id}, expected selected account {expected_account_id}"
+            );
+        }
+        Ok(())
     }
 
-    fn parse_ts(value: &ProjectXTimestamp) -> Option<UnixNanos> {
-        u64::try_from(value.as_jiff().as_nanosecond())
-            .ok()
-            .map(UnixNanos::from)
+    fn parse_ts(value: &ProjectXTimestamp) -> anyhow::Result<UnixNanos> {
+        let nanos = u64::try_from(value.as_jiff().as_nanosecond()).map_err(|e| {
+            anyhow::anyhow!("ProjectX timestamp {value} is outside the UnixNanos range: {e}")
+        })?;
+        Ok(UnixNanos::from(nanos))
+    }
+
+    fn projectx_timestamp_from_unix_nanos(
+        value: UnixNanos,
+        field: &str,
+    ) -> anyhow::Result<ProjectXTimestamp> {
+        let timestamp = jiff::Timestamp::from_nanosecond(i128::from(value.as_u64()))
+            .map_err(|e| anyhow::anyhow!("Invalid ProjectX {field} timestamp {value}: {e}"))?;
+        Ok(ProjectXTimestamp::from(timestamp))
     }
 
     fn try_parse_client_order_id(tag: &str) -> Option<ClientOrderId> {
@@ -443,19 +688,22 @@ impl ProjectXExecutionClient {
 
     fn instrument_id_from_contract_id(
         contract_id: &str,
-        aliases: Option<&AHashMap<String, InstrumentId>>,
-    ) -> InstrumentId {
+        aliases: Option<&HashMap<String, InstrumentId>>,
+    ) -> anyhow::Result<InstrumentId> {
         let key = Self::normalize_projectx_symbol_key(contract_id);
 
         if let Some(aliases) = aliases
             && let Some(instrument_id) = aliases.get(&key)
         {
-            return *instrument_id;
+            return Ok(*instrument_id);
         }
 
         let symbol =
             projectx_to_databento_symbol(contract_id).unwrap_or_else(|_| contract_id.to_string());
-        InstrumentId::new(Symbol::new(symbol), *PROJECTX_VENUE)
+        let symbol = Symbol::new_checked(symbol).map_err(|e| {
+            anyhow::anyhow!("Invalid ProjectX contract identifier `{contract_id}`: {e}")
+        })?;
+        Ok(InstrumentId::new(symbol, *PROJECTX_VENUE))
     }
 
     fn cached_contract_id_from_instrument(instrument: &InstrumentAny) -> Option<&str> {
@@ -482,45 +730,74 @@ impl ProjectXExecutionClient {
             .unwrap_or_else(|_| instrument_id.symbol.inner().to_string())
     }
 
-    fn map_order_side_code(side: i32) -> OrderSide {
-        if side == 0 {
-            OrderSide::Buy
-        } else {
-            OrderSide::Sell
+    fn map_order_side(side: Side) -> anyhow::Result<OrderSide> {
+        match side {
+            Side::Bid => Ok(OrderSide::Buy),
+            Side::Ask => Ok(OrderSide::Sell),
+            Side::Unknown(code) => anyhow::bail!("Unknown ProjectX order side code: {code}"),
+            _ => anyhow::bail!("Unsupported ProjectX order side: {side:?}"),
         }
     }
 
-    fn map_order_type_code(order_type: i32) -> OrderType {
+    fn map_order_type(order_type: ProjectXOrderType) -> anyhow::Result<OrderType> {
         match order_type {
-            1 => OrderType::Limit,
-            2 => OrderType::Market,
-            4 => OrderType::StopMarket,
-            5 => OrderType::TrailingStopMarket,
-            _ => OrderType::Limit,
+            ProjectXOrderType::Limit => Ok(OrderType::Limit),
+            ProjectXOrderType::Market => Ok(OrderType::Market),
+            ProjectXOrderType::StopLimit => Ok(OrderType::StopLimit),
+            ProjectXOrderType::Stop => Ok(OrderType::StopMarket),
+            ProjectXOrderType::TrailingStop => Ok(OrderType::TrailingStopMarket),
+            ProjectXOrderType::JoinBid | ProjectXOrderType::JoinAsk => {
+                anyhow::bail!("ProjectX {order_type:?} orders have no exact Nautilus order type")
+            }
+            ProjectXOrderType::Unknown(code) => {
+                anyhow::bail!("Unknown ProjectX order type code: {code}")
+            }
+            _ => anyhow::bail!("Unsupported ProjectX order type: {order_type:?}"),
         }
     }
 
-    fn map_order_status(order: &Order) -> OrderStatus {
+    fn map_order_status(order: &Order) -> anyhow::Result<OrderStatus> {
         let filled = i64::from(order.fill_volume.unwrap_or(0));
+        let size = i64::from(order.size);
 
-        if filled >= i64::from(order.size) && order.size > 0 {
-            return OrderStatus::Filled;
-        }
-
-        if filled > 0 {
-            return OrderStatus::PartiallyFilled;
-        }
-
-        match order.status.code() {
-            1 | 6 => OrderStatus::Accepted,
-            3 | 4 => OrderStatus::Canceled,
-            5 => OrderStatus::Rejected,
-            _ => OrderStatus::Accepted,
+        match order.status {
+            ProjectXOrderStatus::Filled => Ok(OrderStatus::Filled),
+            ProjectXOrderStatus::Cancelled => Ok(OrderStatus::Canceled),
+            ProjectXOrderStatus::Expired => Ok(OrderStatus::Expired),
+            ProjectXOrderStatus::Rejected => Ok(OrderStatus::Rejected),
+            ProjectXOrderStatus::PendingCancellation => Ok(OrderStatus::PendingCancel),
+            ProjectXOrderStatus::Open | ProjectXOrderStatus::Suspended => {
+                if size > 0 && filled >= size {
+                    Ok(OrderStatus::Filled)
+                } else if filled > 0 {
+                    Ok(OrderStatus::PartiallyFilled)
+                } else {
+                    Ok(OrderStatus::Accepted)
+                }
+            }
+            ProjectXOrderStatus::Pending => {
+                if size > 0 && filled >= size {
+                    Ok(OrderStatus::Filled)
+                } else if filled > 0 {
+                    Ok(OrderStatus::PartiallyFilled)
+                } else {
+                    Ok(OrderStatus::Submitted)
+                }
+            }
+            ProjectXOrderStatus::None => {
+                anyhow::bail!("ProjectX order has no lifecycle status")
+            }
+            ProjectXOrderStatus::Unknown(code) => {
+                anyhow::bail!("Unknown ProjectX order status code: {code}")
+            }
+            _ => anyhow::bail!("Unsupported ProjectX order status: {:?}", order.status),
         }
     }
 
-    fn weighted_trade_avg_px_by_order_id(trades: &[Trade]) -> AHashMap<i64, f64> {
-        let mut totals = AHashMap::<i64, (f64, i64)>::new();
+    fn weighted_trade_avg_px_by_order_id(
+        trades: &[Trade],
+    ) -> anyhow::Result<AHashMap<i64, Decimal>> {
+        let mut totals = AHashMap::<i64, (Decimal, i64)>::new();
 
         for trade in trades {
             if trade.voided || trade.size <= 0 {
@@ -528,20 +805,39 @@ impl ProjectXExecutionClient {
             }
 
             let order_id = trade.order_id.get();
-            let entry = totals.entry(order_id).or_insert((0.0, 0));
-            entry.0 += trade.price.to_f64().unwrap_or_default() * f64::from(trade.size);
-            entry.1 += i64::from(trade.size);
+            let entry = totals.entry(order_id).or_insert((Decimal::ZERO, 0));
+            let notional = trade
+                .price
+                .checked_mul(Decimal::from(trade.size))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ProjectX trade {} notional overflow for price={} size={}",
+                        trade.id.get(),
+                        trade.price,
+                        trade.size
+                    )
+                })?;
+            entry.0 = entry.0.checked_add(notional).ok_or_else(|| {
+                anyhow::anyhow!("ProjectX order {order_id} aggregate trade notional overflow")
+            })?;
+            entry.1 = entry
+                .1
+                .checked_add(i64::from(trade.size))
+                .ok_or_else(|| anyhow::anyhow!("ProjectX order {order_id} fill size overflow"))?;
         }
 
         let mut weighted = AHashMap::with_capacity(totals.len());
 
         for (order_id, (notional, qty)) in totals {
             if qty > 0 {
-                weighted.insert(order_id, notional / qty as f64);
+                let average = notional.checked_div(Decimal::from(qty)).ok_or_else(|| {
+                    anyhow::anyhow!("ProjectX order {order_id} weighted price overflow")
+                })?;
+                weighted.insert(order_id, average);
             }
         }
 
-        weighted
+        Ok(weighted)
     }
 
     fn reconciliation_start_timestamp() -> ProjectXTimestamp {
@@ -550,31 +846,58 @@ impl ProjectXExecutionClient {
         ProjectXTimestamp::from(start)
     }
 
-    fn backfill_order_filled_price(order: &mut Order, weighted_avg_px: &AHashMap<i64, f64>) {
+    fn lookback_start_unix_nanos(lookback_mins: u64) -> anyhow::Result<UnixNanos> {
+        let lookback_ns = lookback_mins
+            .checked_mul(60)
+            .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+            .ok_or_else(|| {
+                anyhow::anyhow!("ProjectX lookback {lookback_mins} minutes exceeds timestamp range")
+            })?;
+        let now = get_atomic_clock_realtime().get_time_ns().as_u64();
+        Ok(UnixNanos::from(now.saturating_sub(lookback_ns)))
+    }
+
+    fn backfill_order_filled_price(order: &mut Order, weighted_avg_px: &AHashMap<i64, Decimal>) {
         if order.filled_price.is_some() || order.fill_volume.unwrap_or(0) <= 0 {
             return;
         }
 
-        if let Some(avg_px) = weighted_avg_px.get(&order.id.get()).copied() {
-            order.filled_price = Some(Decimal::from_f64_retain(avg_px).unwrap_or_default());
-        }
+        order.filled_price = weighted_avg_px.get(&order.id.get()).copied();
     }
 
-    fn backfill_orders_filled_prices(orders: &mut [Order], trades: &[Trade]) {
-        let weighted_avg_px = Self::weighted_trade_avg_px_by_order_id(trades);
+    fn backfill_orders_filled_prices(orders: &mut [Order], trades: &[Trade]) -> anyhow::Result<()> {
+        let weighted_avg_px = Self::weighted_trade_avg_px_by_order_id(trades)?;
 
         for order in orders {
             Self::backfill_order_filled_price(order, &weighted_avg_px);
         }
+        Ok(())
     }
 
-    fn map_position_side(position: &Position) -> PositionSideSpecified {
+    fn map_position_side(position: &Position) -> anyhow::Result<PositionSideSpecified> {
+        if position.size < 0 {
+            anyhow::bail!(
+                "ProjectX position {} has invalid negative size {}",
+                position.id,
+                position.size
+            );
+        }
         if position.size == 0 {
-            PositionSideSpecified::Flat
-        } else if position.position_type == projectx_client::PositionType::Short {
-            PositionSideSpecified::Short
-        } else {
-            PositionSideSpecified::Long
+            return Ok(PositionSideSpecified::Flat);
+        }
+        match position.position_type {
+            projectx_client::PositionType::Long => Ok(PositionSideSpecified::Long),
+            projectx_client::PositionType::Short => Ok(PositionSideSpecified::Short),
+            projectx_client::PositionType::Undefined => {
+                anyhow::bail!("Non-flat ProjectX position has undefined side")
+            }
+            projectx_client::PositionType::Unknown(code) => {
+                anyhow::bail!("Unknown ProjectX position side code: {code}")
+            }
+            _ => anyhow::bail!(
+                "Unsupported ProjectX position side: {:?}",
+                position.position_type
+            ),
         }
     }
 
@@ -584,13 +907,12 @@ impl ProjectXExecutionClient {
         account_id: AccountId,
         venue_to_client: &DashMap<i64, ClientOrderId>,
         ts_init: UnixNanos,
-        aliases: Option<&AHashMap<String, InstrumentId>>,
-    ) -> OrderStatusReport {
-        let now = get_atomic_clock_realtime().get_time_ns();
-        let ts_last = Self::parse_ts(&order.update_timestamp).unwrap_or(now);
-        let ts_accepted = Self::parse_ts(&order.creation_timestamp).unwrap_or(ts_last);
+        aliases: Option<&HashMap<String, InstrumentId>>,
+    ) -> anyhow::Result<OrderStatusReport> {
+        let ts_last = Self::parse_ts(&order.update_timestamp)?;
+        let ts_accepted = Self::parse_ts(&order.creation_timestamp)?;
         let instrument_id =
-            Self::instrument_id_from_contract_id(order.contract_id.as_ref(), aliases);
+            Self::instrument_id_from_contract_id(order.contract_id.as_ref(), aliases)?;
         let venue_order_id = VenueOrderId::new(order.id.to_string());
         let client_order_id = order
             .custom_tag
@@ -603,12 +925,12 @@ impl ProjectXExecutionClient {
             instrument_id,
             client_order_id,
             venue_order_id,
-            Self::map_order_side_code(order.side.code()),
-            Self::map_order_type_code(order.order_type.code()),
+            Self::map_order_side(order.side)?,
+            Self::map_order_type(order.order_type)?,
             TimeInForce::Gtc,
-            Self::map_order_status(&order),
-            Quantity::new(f64::from(order.size), 0),
-            Quantity::new(f64::from(order.fill_volume.unwrap_or(0)), 0),
+            Self::map_order_status(&order)?,
+            Quantity::from_decimal(Decimal::from(order.size))?,
+            Quantity::from_decimal(Decimal::from(order.fill_volume.unwrap_or(0)))?,
             ts_accepted,
             ts_last,
             ts_init,
@@ -616,19 +938,11 @@ impl ProjectXExecutionClient {
         );
 
         if let Some(limit_price) = order.limit_price {
-            let limit_price = limit_price.to_f64().unwrap_or_default();
-            report = report.with_price(Price::new(
-                limit_price,
-                Self::infer_price_precision(limit_price),
-            ));
+            report = report.with_price(Price::from_decimal(limit_price)?);
         }
 
         if let Some(stop_price) = order.stop_price {
-            let stop_price = stop_price.to_f64().unwrap_or_default();
-            report = report.with_trigger_price(Price::new(
-                stop_price,
-                Self::infer_price_precision(stop_price),
-            ));
+            report = report.with_trigger_price(Price::from_decimal(stop_price)?);
         }
 
         if let Some(avg_price) = order.filled_price {
@@ -639,7 +953,7 @@ impl ProjectXExecutionClient {
             report.cancel_reason = Some("ProjectX canceled".to_string());
         }
 
-        report
+        Ok(report)
     }
 
     fn map_user_order_report(
@@ -648,10 +962,9 @@ impl ProjectXExecutionClient {
         account_id: AccountId,
         client_order_id: ClientOrderId,
         ts_init: UnixNanos,
-    ) -> OrderStatusReport {
-        let now = get_atomic_clock_realtime().get_time_ns();
-        let ts_last = Self::parse_ts(&order.update_timestamp).unwrap_or(now);
-        let ts_accepted = Self::parse_ts(&order.creation_timestamp).unwrap_or(ts_last);
+    ) -> anyhow::Result<OrderStatusReport> {
+        let ts_last = Self::parse_ts(&order.update_timestamp)?;
+        let ts_accepted = Self::parse_ts(&order.creation_timestamp)?;
         let venue_order_id = VenueOrderId::new(order.id.to_string());
         let mut report = OrderStatusReport::new(
             account_id,
@@ -661,19 +974,9 @@ impl ProjectXExecutionClient {
             meta.order_side,
             meta.order_type,
             TimeInForce::Gtc,
-            match (
-                order.fill_volume.unwrap_or(0),
-                order.size,
-                order.status.code(),
-            ) {
-                (filled, size, _) if size > 0 && filled >= size => OrderStatus::Filled,
-                (filled, _, _) if filled > 0 => OrderStatus::PartiallyFilled,
-                (_, _, 3 | 4) => OrderStatus::Canceled,
-                (_, _, 5) => OrderStatus::Rejected,
-                _ => OrderStatus::Accepted,
-            },
-            Quantity::new(f64::from(order.size), 0),
-            Quantity::new(f64::from(order.fill_volume.unwrap_or(0)), 0),
+            Self::map_order_status(order)?,
+            Quantity::from_decimal(Decimal::from(order.size))?,
+            Quantity::from_decimal(Decimal::from(order.fill_volume.unwrap_or(0)))?,
             ts_accepted,
             ts_last,
             ts_init,
@@ -681,19 +984,11 @@ impl ProjectXExecutionClient {
         );
 
         if let Some(limit_price) = order.limit_price {
-            let limit_price = limit_price.to_f64().unwrap_or_default();
-            report = report.with_price(Price::new(
-                limit_price,
-                Self::infer_price_precision(limit_price),
-            ));
+            report = report.with_price(Price::from_decimal(limit_price)?);
         }
 
         if let Some(stop_price) = order.stop_price {
-            let stop_price = stop_price.to_f64().unwrap_or_default();
-            report = report.with_trigger_price(Price::new(
-                stop_price,
-                Self::infer_price_precision(stop_price),
-            ));
+            report = report.with_trigger_price(Price::from_decimal(stop_price)?);
         }
 
         if let Some(avg_price) = order.filled_price {
@@ -704,7 +999,20 @@ impl ProjectXExecutionClient {
             report.cancel_reason = Some("ProjectX canceled".to_string());
         }
 
-        report
+        Ok(report)
+    }
+
+    fn trade_commission(trade: &Trade, currency: Currency) -> anyhow::Result<Money> {
+        let total = trade
+            .fees
+            .checked_add(trade.commissions.unwrap_or(Decimal::ZERO))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ProjectX trade {} fee and commission total overflow",
+                    trade.id.get()
+                )
+            })?;
+        Money::from_decimal(total, currency).map_err(anyhow::Error::from)
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -714,35 +1022,34 @@ impl ProjectXExecutionClient {
         base_currency: Option<Currency>,
         venue_to_client: &DashMap<i64, ClientOrderId>,
         ts_init: UnixNanos,
-        aliases: Option<&AHashMap<String, InstrumentId>>,
-    ) -> FillReport {
-        let ts_event = Self::parse_ts(&trade.creation_timestamp).unwrap_or(ts_init);
+        aliases: Option<&HashMap<String, InstrumentId>>,
+    ) -> anyhow::Result<FillReport> {
+        let ts_event = Self::parse_ts(&trade.creation_timestamp)?;
         let instrument_id =
-            Self::instrument_id_from_contract_id(trade.contract_id.as_ref(), aliases);
+            Self::instrument_id_from_contract_id(trade.contract_id.as_ref(), aliases)?;
         let venue_order_id = VenueOrderId::new(trade.order_id.to_string());
         let client_order_id = venue_to_client
             .get(&trade.order_id.get())
             .map(|value| *value);
         let commission_currency = base_currency.unwrap_or_else(Currency::USD);
-        let price = trade.price.to_f64().unwrap_or_default();
-        let fees = trade.fees.to_f64().unwrap_or_default();
+        let commission = Self::trade_commission(&trade, commission_currency)?;
 
-        FillReport::new(
+        Ok(FillReport::new(
             account_id,
             instrument_id,
             venue_order_id,
             TradeId::new(format!("PX-{}", trade.id.get())),
-            Self::map_order_side_code(trade.side.code()),
-            Quantity::new(f64::from(trade.size), 0),
-            Price::new(price, Self::infer_price_precision(price)),
-            Money::new(fees.abs(), commission_currency),
+            Self::map_order_side(trade.side)?,
+            Quantity::from_decimal(Decimal::from(trade.size))?,
+            Price::from_decimal(trade.price)?,
+            commission,
             LiquiditySide::NoLiquiditySide,
             client_order_id,
             None,
             ts_event,
             ts_init,
             None,
-        )
+        ))
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -750,23 +1057,21 @@ impl ProjectXExecutionClient {
         position: Position,
         account_id: AccountId,
         ts_init: UnixNanos,
-        aliases: Option<&AHashMap<String, InstrumentId>>,
-    ) -> PositionStatusReport {
-        let ts_last = Self::parse_ts(&position.creation_timestamp).unwrap_or(ts_init);
-        let avg_px_open = (position.size != 0)
-            .then(|| position.average_price.to_string().parse().ok())
-            .flatten();
-        PositionStatusReport::new(
+        aliases: Option<&HashMap<String, InstrumentId>>,
+    ) -> anyhow::Result<PositionStatusReport> {
+        let ts_last = Self::parse_ts(&position.creation_timestamp)?;
+        let avg_px_open = (position.size != 0).then_some(position.average_price);
+        Ok(PositionStatusReport::new(
             account_id,
-            Self::instrument_id_from_contract_id(position.contract_id.as_ref(), aliases),
-            Self::map_position_side(&position),
-            Quantity::new(f64::from(position.size), 0),
+            Self::instrument_id_from_contract_id(position.contract_id.as_ref(), aliases)?,
+            Self::map_position_side(&position)?,
+            Quantity::from(position.size.unsigned_abs()),
             ts_last,
             ts_init,
             None,
             None,
             avg_px_open,
-        )
+        ))
     }
 
     fn should_refresh_submit_snapshot(order_type: OrderType) -> bool {
@@ -774,7 +1079,7 @@ impl ProjectXExecutionClient {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn refresh_submit_snapshot_best_effort(
+    async fn refresh_submit_snapshot(
         http_client: &ProjectXHttpClient,
         account_id: i64,
         client_order_id: ClientOrderId,
@@ -782,35 +1087,39 @@ impl ProjectXExecutionClient {
         account_issuer: Venue,
         base_currency: Option<Currency>,
         emitter: &ExecutionEventEmitter,
+        order_meta_by_client: &DashMap<ClientOrderId, ProjectXOrderMeta>,
         venue_to_client: &DashMap<i64, ClientOrderId>,
         seen_trade_ids: &DashSet<i64>,
+        voided_trade_ids: &DashSet<i64>,
         open_order_state: &DashMap<i64, OpenOrderState>,
         open_position_state: &DashMap<i64, PositionState>,
-        aliases: &AHashMap<String, InstrumentId>,
-    ) {
+        aliases: &HashMap<String, InstrumentId>,
+    ) -> anyhow::Result<()> {
         let delay_ms = 1_000_u64;
         tokio::time::sleep(StdDuration::from_millis(delay_ms)).await;
 
-        if let Err(e) = Self::reconcile_account_snapshot_with_context(
+        Self::reconcile_account_snapshot_with_context(
             http_client,
             account_id,
             account_ids,
             account_issuer,
             base_currency,
             emitter,
+            order_meta_by_client,
             venue_to_client,
             seen_trade_ids,
+            voided_trade_ids,
             open_order_state,
             open_position_state,
             get_atomic_clock_realtime().get_time_ns(),
             Some(aliases),
         )
         .await
-        {
-            log::warn!(
+        .map_err(|e| {
+            anyhow::anyhow!(
                 "ProjectX post-submit snapshot refresh failed for account {account_id} order {client_order_id} after {delay_ms}ms: {e}"
-            );
-        }
+            )
+        })
     }
 
     fn handle_user_accounts_event(
@@ -820,18 +1129,31 @@ impl ProjectXExecutionClient {
         account_issuer: Venue,
         account_type: AccountType,
         base_currency: Option<Currency>,
-    ) {
+    ) -> anyhow::Result<()> {
         let currency = base_currency.unwrap_or_else(Currency::USD);
 
         for account in accounts {
+            if !account.can_trade {
+                anyhow::bail!(
+                    "ProjectX account {} is no longer permitted to trade",
+                    account.id
+                );
+            }
+            if !account.is_visible {
+                anyhow::bail!(
+                    "ProjectX account {} is no longer visible to this login",
+                    account.id
+                );
+            }
             let ts_now = get_atomic_clock_realtime().get_time_ns();
-            let total = Money::new(
-                account
-                    .balance
-                    .map_or(0.0, |value| value.to_f64().unwrap_or_default()),
-                currency,
-            );
-            let locked = Money::new(0.0, currency);
+            let raw_balance = account.balance.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ProjectX account {} update omitted the account balance",
+                    account.id
+                )
+            })?;
+            let total = Money::from_decimal(raw_balance, currency)?;
+            let locked = Money::from_decimal(Decimal::ZERO, currency)?;
             let free = total;
             let state = AccountState::new(
                 Self::account_id_from_num_with_context(
@@ -850,9 +1172,14 @@ impl ProjectXExecutionClient {
             );
             emitter.send_account_state(state);
         }
+        Ok(())
     }
 
-    fn map_order_report(&self, order: Order, ts_init: UnixNanos) -> OrderStatusReport {
+    fn map_order_report(
+        &self,
+        order: Order,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<OrderStatusReport> {
         let account_id = self.account_id_from_num(i64::from(order.account_id.get()));
         let cache = self.core.cache();
         let aliases = Self::instrument_aliases_from_cache(&cache);
@@ -865,7 +1192,7 @@ impl ProjectXExecutionClient {
         )
     }
 
-    fn map_fill_report(&self, trade: Trade, ts_init: UnixNanos) -> FillReport {
+    fn map_fill_report(&self, trade: Trade, ts_init: UnixNanos) -> anyhow::Result<FillReport> {
         let account_id = self.account_id_from_num(i64::from(trade.account_id.get()));
         let cache = self.core.cache();
         let aliases = Self::instrument_aliases_from_cache(&cache);
@@ -879,7 +1206,11 @@ impl ProjectXExecutionClient {
         )
     }
 
-    fn map_position_report(&self, position: Position, ts_init: UnixNanos) -> PositionStatusReport {
+    fn map_position_report(
+        &self,
+        position: Position,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<PositionStatusReport> {
         let account_id = self.account_id_from_num(i64::from(position.account_id.get()));
         let cache = self.core.cache();
         let aliases = Self::instrument_aliases_from_cache(&cache);
@@ -890,6 +1221,7 @@ impl ProjectXExecutionClient {
         &self,
         ts_now: UnixNanos,
         order_reports: Vec<OrderStatusReport>,
+        fill_reports: Vec<FillReport>,
         position_reports: Vec<PositionStatusReport>,
     ) -> ExecutionMassStatus {
         let mut mass_status = ExecutionMassStatus::new(
@@ -900,6 +1232,7 @@ impl ProjectXExecutionClient {
             None,
         );
         mass_status.add_order_reports(order_reports);
+        mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
         mass_status
     }
@@ -939,6 +1272,12 @@ impl ProjectXExecutionClient {
     fn command_readiness_error(&self) -> Option<&'static str> {
         if !self.core.is_connected() {
             Some("ProjectX execution client is not connected")
+        } else if !self
+            .ws_user
+            .as_ref()
+            .is_some_and(ProjectXWsClient::is_connected)
+        {
+            Some("ProjectX user stream is not connected; command rejected")
         } else if self.reconciliation_in_progress.load(Ordering::SeqCst) {
             Some("ProjectX reconciliation in progress; command rejected")
         } else if self.execution_stale.load(Ordering::SeqCst) {
@@ -993,6 +1332,84 @@ impl ProjectXExecutionClient {
         }
     }
 
+    fn reconciliation_context(&self) -> ReconciliationContext {
+        let instrument_aliases = {
+            let cache = self.core.cache();
+            Arc::new(Self::instrument_aliases_from_cache(&cache))
+        };
+        ReconciliationContext {
+            http_client: self.http_client.clone(),
+            ws_user: self.ws_user.clone(),
+            emitter: self.emitter.clone(),
+            account_ids: Arc::clone(&self.account_ids),
+            subscribed_account_ids: Arc::clone(&self.subscribed_account_ids),
+            account_issuer: self.core.account_id.get_issuer(),
+            account_type: self.core.account_type,
+            base_currency: self.core.base_currency,
+            order_meta_by_client: Arc::clone(&self.order_meta_by_client),
+            venue_to_client: Arc::clone(&self.venue_to_client),
+            seen_trade_ids: Arc::clone(&self.seen_trade_ids),
+            voided_trade_ids: Arc::clone(&self.voided_trade_ids),
+            open_order_state: Arc::clone(&self.open_order_state),
+            open_position_state: Arc::clone(&self.open_position_state),
+            execution_stale: Arc::clone(&self.execution_stale),
+            reconciliation_in_progress: Arc::clone(&self.reconciliation_in_progress),
+            instrument_aliases,
+        }
+    }
+
+    fn is_ambiguous_mutation_error(error: &ProjectXHttpError) -> bool {
+        matches!(
+            error,
+            ProjectXHttpError::Client(projectx_client::Error::AmbiguousMutation { .. })
+        )
+    }
+
+    fn bound_trade_dedup_state(seen_trade_ids: &DashSet<i64>, voided_trade_ids: &DashSet<i64>) {
+        if seen_trade_ids.len() <= MAX_TRACKED_TRADE_IDS {
+            return;
+        }
+
+        let mut ids = seen_trade_ids
+            .iter()
+            .map(|entry| *entry)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+
+        for trade_id in ids.into_iter().take(TRADE_ID_PRUNE_BATCH) {
+            seen_trade_ids.remove(&trade_id);
+            voided_trade_ids.remove(&trade_id);
+        }
+    }
+
+    fn buffer_pending_trade(
+        pending_trades_by_order_id: &DashMap<i64, Vec<Trade>>,
+        trade: Trade,
+    ) -> bool {
+        let order_id = trade.order_id.get();
+
+        if !pending_trades_by_order_id.contains_key(&order_id)
+            && pending_trades_by_order_id.len() >= MAX_PENDING_TRADE_ORDERS
+        {
+            log::warn!(
+                "ProjectX cannot buffer unmatched trade {} because the pending-order buffer is full; reconciliation is required",
+                trade.id.get()
+            );
+            return false;
+        }
+
+        let mut pending = pending_trades_by_order_id.entry(order_id).or_default();
+        if pending.len() >= MAX_PENDING_TRADES_PER_ORDER {
+            log::warn!(
+                "ProjectX cannot buffer unmatched trade {} because order {order_id} reached the per-order buffer limit; reconciliation is required",
+                trade.id.get()
+            );
+            return false;
+        }
+        pending.push(trade);
+        true
+    }
+
     fn ensure_account_id_num_known(&self, account_id_num: i64) -> anyhow::Result<i64> {
         let subscribed_account_ids = self.subscribed_account_ids.read();
         if subscribed_account_ids.is_empty() || subscribed_account_ids.contains(&account_id_num) {
@@ -1034,7 +1451,7 @@ impl ProjectXExecutionClient {
             return Ok(Some(self.ensure_account_id_num_known(account_id_num)?));
         }
 
-        let account_id = projectx_account_id_from_raw(account_raw);
+        let account_id = projectx_account_id_from_raw(account_raw)?;
 
         if let Some(account_id_num) = self
             .account_num_from_account_id(account_id)
@@ -1051,10 +1468,16 @@ impl ProjectXExecutionClient {
         params: Option<&nautilus_core::Params>,
         order_account_id: Option<AccountId>,
     ) -> anyhow::Result<i64> {
-        if let Some(account_id_num) = order_account_id.and_then(|account_id| {
-            self.account_num_from_account_id(canonicalize_projectx_account_id(account_id))
-                .or_else(|| Self::parse_account_num_from_account_id(account_id))
-        }) {
+        if let Some(account_id) = order_account_id {
+            let canonical = canonicalize_projectx_account_id(account_id)?;
+            let account_id_num = self
+                .account_num_from_account_id(canonical)
+                .or_else(|| Self::parse_account_num_from_account_id(canonical))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ProjectX order account {account_id} does not resolve to a subscribed provider account"
+                    )
+                })?;
             return self.ensure_account_id_num_known(account_id_num);
         }
 
@@ -1083,13 +1506,38 @@ impl ProjectXExecutionClient {
         http_client: &ProjectXHttpClient,
         account_id: i64,
     ) -> anyhow::Result<ReconciliationSnapshot> {
-        let account_id = Self::to_client_account_id(account_id)?;
+        let expected_account_id = account_id;
+        let account_id = Self::to_client_account_id(expected_account_id)?;
         let open_orders = http_client.search_open_orders(account_id).await?;
         let positions = http_client.search_open_positions(account_id).await?;
         let start_timestamp = Self::reconciliation_start_timestamp();
         let trades = http_client
             .search_trades(&TradeSearch::new(account_id, start_timestamp, None)?)
             .await?;
+        for order in &open_orders {
+            Self::ensure_response_account(
+                expected_account_id,
+                i64::from(order.account_id.get()),
+                "order",
+                order.id.get(),
+            )?;
+        }
+        for position in &positions {
+            Self::ensure_response_account(
+                expected_account_id,
+                i64::from(position.account_id.get()),
+                "position",
+                i64::from(position.id.get()),
+            )?;
+        }
+        for trade in &trades {
+            Self::ensure_response_account(
+                expected_account_id,
+                i64::from(trade.account_id.get()),
+                "trade",
+                trade.id.get(),
+            )?;
+        }
 
         Ok(ReconciliationSnapshot {
             open_orders,
@@ -1105,7 +1553,8 @@ impl ProjectXExecutionClient {
         trades: &[Trade],
         open_orders: &[Order],
     ) -> anyhow::Result<Vec<Order>> {
-        let account_id = Self::to_client_account_id(account_id)?;
+        let expected_account_id = account_id;
+        let account_id = Self::to_client_account_id(expected_account_id)?;
         let open_order_ids: HashSet<i64> = open_orders.iter().map(|order| order.id.get()).collect();
         let trade_order_ids: HashSet<i64> = trades
             .iter()
@@ -1125,6 +1574,14 @@ impl ProjectXExecutionClient {
                 None,
             )?)
             .await?;
+        for order in &orders {
+            Self::ensure_response_account(
+                expected_account_id,
+                i64::from(order.account_id.get()),
+                "order",
+                order.id.get(),
+            )?;
+        }
         orders.retain(|order| trade_order_ids.contains(&order.id.get()));
         Ok(orders)
     }
@@ -1136,22 +1593,13 @@ impl ProjectXExecutionClient {
         let mut snapshot =
             Self::fetch_reconciliation_snapshot_from_http(http_client, account_id).await?;
 
-        snapshot.recent_trade_orders = match Self::fetch_recent_trade_orders_from_http(
+        snapshot.recent_trade_orders = Self::fetch_recent_trade_orders_from_http(
             http_client,
             account_id,
             &snapshot.trades,
             &snapshot.open_orders,
         )
-        .await
-        {
-            Ok(orders) => orders,
-            Err(e) => {
-                log::warn!(
-                    "ProjectX failed to fetch recent closed orders for account {account_id}: {e}"
-                );
-                Vec::new()
-            }
-        };
+        .await?;
 
         Ok(snapshot)
     }
@@ -1163,14 +1611,16 @@ impl ProjectXExecutionClient {
         account_issuer: Venue,
         base_currency: Option<Currency>,
         emitter: &ExecutionEventEmitter,
+        order_meta_by_client: &DashMap<ClientOrderId, ProjectXOrderMeta>,
         venue_to_client: &DashMap<i64, ClientOrderId>,
         seen_trade_ids: &DashSet<i64>,
+        voided_trade_ids: &DashSet<i64>,
         open_order_state: &DashMap<i64, OpenOrderState>,
         open_position_state: &DashMap<i64, PositionState>,
         ts_init: UnixNanos,
         emit_reports: bool,
-        aliases: Option<&AHashMap<String, InstrumentId>>,
-    ) {
+        aliases: Option<&HashMap<String, InstrumentId>>,
+    ) -> anyhow::Result<()> {
         let ReconciliationSnapshot {
             open_orders,
             recent_trade_orders,
@@ -1186,41 +1636,36 @@ impl ProjectXExecutionClient {
             trades.len()
         );
 
-        let trade_avg_px_by_order_id = Self::weighted_trade_avg_px_by_order_id(&trades);
+        let trade_avg_px_by_order_id = Self::weighted_trade_avg_px_by_order_id(&trades)?;
         let trade_order_ids: HashSet<i64> = trades
             .iter()
             .filter(|trade| !trade.voided && trade.size > 0)
             .map(|trade| trade.order_id.get())
             .collect();
+        let staged_venue_to_client = DashMap::new();
+        for entry in venue_to_client {
+            staged_venue_to_client.insert(*entry.key(), *entry.value());
+        }
+        let mut venue_mapping_updates = Vec::new();
+        let mut order_reports = Vec::new();
+        let mut open_order_updates = Vec::new();
         let mut order_ids = HashSet::new();
 
         for mut order in open_orders {
-            order_ids.insert(order.id.get());
+            let order_id = order.id.get();
+            order_ids.insert(order_id);
             let new_state = OpenOrderState {
                 status: order.status.code(),
                 fill_volume: i64::from(order.fill_volume.unwrap_or(0)),
-                filled_price_bits: order
-                    .filled_price
-                    .map(|value| value.to_f64().unwrap_or_default().to_bits()),
+                filled_price: order.filled_price,
             };
-            if open_order_state
-                .get(&order.id.get())
-                .is_some_and(|prev| *prev == new_state)
-            {
-                continue;
-            }
-            open_order_state.insert(order.id.get(), new_state);
-
-            if let Some(client_order_id) = order
+            let client_order_id = order
                 .custom_tag
                 .as_deref()
-                .and_then(Self::try_parse_client_order_id)
-            {
-                venue_to_client.insert(order.id.get(), client_order_id);
-            }
-
-            if !emit_reports {
-                continue;
+                .and_then(Self::try_parse_client_order_id);
+            if let Some(client_order_id) = client_order_id {
+                staged_venue_to_client.insert(order_id, client_order_id);
+                venue_mapping_updates.push((order_id, client_order_id));
             }
             Self::backfill_order_filled_price(&mut order, &trade_avg_px_by_order_id);
             let account_id = Self::account_id_from_num_with_context(
@@ -1231,34 +1676,33 @@ impl ProjectXExecutionClient {
             let report = Self::map_order_report_with_context(
                 order,
                 account_id,
-                venue_to_client,
+                &staged_venue_to_client,
                 ts_init,
                 aliases,
-            );
-            emitter.send_order_status_report(report);
+            )?;
+            if open_order_state
+                .get(&order_id)
+                .is_none_or(|prev| *prev != new_state)
+            {
+                if emit_reports {
+                    order_reports.push(report);
+                }
+                open_order_updates.push((order_id, new_state));
+            }
         }
 
         for mut order in recent_trade_orders {
-            let existing_client_order_id = venue_to_client.get(&order.id.get()).map(|v| *v);
+            let order_id = order.id.get();
+            let existing_client_order_id =
+                staged_venue_to_client.get(&order_id).map(|value| *value);
             let client_order_id = order
                 .custom_tag
                 .as_deref()
                 .and_then(Self::try_parse_client_order_id)
                 .or(existing_client_order_id);
-
             if let Some(client_order_id) = client_order_id {
-                venue_to_client.insert(order.id.get(), client_order_id);
-            }
-
-            if !emit_reports {
-                continue;
-            }
-
-            // For known orders, let the fill report drive filled quantity reconciliation.
-            // Emitting both a FILLED order status and a fill report causes duplicate fill
-            // application once the engine infers from the status report first.
-            if existing_client_order_id.is_some() && trade_order_ids.contains(&order.id.get()) {
-                continue;
+                staged_venue_to_client.insert(order_id, client_order_id);
+                venue_mapping_updates.push((order_id, client_order_id));
             }
 
             Self::backfill_order_filled_price(&mut order, &trade_avg_px_by_order_id);
@@ -1270,11 +1714,19 @@ impl ProjectXExecutionClient {
             let report = Self::map_order_report_with_context(
                 order,
                 account_id,
-                venue_to_client,
+                &staged_venue_to_client,
                 ts_init,
                 aliases,
-            );
-            emitter.send_order_status_report(report);
+            )?;
+
+            // For known orders, let the fill report drive filled quantity reconciliation.
+            // Emitting both a FILLED order status and a fill report causes duplicate fill
+            // application once the engine infers from the status report first.
+            if emit_reports
+                && !(existing_client_order_id.is_some() && trade_order_ids.contains(&order_id))
+            {
+                order_reports.push(report);
+            }
         }
 
         let stale_order_ids: Vec<i64> = open_order_state
@@ -1282,83 +1734,153 @@ impl ProjectXExecutionClient {
             .filter_map(|entry| (!order_ids.contains(entry.key())).then_some(*entry.key()))
             .collect();
 
-        for order_id in stale_order_ids {
-            open_order_state.remove(&order_id);
+        let mut staged_seen_trade_ids =
+            AHashSet::with_capacity(seen_trade_ids.len() + trades.len());
+        for trade_id in seen_trade_ids.iter() {
+            staged_seen_trade_ids.insert(*trade_id);
         }
+        let mut staged_voided_trade_ids =
+            AHashSet::with_capacity(voided_trade_ids.len() + trades.len());
+        for trade_id in voided_trade_ids.iter() {
+            staged_voided_trade_ids.insert(*trade_id);
+        }
+        let mut trade_state_updates = Vec::new();
+        let mut fill_reports = Vec::new();
+        let mut fill_void_events = Vec::new();
 
         for trade in trades {
-            if !seen_trade_ids.insert(trade.id.get()) {
-                continue;
-            }
-
-            if !emit_reports {
-                continue;
-            }
+            let trade_id = trade.id.get();
             let account_id = Self::account_id_from_num_with_context(
                 i64::from(trade.account_id.get()),
                 account_ids,
                 account_issuer,
             );
-            let report = Self::map_fill_report_with_context(
-                trade,
+            let fill_report = Self::map_fill_report_with_context(
+                trade.clone(),
                 account_id,
                 base_currency,
-                venue_to_client,
+                &staged_venue_to_client,
                 ts_init,
                 aliases,
-            );
-            emitter.send_fill_report(report);
-        }
+            )?;
 
-        let mut position_ids = HashSet::new();
+            if trade.voided {
+                if staged_voided_trade_ids.contains(&trade_id) {
+                    continue;
+                }
+                let had_fill = staged_seen_trade_ids.contains(&trade_id);
+                if emit_reports && had_fill {
+                    let event = Self::build_trade_void_event(
+                        &trade,
+                        emitter.trader_id(),
+                        account_ids,
+                        account_issuer,
+                        order_meta_by_client,
+                        &staged_venue_to_client,
+                        base_currency,
+                    )?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Could not route ProjectX voided trade {trade_id} to a known order"
+                        )
+                    })?;
+                    fill_void_events.push(event);
+                }
+                staged_seen_trade_ids.insert(trade_id);
+                staged_voided_trade_ids.insert(trade_id);
+                trade_state_updates.push((trade_id, true));
+                continue;
+            }
 
-        for position in positions {
-            position_ids.insert(i64::from(position.id.get()));
-            let new_state = PositionState {
-                size: i64::from(position.size),
-                type_: position.position_type.code(),
-                avg_px_bits: position
-                    .average_price
-                    .to_f64()
-                    .unwrap_or_default()
-                    .to_bits(),
-            };
-
-            if open_position_state
-                .get(&i64::from(position.id.get()))
-                .is_some_and(|prev| *prev == new_state)
+            if staged_voided_trade_ids.contains(&trade_id)
+                || staged_seen_trade_ids.contains(&trade_id)
             {
                 continue;
             }
-            open_position_state.insert(i64::from(position.id.get()), new_state);
-
-            if !emit_reports {
-                continue;
+            if emit_reports {
+                fill_reports.push(fill_report);
             }
+            staged_seen_trade_ids.insert(trade_id);
+            trade_state_updates.push((trade_id, false));
+        }
+
+        let mut position_ids = HashSet::new();
+        let mut position_reports = Vec::new();
+        let mut position_state_updates = Vec::new();
+
+        for position in positions {
+            let position_id = i64::from(position.id.get());
+            position_ids.insert(position_id);
+            let new_state = PositionState {
+                size: i64::from(position.size),
+                type_: position.position_type.code(),
+                average_price: position.average_price,
+            };
             let account_id = Self::account_id_from_num_with_context(
                 i64::from(position.account_id.get()),
                 account_ids,
                 account_issuer,
             );
             let report =
-                Self::map_position_report_with_context(position, account_id, ts_init, aliases);
-            emitter.send_position_report(report);
+                Self::map_position_report_with_context(position, account_id, ts_init, aliases)?;
+            if open_position_state
+                .get(&position_id)
+                .is_none_or(|prev| *prev != new_state)
+            {
+                if emit_reports {
+                    position_reports.push(report);
+                }
+                position_state_updates.push((position_id, new_state));
+            }
         }
         let stale_position_ids: Vec<i64> = open_position_state
             .iter()
             .filter_map(|entry| (!position_ids.contains(entry.key())).then_some(*entry.key()))
             .collect();
 
+        // Commit only after every provider entity has been validated and mapped.
+        for (order_id, client_order_id) in venue_mapping_updates {
+            venue_to_client.insert(order_id, client_order_id);
+        }
+        for report in order_reports {
+            emitter.send_order_status_report(report);
+        }
+        for (order_id, state) in open_order_updates {
+            open_order_state.insert(order_id, state);
+        }
+        for report in fill_reports {
+            emitter.send_fill_report(report);
+        }
+        for event in fill_void_events {
+            emitter.send_order_event(OrderEventAny::FillVoided(event));
+        }
+        for (trade_id, voided) in trade_state_updates {
+            seen_trade_ids.insert(trade_id);
+            if voided {
+                voided_trade_ids.insert(trade_id);
+            }
+        }
+        Self::bound_trade_dedup_state(seen_trade_ids, voided_trade_ids);
+        for report in position_reports {
+            emitter.send_position_report(report);
+        }
+        for (position_id, state) in position_state_updates {
+            open_position_state.insert(position_id, state);
+        }
+        for order_id in stale_order_ids {
+            open_order_state.remove(&order_id);
+        }
         for position_id in stale_position_ids {
             open_position_state.remove(&position_id);
         }
+        Ok(())
     }
 
     fn seed_reconciliation_snapshot_state(
         &self,
         snapshot: ReconciliationSnapshot,
         ts_init: UnixNanos,
-    ) {
+    ) -> anyhow::Result<()> {
         let cache = self.core.cache();
         let aliases = Self::instrument_aliases_from_cache(&cache);
         Self::apply_reconciliation_snapshot_with_context(
@@ -1367,14 +1889,16 @@ impl ProjectXExecutionClient {
             self.core.account_id.get_issuer(),
             self.core.base_currency,
             &self.emitter,
+            &self.order_meta_by_client,
             &self.venue_to_client,
             &self.seen_trade_ids,
+            &self.voided_trade_ids,
             &self.open_order_state,
             &self.open_position_state,
             ts_init,
             false,
             Some(&aliases),
-        );
+        )
     }
 
     async fn reconcile_execution_state(&self, account_id: i64) -> anyhow::Result<()> {
@@ -1383,7 +1907,7 @@ impl ProjectXExecutionClient {
         self.seed_reconciliation_snapshot_state(
             snapshot,
             get_atomic_clock_realtime().get_time_ns(),
-        );
+        )?;
         Ok(())
     }
 
@@ -1395,12 +1919,14 @@ impl ProjectXExecutionClient {
         account_issuer: Venue,
         base_currency: Option<Currency>,
         emitter: &ExecutionEventEmitter,
+        order_meta_by_client: &DashMap<ClientOrderId, ProjectXOrderMeta>,
         venue_to_client: &DashMap<i64, ClientOrderId>,
         seen_trade_ids: &DashSet<i64>,
+        voided_trade_ids: &DashSet<i64>,
         open_order_state: &DashMap<i64, OpenOrderState>,
         open_position_state: &DashMap<i64, PositionState>,
         ts_init: UnixNanos,
-        aliases: Option<&AHashMap<String, InstrumentId>>,
+        aliases: Option<&HashMap<String, InstrumentId>>,
     ) -> anyhow::Result<()> {
         let snapshot =
             Self::fetch_runtime_reconciliation_snapshot_from_http(http_client, account_id).await?;
@@ -1410,15 +1936,16 @@ impl ProjectXExecutionClient {
             account_issuer,
             base_currency,
             emitter,
+            order_meta_by_client,
             venue_to_client,
             seen_trade_ids,
+            voided_trade_ids,
             open_order_state,
             open_position_state,
             ts_init,
             true,
             aliases,
-        );
-        Ok(())
+        )
     }
 
     async fn refresh_account_state_with_context(
@@ -1455,7 +1982,7 @@ impl ProjectXExecutionClient {
             account_issuer,
             account_type,
             base_currency,
-        );
+        )?;
         Ok(())
     }
 
@@ -1499,23 +2026,18 @@ impl ProjectXExecutionClient {
             .account_state_context()
             .resolve_all_account_ids_num()
             .await?;
-        let start_timestamp = start.map_or_else(Self::reconciliation_start_timestamp, |value| {
-            ProjectXTimestamp::from(
-                jiff::Timestamp::from_nanosecond(i128::from(value.as_u64()))
-                    .unwrap_or_else(|_| jiff::Timestamp::now()),
-            )
-        });
-        let end_timestamp = end.map(|value| {
-            ProjectXTimestamp::from(
-                jiff::Timestamp::from_nanosecond(i128::from(value.as_u64()))
-                    .unwrap_or_else(|_| jiff::Timestamp::now()),
-            )
-        });
+        let start_timestamp = start.map_or_else(
+            || Ok(Self::reconciliation_start_timestamp()),
+            |value| Self::projectx_timestamp_from_unix_nanos(value, "order-search start"),
+        )?;
+        let end_timestamp = end
+            .map(|value| Self::projectx_timestamp_from_unix_nanos(value, "order-search end"))
+            .transpose()?;
         let mut orders = Vec::new();
         let mut needs_trade_backfill = false;
 
-        for &account_id in &account_ids {
-            let account_id = Self::to_client_account_id(account_id)?;
+        for &expected_account_id in &account_ids {
+            let account_id = Self::to_client_account_id(expected_account_id)?;
             let mut account_orders = if open_only {
                 self.http_client.search_open_orders(account_id).await?
             } else {
@@ -1527,6 +2049,14 @@ impl ProjectXExecutionClient {
                     )?)
                     .await?
             };
+            for order in &account_orders {
+                Self::ensure_response_account(
+                    expected_account_id,
+                    i64::from(order.account_id.get()),
+                    "order",
+                    order.id.get(),
+                )?;
+            }
             needs_trade_backfill |= account_orders
                 .iter()
                 .any(|order| order.fill_volume.unwrap_or(0) > 0 && order.filled_price.is_none());
@@ -1536,8 +2066,8 @@ impl ProjectXExecutionClient {
         if needs_trade_backfill {
             let mut trades = Vec::new();
 
-            for &account_id in &account_ids {
-                let account_id = Self::to_client_account_id(account_id)?;
+            for &expected_account_id in &account_ids {
+                let account_id = Self::to_client_account_id(expected_account_id)?;
                 let mut account_trades = self
                     .http_client
                     .search_trades(&TradeSearch::new(
@@ -1546,23 +2076,28 @@ impl ProjectXExecutionClient {
                         end_timestamp,
                     )?)
                     .await?;
+                for trade in &account_trades {
+                    Self::ensure_response_account(
+                        expected_account_id,
+                        i64::from(trade.account_id.get()),
+                        "trade",
+                        trade.id.get(),
+                    )?;
+                }
                 trades.append(&mut account_trades);
             }
 
-            Self::backfill_orders_filled_prices(&mut orders, &trades);
+            Self::backfill_orders_filled_prices(&mut orders, &trades)?;
         }
 
-        Ok(orders
+        let reports = orders
             .into_iter()
-            .filter_map(|order| {
-                let report = self.map_order_report(order, ts_init);
+            .map(|order| self.map_order_report(order, ts_init))
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
-                if instrument_id.is_some_and(|id| report.instrument_id != id) {
-                    None
-                } else {
-                    Some(report)
-                }
-            })
+        Ok(reports
+            .into_iter()
+            .filter(|report| instrument_id.is_none_or(|id| report.instrument_id == id))
             .collect())
     }
 
@@ -1578,22 +2113,17 @@ impl ProjectXExecutionClient {
             .account_state_context()
             .resolve_all_account_ids_num()
             .await?;
-        let start_timestamp = start.map_or_else(Self::reconciliation_start_timestamp, |value| {
-            ProjectXTimestamp::from(
-                jiff::Timestamp::from_nanosecond(i128::from(value.as_u64()))
-                    .unwrap_or_else(|_| jiff::Timestamp::now()),
-            )
-        });
-        let end_timestamp = end.map(|value| {
-            ProjectXTimestamp::from(
-                jiff::Timestamp::from_nanosecond(i128::from(value.as_u64()))
-                    .unwrap_or_else(|_| jiff::Timestamp::now()),
-            )
-        });
+        let start_timestamp = start.map_or_else(
+            || Ok(Self::reconciliation_start_timestamp()),
+            |value| Self::projectx_timestamp_from_unix_nanos(value, "trade-search start"),
+        )?;
+        let end_timestamp = end
+            .map(|value| Self::projectx_timestamp_from_unix_nanos(value, "trade-search end"))
+            .transpose()?;
         let mut trades = Vec::new();
 
-        for account_id in account_ids {
-            let account_id = Self::to_client_account_id(account_id)?;
+        for expected_account_id in account_ids {
+            let account_id = Self::to_client_account_id(expected_account_id)?;
             let mut account_trades = self
                 .http_client
                 .search_trades(&TradeSearch::new(
@@ -1602,12 +2132,25 @@ impl ProjectXExecutionClient {
                     end_timestamp,
                 )?)
                 .await?;
+            for trade in &account_trades {
+                Self::ensure_response_account(
+                    expected_account_id,
+                    i64::from(trade.account_id.get()),
+                    "trade",
+                    trade.id.get(),
+                )?;
+            }
             trades.append(&mut account_trades);
         }
 
-        Ok(trades
+        let reports = trades
             .into_iter()
+            .filter(|trade| !trade.voided)
             .map(|trade| self.map_fill_report(trade, ts_init))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        Ok(reports
+            .into_iter()
             .filter(|report| {
                 if instrument_id.is_some_and(|id| report.instrument_id != id) {
                     return false;
@@ -1632,15 +2175,26 @@ impl ProjectXExecutionClient {
             .await?;
         let mut positions = Vec::new();
 
-        for account_id in account_ids {
-            let account_id = Self::to_client_account_id(account_id)?;
+        for expected_account_id in account_ids {
+            let account_id = Self::to_client_account_id(expected_account_id)?;
             let mut account_positions = self.http_client.search_open_positions(account_id).await?;
+            for position in &account_positions {
+                Self::ensure_response_account(
+                    expected_account_id,
+                    i64::from(position.account_id.get()),
+                    "position",
+                    i64::from(position.id.get()),
+                )?;
+            }
             positions.append(&mut account_positions);
         }
 
-        Ok(positions
+        let reports = positions
             .into_iter()
             .map(|position| self.map_position_report(position, ts_init))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(reports
+            .into_iter()
             .filter(|report| instrument_id.is_none_or(|id| report.instrument_id == id))
             .collect())
     }
@@ -1655,32 +2209,85 @@ impl ProjectXExecutionClient {
         order_meta_by_client: &DashMap<ClientOrderId, ProjectXOrderMeta>,
         venue_to_client: &DashMap<i64, ClientOrderId>,
         seen_trade_ids: &DashSet<i64>,
-    ) -> bool {
+        voided_trade_ids: &DashSet<i64>,
+        base_currency: Option<Currency>,
+    ) -> anyhow::Result<bool> {
         let order_id = trade.order_id.get();
         let Some(client_order_id) = venue_to_client.get(&order_id).map(|v| *v) else {
-            return false;
+            return Ok(false);
         };
         let Some(meta) = order_meta_by_client.get(&client_order_id).map(|v| *v) else {
-            return false;
+            return Ok(false);
         };
 
-        if !seen_trade_ids.insert(trade.id.get()) {
-            return true;
+        let trade_id_num = trade.id.get();
+
+        if trade.voided {
+            if voided_trade_ids.contains(&trade_id_num) {
+                return Ok(true);
+            }
+            let had_fill = seen_trade_ids.contains(&trade_id_num);
+            if had_fill
+                && !Self::emit_trade_void_event(
+                    trade,
+                    emitter,
+                    trader_id,
+                    account_ids,
+                    account_issuer,
+                    order_meta_by_client,
+                    venue_to_client,
+                    base_currency,
+                )?
+            {
+                return Ok(false);
+            }
+            if !had_fill {
+                Quantity::from_decimal(Decimal::from(trade.size)).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Invalid ProjectX voided trade {trade_id_num} size {}: {e}",
+                        trade.size
+                    )
+                })?;
+                Price::from_decimal(trade.price).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Invalid ProjectX voided trade {trade_id_num} price {}: {e}",
+                        trade.price
+                    )
+                })?;
+                Self::trade_commission(trade, base_currency.unwrap_or_else(Currency::USD))?;
+            }
+            seen_trade_ids.insert(trade_id_num);
+            voided_trade_ids.insert(trade_id_num);
+            Self::bound_trade_dedup_state(seen_trade_ids, voided_trade_ids);
+            return Ok(true);
+        }
+
+        if voided_trade_ids.contains(&trade_id_num) || seen_trade_ids.contains(&trade_id_num) {
+            return Ok(true);
         }
 
         let now = get_atomic_clock_realtime().get_time_ns();
-        let ts_event = Self::parse_ts(&trade.creation_timestamp).unwrap_or(now);
+        let ts_event = Self::parse_ts(&trade.creation_timestamp)?;
         let account_id = Self::account_id_from_num_with_context(
             i64::from(trade.account_id.get()),
             account_ids,
             account_issuer,
         );
-        let last_qty = Quantity::new(f64::from(trade.size), 0);
-        let last_px = trade.price.to_f64().map_or_else(
-            || Price::zero(0),
-            |price| Price::new(price, Self::infer_price_precision(price)),
-        );
+        let last_qty = Quantity::from_decimal(Decimal::from(trade.size)).map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid ProjectX trade {trade_id_num} size {}: {e}",
+                trade.size
+            )
+        })?;
+        let last_px = Price::from_decimal(trade.price).map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid ProjectX trade {trade_id_num} price {}: {e}",
+                trade.price
+            )
+        })?;
         let trade_id = TradeId::new(format!("PX-{}", trade.id.get()));
+        let currency = base_currency.unwrap_or_else(Currency::USD);
+        let commission = Self::trade_commission(trade, currency)?;
         let event = OrderFilled::new(
             trader_id,
             meta.strategy_id,
@@ -1693,18 +2300,118 @@ impl ProjectXExecutionClient {
             meta.order_type,
             last_qty,
             last_px,
-            Currency::from("USD"),
+            currency,
             LiquiditySide::NoLiquiditySide,
             UUID4::new(),
             ts_event,
             now,
             false,
             None,
-            None,
+            Some(commission),
             None,
         );
         emitter.send_order_event(OrderEventAny::Filled(event));
-        true
+        seen_trade_ids.insert(trade_id_num);
+        Self::bound_trade_dedup_state(seen_trade_ids, voided_trade_ids);
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_trade_void_event(
+        trade: &Trade,
+        trader_id: TraderId,
+        account_ids: &AccountIdCache,
+        account_issuer: Venue,
+        order_meta_by_client: &DashMap<ClientOrderId, ProjectXOrderMeta>,
+        venue_to_client: &DashMap<i64, ClientOrderId>,
+        base_currency: Option<Currency>,
+    ) -> anyhow::Result<Option<OrderFillVoided>> {
+        let order_id = trade.order_id.get();
+        let Some(client_order_id) = venue_to_client.get(&order_id).map(|value| *value) else {
+            return Ok(None);
+        };
+        let Some(meta) = order_meta_by_client
+            .get(&client_order_id)
+            .map(|value| *value)
+        else {
+            return Ok(None);
+        };
+        let voided_qty = Quantity::from_decimal(Decimal::from(trade.size)).map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid ProjectX trade void {} size {}: {e}",
+                trade.id.get(),
+                trade.size
+            )
+        })?;
+        let last_px = Price::from_decimal(trade.price).map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid ProjectX trade void {} price {}: {e}",
+                trade.id.get(),
+                trade.price
+            )
+        })?;
+
+        let now = get_atomic_clock_realtime().get_time_ns();
+        let ts_event = Self::parse_ts(&trade.creation_timestamp)?;
+        let account_id = Self::account_id_from_num_with_context(
+            i64::from(trade.account_id.get()),
+            account_ids,
+            account_issuer,
+        );
+        let currency = base_currency.unwrap_or_else(Currency::USD);
+        let event = OrderFillVoided::new(
+            trader_id,
+            meta.strategy_id,
+            meta.instrument_id,
+            client_order_id,
+            VenueOrderId::new(trade.order_id.to_string()),
+            account_id,
+            VenueOrderId::new(format!("PX-VOID-{}", trade.id.get())).inner(),
+            TradeId::new(format!("PX-{}", trade.id.get())),
+            voided_qty,
+            Some(Self::trade_commission(trade, currency)?),
+            meta.order_side,
+            meta.order_type,
+            last_px,
+            currency,
+            LiquiditySide::NoLiquiditySide,
+            None,
+            Some("ProjectX trade voided".into()),
+            None,
+            UUID4::new(),
+            ts_event,
+            now,
+            false,
+            false,
+        );
+        Ok(Some(event))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_trade_void_event(
+        trade: &Trade,
+        emitter: &ExecutionEventEmitter,
+        trader_id: TraderId,
+        account_ids: &AccountIdCache,
+        account_issuer: Venue,
+        order_meta_by_client: &DashMap<ClientOrderId, ProjectXOrderMeta>,
+        venue_to_client: &DashMap<i64, ClientOrderId>,
+        base_currency: Option<Currency>,
+    ) -> anyhow::Result<bool> {
+        let Some(event) = Self::build_trade_void_event(
+            trade,
+            trader_id,
+            account_ids,
+            account_issuer,
+            order_meta_by_client,
+            venue_to_client,
+            base_currency,
+        )?
+        else {
+            return Ok(false);
+        };
+        emitter.send_order_event(OrderEventAny::FillVoided(event));
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1717,14 +2424,19 @@ impl ProjectXExecutionClient {
         order_meta_by_client: &DashMap<ClientOrderId, ProjectXOrderMeta>,
         venue_to_client: &DashMap<i64, ClientOrderId>,
         seen_trade_ids: &DashSet<i64>,
+        voided_trade_ids: &DashSet<i64>,
         pending_trades_by_order_id: &DashMap<i64, Vec<Trade>>,
-    ) {
+        base_currency: Option<Currency>,
+    ) -> bool {
         let Some((_, pending_trades)) = pending_trades_by_order_id.remove(&order_id) else {
-            return;
+            return false;
         };
 
+        let mut reconciliation_required = false;
+
         for trade in pending_trades {
-            if !Self::emit_trade_fill_event(
+            let is_voided = trade.voided;
+            match Self::emit_trade_fill_event(
                 &trade,
                 emitter,
                 trader_id,
@@ -1733,13 +2445,21 @@ impl ProjectXExecutionClient {
                 order_meta_by_client,
                 venue_to_client,
                 seen_trade_ids,
+                voided_trade_ids,
+                base_currency,
             ) {
-                pending_trades_by_order_id
-                    .entry(order_id)
-                    .or_default()
-                    .push(trade);
+                Ok(true) => reconciliation_required |= is_voided,
+                Ok(false) => {
+                    reconciliation_required = true;
+                    Self::buffer_pending_trade(pending_trades_by_order_id, trade);
+                }
+                Err(e) => {
+                    reconciliation_required = true;
+                    log::warn!("ProjectX pending trade conversion failed: {e}");
+                }
             }
         }
+        reconciliation_required
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1752,35 +2472,35 @@ impl ProjectXExecutionClient {
         order_meta_by_client: &DashMap<ClientOrderId, ProjectXOrderMeta>,
         venue_to_client: &DashMap<i64, ClientOrderId>,
         last_order_state: &DashMap<ClientOrderId, OpenOrderState>,
+        last_order_status: &DashMap<ClientOrderId, i32>,
         open_order_state: &DashMap<i64, OpenOrderState>,
         seen_trade_ids: &DashSet<i64>,
+        voided_trade_ids: &DashSet<i64>,
         pending_trades_by_order_id: &DashMap<i64, Vec<Trade>>,
+        base_currency: Option<Currency>,
     ) -> HashSet<i64> {
         let now = get_atomic_clock_realtime().get_time_ns();
         let mut accounts_needing_snapshot = HashSet::new();
 
         for order in orders {
             let order_id = order.id.get();
+            let account_id_num = i64::from(order.account_id.get());
+            if let Err(e) = Self::map_order_status(&order) {
+                log::warn!("Invalid ProjectX user-order status for order {order_id}: {e}");
+                accounts_needing_snapshot.insert(account_id_num);
+                continue;
+            }
             let prev_state = open_order_state.get(&order_id).map(|entry| *entry);
             let new_state = OpenOrderState {
                 status: order.status.code(),
                 fill_volume: i64::from(order.fill_volume.unwrap_or(0)),
-                filled_price_bits: order
-                    .filled_price
-                    .map(|value| value.to_f64().unwrap_or_default().to_bits()),
+                filled_price: order.filled_price,
             };
             let fill_progressed =
                 new_state.fill_volume > prev_state.map_or(0, |prev| prev.fill_volume);
 
-            if prev_state != Some(new_state) {
-                open_order_state.insert(order_id, new_state);
-            }
-
-            let account_id = Self::account_id_from_num_with_context(
-                i64::from(order.account_id.get()),
-                account_ids,
-                account_issuer,
-            );
+            let account_id =
+                Self::account_id_from_num_with_context(account_id_num, account_ids, account_issuer);
             let client_order_id = order
                 .custom_tag
                 .as_deref()
@@ -1791,32 +2511,41 @@ impl ProjectXExecutionClient {
                 log::debug!(
                     "ProjectX order event missing client mapping: venue_order_id={order_id}"
                 );
-                if fill_progressed || order.status.code() == 2 {
-                    accounts_needing_snapshot.insert(i64::from(order.account_id.get()));
-                }
+                accounts_needing_snapshot.insert(account_id_num);
                 continue;
             };
-
-            venue_to_client.insert(order_id, client_order_id);
 
             if let Some(last) = last_order_state.get(&client_order_id)
                 && *last == new_state
             {
                 continue;
             }
-            last_order_state.insert(client_order_id, new_state);
-
             let Some(meta) = order_meta_by_client.get(&client_order_id).map(|v| *v) else {
-                if fill_progressed || order.status.code() == 2 {
-                    accounts_needing_snapshot.insert(i64::from(order.account_id.get()));
-                }
+                accounts_needing_snapshot.insert(account_id_num);
                 continue;
             };
 
             let defer_fill_to_submit_snapshot =
                 fill_progressed && Self::should_refresh_submit_snapshot(meta.order_type);
+            let report = match Self::map_user_order_report(
+                &order,
+                &meta,
+                account_id,
+                client_order_id,
+                now,
+            ) {
+                Ok(report) => report,
+                Err(e) => {
+                    log::warn!("Invalid ProjectX user-order report for order {order_id}: {e}");
+                    accounts_needing_snapshot.insert(account_id_num);
+                    continue;
+                }
+            };
+            let ts_event = report.ts_last;
 
-            Self::flush_pending_trades_for_order(
+            venue_to_client.insert(order_id, client_order_id);
+
+            if Self::flush_pending_trades_for_order(
                 order_id,
                 emitter,
                 trader_id,
@@ -1825,15 +2554,16 @@ impl ProjectXExecutionClient {
                 order_meta_by_client,
                 venue_to_client,
                 seen_trade_ids,
+                voided_trade_ids,
                 pending_trades_by_order_id,
-            );
+                base_currency,
+            ) {
+                accounts_needing_snapshot.insert(account_id_num);
+            }
 
-            let ts_event = Self::parse_ts(&order.update_timestamp).unwrap_or(now);
             let venue_order_id = VenueOrderId::new(order.id.to_string());
 
             if !defer_fill_to_submit_snapshot && (fill_progressed || order.status.code() == 2) {
-                let report =
-                    Self::map_user_order_report(&order, &meta, account_id, client_order_id, now);
                 emitter.send_order_status_report(report);
             }
 
@@ -1841,11 +2571,16 @@ impl ProjectXExecutionClient {
                 && (fill_progressed || order.status.code() == 2)
                 && order.filled_price.is_none()
             {
-                accounts_needing_snapshot.insert(i64::from(order.account_id.get()));
+                accounts_needing_snapshot.insert(account_id_num);
             }
 
-            match order.status.code() {
-                1 | 6 if prev_state.is_none_or(|prev| prev.status != order.status.code()) => {
+            let previous_status = last_order_status
+                .get(&client_order_id)
+                .map(|value| *value)
+                .or_else(|| prev_state.map(|state| state.status));
+
+            match order.status {
+                ProjectXOrderStatus::Open if previous_status != Some(order.status.code()) => {
                     let event = OrderAccepted::new(
                         trader_id,
                         meta.strategy_id,
@@ -1860,7 +2595,7 @@ impl ProjectXExecutionClient {
                     );
                     emitter.send_order_event(OrderEventAny::Accepted(event));
                 }
-                3 | 4 if prev_state.is_none_or(|prev| prev.status != order.status.code()) => {
+                ProjectXOrderStatus::Cancelled if previous_status != Some(order.status.code()) => {
                     let event = OrderCanceled::new(
                         trader_id,
                         meta.strategy_id,
@@ -1875,7 +2610,22 @@ impl ProjectXExecutionClient {
                     );
                     emitter.send_order_event(OrderEventAny::Canceled(event));
                 }
-                5 if prev_state.is_none_or(|prev| prev.status != order.status.code()) => {
+                ProjectXOrderStatus::Expired if previous_status != Some(order.status.code()) => {
+                    let event = OrderExpired::new(
+                        trader_id,
+                        meta.strategy_id,
+                        meta.instrument_id,
+                        client_order_id,
+                        UUID4::new(),
+                        ts_event,
+                        now,
+                        false,
+                        Some(venue_order_id),
+                        Some(account_id),
+                    );
+                    emitter.send_order_event(OrderEventAny::Expired(event));
+                }
+                ProjectXOrderStatus::Rejected if previous_status != Some(order.status.code()) => {
                     let event = OrderRejected::new(
                         trader_id,
                         meta.strategy_id,
@@ -1891,8 +2641,15 @@ impl ProjectXExecutionClient {
                     );
                     emitter.send_order_event(OrderEventAny::Rejected(event));
                 }
+                ProjectXOrderStatus::Unknown(code) => {
+                    log::warn!("Ignoring ProjectX order event with unknown status code {code}");
+                }
                 _ => {}
             }
+
+            last_order_state.insert(client_order_id, new_state);
+            last_order_status.insert(client_order_id, order.status.code());
+            open_order_state.insert(order_id, new_state);
         }
 
         accounts_needing_snapshot
@@ -1909,11 +2666,7 @@ impl ProjectXExecutionClient {
             let new_state = PositionState {
                 size: i64::from(position.size),
                 type_: position.position_type.code(),
-                avg_px_bits: position
-                    .average_price
-                    .to_f64()
-                    .unwrap_or_default()
-                    .to_bits(),
+                average_price: position.average_price,
             };
 
             let changed = open_position_state
@@ -1921,7 +2674,6 @@ impl ProjectXExecutionClient {
                 .is_none_or(|prev| *prev != new_state);
 
             if changed {
-                open_position_state.insert(position_id, new_state);
                 accounts_needing_snapshot.insert(i64::from(position.account_id.get()));
             }
         }
@@ -1939,14 +2691,19 @@ impl ProjectXExecutionClient {
         order_meta_by_client: &DashMap<ClientOrderId, ProjectXOrderMeta>,
         venue_to_client: &DashMap<i64, ClientOrderId>,
         seen_trade_ids: &DashSet<i64>,
+        voided_trade_ids: &DashSet<i64>,
         pending_trades_by_order_id: &DashMap<i64, Vec<Trade>>,
-    ) {
+        base_currency: Option<Currency>,
+    ) -> HashSet<i64> {
+        let mut accounts_needing_snapshot = HashSet::new();
         for trade in trades {
-            if seen_trade_ids.contains(&trade.id.get()) {
+            if !trade.voided && seen_trade_ids.contains(&trade.id.get()) {
                 continue;
             }
 
-            if Self::emit_trade_fill_event(
+            let account_id_num = i64::from(trade.account_id.get());
+            let is_voided = trade.voided;
+            match Self::emit_trade_fill_event(
                 &trade,
                 emitter,
                 trader_id,
@@ -1955,20 +2712,32 @@ impl ProjectXExecutionClient {
                 order_meta_by_client,
                 venue_to_client,
                 seen_trade_ids,
+                voided_trade_ids,
+                base_currency,
             ) {
-                continue;
+                Ok(true) => {
+                    if is_voided {
+                        accounts_needing_snapshot.insert(account_id_num);
+                    }
+                }
+                Ok(false) => {
+                    // Buffer to cover the common trade-before-order race, but reconcile
+                    // immediately so an external/unmapped fill cannot remain stranded.
+                    Self::buffer_pending_trade(pending_trades_by_order_id, trade);
+                    accounts_needing_snapshot.insert(account_id_num);
+                }
+                Err(e) => {
+                    log::warn!("ProjectX live trade conversion failed: {e}");
+                    accounts_needing_snapshot.insert(account_id_num);
+                }
             }
-
-            pending_trades_by_order_id
-                .entry(trade.order_id.get())
-                .or_default()
-                .push(trade);
         }
+        accounts_needing_snapshot
     }
 
     fn spawn_ws_event_task(&mut self, ws_user: &ProjectXWsClient) {
         let ws_user = ws_user.clone();
-        let http_client = self.http_client.clone();
+        let reconciliation = self.reconciliation_context();
         let emitter = self.emitter.clone();
         let trader_id = self.core.trader_id;
         let account_ids = Arc::clone(&self.account_ids);
@@ -1979,104 +2748,71 @@ impl ProjectXExecutionClient {
         let order_meta_by_client = Arc::clone(&self.order_meta_by_client);
         let venue_to_client = Arc::clone(&self.venue_to_client);
         let last_order_state = Arc::clone(&self.last_order_state);
+        let last_order_status = Arc::clone(&self.last_order_status);
         let seen_trade_ids = Arc::clone(&self.seen_trade_ids);
+        let voided_trade_ids = Arc::clone(&self.voided_trade_ids);
         let pending_trades_by_order_id = Arc::clone(&self.pending_trades_by_order_id);
         let open_order_state = Arc::clone(&self.open_order_state);
         let open_position_state = Arc::clone(&self.open_position_state);
         let execution_stale = Arc::clone(&self.execution_stale);
         let reconciliation_in_progress = Arc::clone(&self.reconciliation_in_progress);
-        let instrument_aliases = {
-            let cache = self.core.cache();
-            Self::instrument_aliases_from_cache(&cache)
-        };
-
         let handle = get_runtime().spawn(async move {
             let Some(mut rx) = ws_user.take_event_receiver().await else {
+                execution_stale.store(true, Ordering::SeqCst);
+                log::warn!("ProjectX user event receiver was already claimed");
                 return;
             };
 
             while let Some(event) = rx.recv().await {
                 match event {
-                    ProjectXWsEvent::ReconciliationRequired | ProjectXWsEvent::Reconnected => {
+                    ProjectXWsEvent::Disconnected => {
                         execution_stale.store(true, Ordering::SeqCst);
-                        reconciliation_in_progress.store(true, Ordering::SeqCst);
-                        let account_ids_num = subscribed_account_ids
-                            .read()
-                            .iter()
-                            .copied()
-                            .collect::<Vec<_>>();
-                        let mut reconciled = true;
-
-                        for account_id_num in &account_ids_num {
-                            match Self::fetch_runtime_reconciliation_snapshot_from_http(
-                                &http_client,
-                                *account_id_num,
-                            )
-                            .await
-                            {
-                                Ok(snapshot) => {
-                                    Self::apply_reconciliation_snapshot_with_context(
-                                        snapshot,
-                                        &account_ids,
-                                        account_issuer,
-                                        base_currency,
-                                        &emitter,
-                                        &venue_to_client,
-                                        &seen_trade_ids,
-                                        &open_order_state,
-                                        &open_position_state,
-                                        get_atomic_clock_realtime().get_time_ns(),
-                                        true,
-                                        Some(&instrument_aliases),
-                                    );
-                                }
-                                Err(e) => {
-                                    reconciled = false;
-                                    log::warn!(
-                                        "ProjectX reconciliation failed for account {account_id_num}: {e}"
-                                    );
-                                }
-                            }
-                        }
-
-                        if reconciled
-                            && let Err(e) = Self::refresh_account_state_with_context(
-                                &http_client,
-                                &account_ids_num,
-                                &account_ids,
-                                account_issuer,
-                                account_type,
-                                base_currency,
-                                &emitter,
-                            )
-                            .await
-                        {
-                            reconciled = false;
-                            log::warn!("ProjectX account refresh failed after reconciliation: {e}");
-                        }
-
-                        if reconciled {
-                            execution_stale.store(false, Ordering::SeqCst);
-                        }
-                        reconciliation_in_progress.store(false, Ordering::SeqCst);
+                        log::warn!("ProjectX user stream disconnected; execution is fenced");
+                    }
+                    ProjectXWsEvent::Reconnected => {
+                        reconciliation.reconcile("user stream reconnect").await;
+                    }
+                    ProjectXWsEvent::ReconciliationRequired => {
+                        // A transport gap is emitted while the realtime stream is still
+                        // disconnected. Keep execution fenced; the Reconnected event starts
+                        // reconciliation only after subscriptions have been replayed.
+                        execution_stale.store(true, Ordering::SeqCst);
+                        log::warn!("ProjectX user stream transport gap; execution is fenced");
                     }
                     ProjectXWsEvent::UserAccount(account) => {
+                        let account_id_num = i64::from(account.id.get());
+                        if !subscribed_account_ids.read().contains(&account_id_num) {
+                            log::warn!(
+                                "Ignoring ProjectX account update for unsubscribed account {account_id_num}"
+                            );
+                            continue;
+                        }
                         if execution_stale.load(Ordering::SeqCst)
                             || reconciliation_in_progress.load(Ordering::SeqCst)
                         {
                             continue;
                         }
 
-                        Self::handle_user_accounts_event(
+                        if let Err(e) = Self::handle_user_accounts_event(
                             vec![account],
                             &emitter,
                             &account_ids,
                             account_issuer,
                             account_type,
                             base_currency,
-                        );
+                        ) {
+                            log::warn!("Invalid ProjectX account update: {e}");
+                            reconciliation.reconcile("invalid account update").await;
+                        }
                     }
                     ProjectXWsEvent::UserOrder(order) => {
+                        let account_id_num = i64::from(order.account_id.get());
+                        if !subscribed_account_ids.read().contains(&account_id_num) {
+                            log::warn!(
+                                "Ignoring ProjectX order update for unsubscribed account {account_id_num}"
+                            );
+                            continue;
+                        }
                         if execution_stale.load(Ordering::SeqCst)
                             || reconciliation_in_progress.load(Ordering::SeqCst)
                         {
@@ -2092,54 +2828,26 @@ impl ProjectXExecutionClient {
                             &order_meta_by_client,
                             &venue_to_client,
                             &last_order_state,
+                            &last_order_status,
                             &open_order_state,
                             &seen_trade_ids,
+                            &voided_trade_ids,
                             &pending_trades_by_order_id,
-                        )
-                        .into_iter()
-                        .collect::<Vec<_>>();
+                            base_currency,
+                        );
 
-                        for account_id_num in &accounts_needing_snapshot {
-                            if let Err(e) = Self::reconcile_account_snapshot_with_context(
-                                &http_client,
-                                *account_id_num,
-                                &account_ids,
-                                account_issuer,
-                                base_currency,
-                                &emitter,
-                                &venue_to_client,
-                                &seen_trade_ids,
-                                &open_order_state,
-                                &open_position_state,
-                                get_atomic_clock_realtime().get_time_ns(),
-                                Some(&instrument_aliases),
-                            )
-                            .await
-                            {
-                                log::warn!(
-                                    "ProjectX live snapshot refresh failed for account {account_id_num} after order update: {e}"
-                                );
-                            }
-                        }
-
-                        if !accounts_needing_snapshot.is_empty()
-                            && let Err(e) = Self::refresh_account_state_with_context(
-                                &http_client,
-                                &accounts_needing_snapshot,
-                                &account_ids,
-                                account_issuer,
-                                account_type,
-                                base_currency,
-                                &emitter,
-                            )
-                            .await
-                        {
-                            log::warn!(
-                                "ProjectX account refresh failed after order snapshot update: {e}"
-                            );
+                        if !accounts_needing_snapshot.is_empty() {
+                            reconciliation.reconcile("live order update").await;
                         }
                     }
                     ProjectXWsEvent::UserPosition(position) => {
+                        let account_id_num = i64::from(position.account_id.get());
+                        if !subscribed_account_ids.read().contains(&account_id_num) {
+                            log::warn!(
+                                "Ignoring ProjectX position update for unsubscribed account {account_id_num}"
+                            );
+                            continue;
+                        }
                         if execution_stale.load(Ordering::SeqCst)
                             || reconciliation_in_progress.load(Ordering::SeqCst)
                         {
@@ -2149,58 +2857,27 @@ impl ProjectXExecutionClient {
                         let accounts_needing_snapshot = Self::handle_user_positions_event(
                             vec![position],
                             &open_position_state,
-                        )
-                        .into_iter()
-                        .collect::<Vec<_>>();
+                        );
 
-                        for account_id_num in &accounts_needing_snapshot {
-                            if let Err(e) = Self::reconcile_account_snapshot_with_context(
-                                &http_client,
-                                *account_id_num,
-                                &account_ids,
-                                account_issuer,
-                                base_currency,
-                                &emitter,
-                                &venue_to_client,
-                                &seen_trade_ids,
-                                &open_order_state,
-                                &open_position_state,
-                                get_atomic_clock_realtime().get_time_ns(),
-                                Some(&instrument_aliases),
-                            )
-                            .await
-                            {
-                                log::warn!(
-                                    "ProjectX live snapshot refresh failed for account {account_id_num} after position update: {e}"
-                                );
-                            }
-                        }
-
-                        if !accounts_needing_snapshot.is_empty()
-                            && let Err(e) = Self::refresh_account_state_with_context(
-                                &http_client,
-                                &accounts_needing_snapshot,
-                                &account_ids,
-                                account_issuer,
-                                account_type,
-                                base_currency,
-                                &emitter,
-                            )
-                            .await
-                        {
-                            log::warn!(
-                                "ProjectX account refresh failed after position snapshot update: {e}"
-                            );
+                        if !accounts_needing_snapshot.is_empty() {
+                            reconciliation.reconcile("live position update").await;
                         }
                     }
                     ProjectXWsEvent::UserTrade(trade) => {
+                        let account_id_num = i64::from(trade.account_id.get());
+                        if !subscribed_account_ids.read().contains(&account_id_num) {
+                            log::warn!(
+                                "Ignoring ProjectX trade update for unsubscribed account {account_id_num}"
+                            );
+                            continue;
+                        }
                         if execution_stale.load(Ordering::SeqCst)
                             || reconciliation_in_progress.load(Ordering::SeqCst)
                         {
                             continue;
                         }
 
-                        Self::handle_user_trades_event(
+                        let accounts_needing_snapshot = Self::handle_user_trades_event(
                             vec![trade],
                             &emitter,
                             trader_id,
@@ -2209,12 +2886,20 @@ impl ProjectXExecutionClient {
                             &order_meta_by_client,
                             &venue_to_client,
                             &seen_trade_ids,
+                            &voided_trade_ids,
                             &pending_trades_by_order_id,
+                            base_currency,
                         );
+                        if !accounts_needing_snapshot.is_empty() {
+                            reconciliation.reconcile("live trade update").await;
+                        }
                     }
                     _ => {}
                 }
             }
+            execution_stale.store(true, Ordering::SeqCst);
+            reconciliation_in_progress.store(false, Ordering::SeqCst);
+            log::warn!("ProjectX user event stream ended; execution is fenced");
         });
         self.ws_event_task = Some(handle);
     }
@@ -2224,6 +2909,12 @@ impl ProjectXExecutionClient {
 impl ExecutionClient for ProjectXExecutionClient {
     fn is_connected(&self) -> bool {
         self.core.is_connected()
+            && self
+                .ws_user
+                .as_ref()
+                .is_some_and(ProjectXWsClient::is_connected)
+            && !self.execution_stale.load(Ordering::SeqCst)
+            && !self.reconciliation_in_progress.load(Ordering::SeqCst)
     }
 
     fn client_id(&self) -> ClientId {
@@ -2272,110 +2963,145 @@ impl ExecutionClient for ProjectXExecutionClient {
         if let Some(task) = self.ws_event_task.take() {
             task.abort();
         }
+        self.pending_tasks.abort_all();
 
         if let Some(ws_user) = self.ws_user.take() {
-            get_runtime().spawn(async move {
+            let handle = get_runtime().spawn(async move {
                 let _ = ws_user.disconnect().await;
             });
+            self.pending_tasks.push(handle);
         }
         self.http_client.stop();
         self.execution_stale.store(true, Ordering::Release);
+        self.reconciliation_in_progress
+            .store(false, Ordering::Release);
         self.core.set_disconnected();
         self.core.set_stopped();
         Ok(())
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        if self.core.is_connected() {
+        if self.is_connected() {
             return Ok(());
+        }
+        if self.core.is_connected() {
+            anyhow::bail!(
+                "ProjectX transport is connected but execution recovery is incomplete; commands remain fenced"
+            );
         }
 
         self.execution_stale.store(true, Ordering::SeqCst);
         self.reconciliation_in_progress
             .store(true, Ordering::SeqCst);
-        self.http_client.start().await?;
+        if let Err(e) = self.http_client.start().await {
+            self.reconciliation_in_progress
+                .store(false, Ordering::SeqCst);
+            self.core.set_disconnected();
+            return Err(e.into());
+        }
 
         let ws_user = self.http_client.create_ws_client(ProjectXHub::User);
-        ws_user.connect().await?;
-        self.spawn_ws_event_task(&ws_user);
+        let bootstrap_result = async {
+            ws_user.connect().await?;
+            let account_ids = self
+                .account_state_context()
+                .resolve_all_account_ids_num()
+                .await?;
+
+            ws_user
+                .invoke("SubscribeAccounts", Vec::new(), true)
+                .await?;
+
+            for account_id in &account_ids {
+                ws_user
+                    .invoke("SubscribeOrders", vec![Value::from(*account_id)], true)
+                    .await?;
+                ws_user
+                    .invoke("SubscribePositions", vec![Value::from(*account_id)], true)
+                    .await?;
+                ws_user
+                    .invoke("SubscribeTrades", vec![Value::from(*account_id)], true)
+                    .await?;
+            }
+
+            for account_id in account_ids {
+                self.reconcile_execution_state(account_id).await?;
+            }
+            self.account_state_context().refresh().await?;
+            self.await_account_registered(30.0).await
+        }
+        .await;
+
+        if let Err(e) = bootstrap_result {
+            if let Err(disconnect_error) = ws_user.disconnect().await {
+                log::warn!(
+                    "ProjectX failed to close user stream after connect rollback: {disconnect_error}"
+                );
+            }
+            self.http_client.stop();
+            self.execution_stale.store(true, Ordering::SeqCst);
+            self.reconciliation_in_progress
+                .store(false, Ordering::SeqCst);
+            self.subscribed_account_ids.write().clear();
+            self.account_ids.write().clear();
+            *self.account_id_num.lock().expect(MUTEX_POISONED) = None;
+            self.core.set_disconnected();
+            return Err(e);
+        }
+
         self.ws_user = Some(ws_user.clone());
-
-        let account_ids = self
-            .account_state_context()
-            .resolve_all_account_ids_num()
-            .await?;
-
-        for account_id in &account_ids {
-            ws_user
-                .invoke("SubscribeAccounts", vec![Value::from(*account_id)], true)
-                .await?;
-            ws_user
-                .invoke("SubscribeOrders", vec![Value::from(*account_id)], true)
-                .await?;
-            ws_user
-                .invoke("SubscribePositions", vec![Value::from(*account_id)], true)
-                .await?;
-            ws_user
-                .invoke("SubscribeTrades", vec![Value::from(*account_id)], true)
-                .await?;
-        }
-
-        for account_id in account_ids {
-            self.reconcile_execution_state(account_id).await?;
-        }
-        self.account_state_context().refresh().await?;
-        self.await_account_registered(30.0).await?;
-
         self.reconciliation_in_progress
             .store(false, Ordering::SeqCst);
         self.execution_stale.store(false, Ordering::SeqCst);
         self.core.set_connected();
+        self.spawn_ws_event_task(&ws_user);
         log::info!("ProjectX execution client connected");
         Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.execution_stale.store(true, Ordering::SeqCst);
+        self.core.set_disconnected();
+        self.pending_tasks.abort_all();
+
         if let Some(task) = self.ws_event_task.take() {
             task.abort();
         }
 
-        if let Some(ws_user) = &self.ws_user {
-            ws_user.disconnect().await?;
-        }
-        self.ws_user = None;
+        let disconnect_result = if let Some(ws_user) = self.ws_user.take() {
+            ws_user.disconnect().await.map_err(anyhow::Error::from)
+        } else {
+            Ok(())
+        };
         self.http_client.stop();
-        self.execution_stale.store(true, Ordering::SeqCst);
         self.reconciliation_in_progress
             .store(false, Ordering::SeqCst);
         self.subscribed_account_ids.write().clear();
         self.account_ids.write().clear();
         *self.account_id_num.lock().expect(MUTEX_POISONED) = None;
-        self.core.set_disconnected();
         log::info!("ProjectX execution client disconnected");
-        Ok(())
+        disconnect_result
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
-        if let Some(reason) = self.command_readiness_error() {
-            self.emitter.emit_order_rejected_event(
-                cmd.strategy_id,
-                cmd.instrument_id,
-                cmd.client_order_id,
-                reason,
-                get_atomic_clock_realtime().get_time_ns(),
-                false,
-            );
-            anyhow::bail!("{reason}");
-        }
-
         let order = {
             let cache = self.core.cache();
             cache.order_owned(&cmd.client_order_id).ok_or_else(|| {
                 anyhow::anyhow!("Order not found in cache: {}", cmd.client_order_id)
             })?
         };
-        self.remember_order_meta(&order);
-        self.emitter.emit_order_submitted(&order);
+
+        if let Some(reason) = self.command_readiness_error() {
+            self.emitter.emit_order_denied(&order, reason);
+            return Ok(());
+        }
+        if order.is_closed() {
+            log::warn!(
+                "Cannot submit closed ProjectX order {}",
+                order.client_order_id()
+            );
+            return Ok(());
+        }
 
         let position_account_id = cmd.position_id.and_then(|position_id| {
             self.core
@@ -2383,45 +3109,25 @@ impl ExecutionClient for ProjectXExecutionClient {
                 .position(&position_id)
                 .map(|position| position.account_id)
         });
-        let account_id_num = self.resolve_target_account_id_num(
-            cmd.params.as_ref(),
-            position_account_id.or_else(|| order.account_id()),
-        )?;
-        let order_side = Self::parse_order_side(order.order_side())?;
-        let order_type = Self::parse_order_type(order.order_type())?;
-        let quantity = Self::quantity_to_i64(order.quantity())?;
+        let prepared = self
+            .resolve_target_account_id_num(
+                cmd.params.as_ref(),
+                position_account_id.or_else(|| order.account_id()),
+            )
+            .and_then(|account_id_num| {
+                self.build_place_order_request(&order, account_id_num)
+                    .map(|request| (account_id_num, request))
+            });
+        let (account_id_num, req) = match prepared {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                self.emitter.emit_order_denied(&order, &e.to_string());
+                return Ok(());
+            }
+        };
 
-        let account_id = Self::to_client_account_id(account_id_num)?;
-        let order_type = match order_type {
-            1 => ProjectXOrderType::Limit,
-            2 => ProjectXOrderType::Market,
-            4 => ProjectXOrderType::Stop,
-            5 => ProjectXOrderType::TrailingStop,
-            _ => anyhow::bail!("Unsupported ProjectX order type code: {order_type}"),
-        };
-        let side = match order_side {
-            0 => Side::Bid,
-            1 => Side::Ask,
-            _ => anyhow::bail!("Unsupported ProjectX order side code: {order_side}"),
-        };
-        let mut builder = PlaceOrder::builder(
-            account_id,
-            Self::to_client_contract_id(
-                &self.contract_id_from_instrument_id(order.instrument_id()),
-            )?,
-            order_type,
-            side,
-            i32::try_from(quantity)?,
-        );
-        if let Some(limit_price) = Self::price_to_f64(order.price()) {
-            builder =
-                builder.limit_price(Decimal::from_f64_retain(limit_price).unwrap_or_default());
-        }
-        if let Some(stop_price) = Self::price_to_f64(order.trigger_price()) {
-            builder = builder.stop_price(Decimal::from_f64_retain(stop_price).unwrap_or_default());
-        }
-        builder = builder.custom_tag(order.client_order_id().to_string());
-        let req = builder.build().map_err(anyhow::Error::from)?;
+        self.remember_order_meta(&order);
+        self.emitter.emit_order_submitted(&order);
 
         let http_client = self.http_client.clone();
         let emitter = self.emitter.clone();
@@ -2430,30 +3136,48 @@ impl ExecutionClient for ProjectXExecutionClient {
         let client_order_id = cmd.client_order_id;
         let clock = get_atomic_clock_realtime();
         let venue_to_client = Arc::clone(&self.venue_to_client);
+        let last_order_status = Arc::clone(&self.last_order_status);
         let account_ids = Arc::clone(&self.account_ids);
         let order_meta_by_client = Arc::clone(&self.order_meta_by_client);
         let seen_trade_ids = Arc::clone(&self.seen_trade_ids);
+        let voided_trade_ids = Arc::clone(&self.voided_trade_ids);
         let pending_trades_by_order_id = Arc::clone(&self.pending_trades_by_order_id);
         let open_order_state = Arc::clone(&self.open_order_state);
         let open_position_state = Arc::clone(&self.open_position_state);
         let account_issuer = self.core.account_id.get_issuer();
         let base_currency = self.core.base_currency;
+        let reconciliation = self.reconciliation_context();
         let instrument_aliases = {
             let cache = self.core.cache();
             Self::instrument_aliases_from_cache(&cache)
         };
 
-        get_runtime().spawn(async move {
+        let handle = get_runtime().spawn(async move {
             match http_client.place_order(&req).await {
                 Ok(resp) => {
                     let order_id = resp.order_id.get();
                     venue_to_client.insert(order_id, client_order_id);
-                    emitter.emit_order_accepted(
-                        &order_clone,
-                        VenueOrderId::new(order_id.to_string()),
-                        clock.get_time_ns(),
-                    );
-                    Self::flush_pending_trades_for_order(
+                    let should_emit_accepted = match last_order_status.entry(client_order_id) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(ProjectXOrderStatus::Open.code());
+                            true
+                        }
+                        Entry::Occupied(mut entry)
+                            if *entry.get() == ProjectXOrderStatus::Pending.code() =>
+                        {
+                            entry.insert(ProjectXOrderStatus::Open.code());
+                            true
+                        }
+                        Entry::Occupied(_) => false,
+                    };
+                    if should_emit_accepted {
+                        emitter.emit_order_accepted(
+                            &order_clone,
+                            VenueOrderId::new(order_id.to_string()),
+                            clock.get_time_ns(),
+                        );
+                    }
+                    let mut reconciliation_required = Self::flush_pending_trades_for_order(
                         order_id,
                         &emitter,
                         order_clone.trader_id(),
@@ -2462,11 +3186,13 @@ impl ExecutionClient for ProjectXExecutionClient {
                         &order_meta_by_client,
                         &venue_to_client,
                         &seen_trade_ids,
+                        &voided_trade_ids,
                         &pending_trades_by_order_id,
+                        base_currency,
                     );
 
-                    if should_refresh_snapshot {
-                        Self::refresh_submit_snapshot_best_effort(
+                    if should_refresh_snapshot
+                        && let Err(e) = Self::refresh_submit_snapshot(
                             &http_client,
                             account_id_num,
                             client_order_id,
@@ -2474,14 +3200,33 @@ impl ExecutionClient for ProjectXExecutionClient {
                             account_issuer,
                             base_currency,
                             &emitter,
+                            &order_meta_by_client,
                             &venue_to_client,
                             &seen_trade_ids,
+                            &voided_trade_ids,
                             &open_order_state,
                             &open_position_state,
                             &instrument_aliases,
                         )
-                        .await;
+                        .await
+                    {
+                        log::warn!("{e}");
+                        reconciliation_required = true;
                     }
+
+                    if reconciliation_required {
+                        reconciliation
+                            .reconcile("post-submit execution recovery")
+                            .await;
+                    }
+                }
+                Err(e) if Self::is_ambiguous_mutation_error(&e) => {
+                    log::warn!(
+                        "ProjectX submit for {client_order_id} has an ambiguous outcome: {e}; reconciling before admitting more commands"
+                    );
+                    reconciliation
+                        .reconcile("ambiguous order submission")
+                        .await;
                 }
                 Err(e) => {
                     emitter.emit_order_rejected(
@@ -2493,6 +3238,7 @@ impl ExecutionClient for ProjectXExecutionClient {
                 }
             }
         });
+        self.pending_tasks.push(handle);
         Ok(())
     }
 
@@ -2543,35 +3289,90 @@ impl ExecutionClient for ProjectXExecutionClient {
             anyhow::bail!("{reason}");
         };
 
-        let account_id = Self::to_client_account_id(self.resolve_target_account_id_num(
-            cmd.params.as_ref(),
-            cached_order.as_ref().and_then(|o| o.account_id()),
-        )?)?;
-        let order_id = Self::parse_venue_order_id(venue_order_id)?;
-        self.venue_to_client.insert(order_id, cmd.client_order_id);
-        let order_id = Self::to_client_order_id(order_id)?;
-        let mut builder = PxModifyOrder::builder(account_id, order_id);
-        if let Some(size) = cmd.quantity.map(Self::quantity_to_i64).transpose()? {
-            builder = builder.size(i32::try_from(size)?);
-        }
-        if let Some(limit_price) = Self::price_to_f64(cmd.price) {
-            builder =
-                builder.limit_price(Decimal::from_f64_retain(limit_price).unwrap_or_default());
-        }
-        if let Some(stop_price) = Self::price_to_f64(cmd.trigger_price) {
-            builder = builder.stop_price(Decimal::from_f64_retain(stop_price).unwrap_or_default());
-        }
-        let req = builder.build().map_err(anyhow::Error::from)?;
+        let prepared = (|| -> anyhow::Result<(i64, PxModifyOrder)> {
+            match cached_order.as_ref().map(|order| order.order_type()) {
+                Some(OrderType::Limit) if cmd.trigger_price.is_some() => {
+                    anyhow::bail!("ProjectX limit orders do not have a trigger price")
+                }
+                Some(OrderType::StopMarket) if cmd.price.is_some() => {
+                    anyhow::bail!("ProjectX stop-market orders do not have a limit price")
+                }
+                Some(OrderType::Market) if cmd.price.is_some() || cmd.trigger_price.is_some() => {
+                    anyhow::bail!("ProjectX market orders do not have price fields")
+                }
+                Some(OrderType::Limit | OrderType::Market | OrderType::StopMarket) => {}
+                Some(order_type) => anyhow::bail!(
+                    "ProjectX cannot preserve modification semantics for {order_type:?} orders"
+                ),
+                None if cmd.price.is_some() || cmd.trigger_price.is_some() => anyhow::bail!(
+                    "ProjectX requires the cached order type to validate a price modification"
+                ),
+                None => {}
+            }
+            let account_id = Self::to_client_account_id(self.resolve_target_account_id_num(
+                cmd.params.as_ref(),
+                cached_order.as_ref().and_then(|order| order.account_id()),
+            )?)?;
+            let order_id_num = Self::parse_venue_order_id(venue_order_id)?;
+            let order_id = Self::to_client_order_id(order_id_num)?;
+            let mut builder = PxModifyOrder::builder(account_id, order_id);
+            if let Some(size) = cmd.quantity.map(Self::quantity_to_i64).transpose()? {
+                builder = builder.size(i32::try_from(size)?);
+            }
+            if let Some(limit_price) = Self::price_to_decimal(cmd.price) {
+                builder = builder.limit_price(limit_price);
+            }
+            if let Some(stop_price) = Self::price_to_decimal(cmd.trigger_price) {
+                builder = builder.stop_price(stop_price);
+            }
+            Ok((order_id_num, builder.build().map_err(anyhow::Error::from)?))
+        })();
+        let (order_id_num, req) = match prepared {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                let reason = format!("Invalid ProjectX modify request: {e}");
+                if let Some(order) = cached_order.as_ref() {
+                    self.emitter.emit_order_modify_rejected(
+                        order,
+                        Some(venue_order_id),
+                        &reason,
+                        get_atomic_clock_realtime().get_time_ns(),
+                    );
+                } else {
+                    self.emitter.emit_order_modify_rejected_event(
+                        cmd.strategy_id,
+                        cmd.instrument_id,
+                        cmd.client_order_id,
+                        Some(venue_order_id),
+                        &reason,
+                        get_atomic_clock_realtime().get_time_ns(),
+                    );
+                }
+                return Ok(());
+            }
+        };
+        self.venue_to_client
+            .insert(order_id_num, cmd.client_order_id);
 
         let http_client = self.http_client.clone();
         let emitter = self.emitter.clone();
         let command = cmd;
         let clock = get_atomic_clock_realtime();
         let cached_order = cached_order;
+        let reconciliation = self.reconciliation_context();
 
-        get_runtime().spawn(async move {
+        let handle = get_runtime().spawn(async move {
             match http_client.modify_order(&req).await {
                 Ok(()) => {}
+                Err(e) if Self::is_ambiguous_mutation_error(&e) => {
+                    log::warn!(
+                        "ProjectX modify for {} has an ambiguous outcome: {e}; reconciling before admitting more commands",
+                        command.client_order_id
+                    );
+                    reconciliation
+                        .reconcile("ambiguous order modification")
+                        .await;
+                }
                 Err(e) => {
                     let reason = format!("modify-order-error: {e}");
 
@@ -2595,6 +3396,7 @@ impl ExecutionClient for ProjectXExecutionClient {
                 }
             }
         });
+        self.pending_tasks.push(handle);
 
         Ok(())
     }
@@ -2646,33 +3448,99 @@ impl ExecutionClient for ProjectXExecutionClient {
             anyhow::bail!("{reason}");
         };
 
-        let account_id = Self::to_client_account_id(self.resolve_target_account_id_num(
-            cmd.params.as_ref(),
-            cached_order.as_ref().and_then(|o| o.account_id()),
-        )?)?;
-        let order_id = Self::parse_venue_order_id(venue_order_id)?;
-        self.venue_to_client.insert(order_id, cmd.client_order_id);
-        let req = PxCancelOrder {
-            account_id,
-            order_id: Self::to_client_order_id(order_id)?,
+        let prepared = (|| -> anyhow::Result<(i64, PxCancelOrder)> {
+            let account_id = Self::to_client_account_id(self.resolve_target_account_id_num(
+                cmd.params.as_ref(),
+                cached_order.as_ref().and_then(|order| order.account_id()),
+            )?)?;
+            let order_id_num = Self::parse_venue_order_id(venue_order_id)?;
+            Ok((
+                order_id_num,
+                PxCancelOrder {
+                    account_id,
+                    order_id: Self::to_client_order_id(order_id_num)?,
+                },
+            ))
+        })();
+        let (order_id_num, req) = match prepared {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                let reason = format!("Invalid ProjectX cancel request: {e}");
+                if let Some(order) = cached_order.as_ref() {
+                    self.emitter.emit_order_cancel_rejected(
+                        order,
+                        Some(venue_order_id),
+                        &reason,
+                        get_atomic_clock_realtime().get_time_ns(),
+                    );
+                } else {
+                    self.emitter.emit_order_cancel_rejected_event(
+                        cmd.strategy_id,
+                        cmd.instrument_id,
+                        cmd.client_order_id,
+                        Some(venue_order_id),
+                        &reason,
+                        get_atomic_clock_realtime().get_time_ns(),
+                    );
+                }
+                return Ok(());
+            }
         };
+        self.venue_to_client
+            .insert(order_id_num, cmd.client_order_id);
 
         let http_client = self.http_client.clone();
         let emitter = self.emitter.clone();
         let command = cmd;
         let clock = get_atomic_clock_realtime();
         let cached_order = cached_order;
+        let reconciliation = self.reconciliation_context();
+        let last_order_status = Arc::clone(&self.last_order_status);
 
-        get_runtime().spawn(async move {
+        let handle = get_runtime().spawn(async move {
             match http_client.cancel_order(&req).await {
                 Ok(()) => {
                     if let Some(order) = cached_order.as_ref() {
-                        emitter.emit_order_canceled(
-                            order,
-                            Some(venue_order_id),
-                            clock.get_time_ns(),
-                        );
+                        let should_emit_canceled =
+                            match last_order_status.entry(command.client_order_id) {
+                                Entry::Vacant(entry) => {
+                                    entry.insert(ProjectXOrderStatus::Cancelled.code());
+                                    true
+                                }
+                                Entry::Occupied(entry)
+                                    if matches!(
+                                        *entry.get(),
+                                        status
+                                            if status == ProjectXOrderStatus::Cancelled.code()
+                                                || status == ProjectXOrderStatus::Filled.code()
+                                                || status == ProjectXOrderStatus::Expired.code()
+                                                || status == ProjectXOrderStatus::Rejected.code()
+                                    ) =>
+                                {
+                                    false
+                                }
+                                Entry::Occupied(mut entry) => {
+                                    entry.insert(ProjectXOrderStatus::Cancelled.code());
+                                    true
+                                }
+                            };
+                        if should_emit_canceled {
+                            emitter.emit_order_canceled(
+                                order,
+                                Some(venue_order_id),
+                                clock.get_time_ns(),
+                            );
+                        }
                     }
+                }
+                Err(e) if Self::is_ambiguous_mutation_error(&e) => {
+                    log::warn!(
+                        "ProjectX cancel for {} has an ambiguous outcome: {e}; reconciling before admitting more commands",
+                        command.client_order_id
+                    );
+                    reconciliation
+                        .reconcile("ambiguous order cancellation")
+                        .await;
                 }
                 Err(e) => {
                     let reason = format!("cancel-order-error: {e}");
@@ -2697,20 +3565,34 @@ impl ExecutionClient for ProjectXExecutionClient {
                 }
             }
         });
+        self.pending_tasks.push(handle);
         Ok(())
     }
 
     fn query_account(&self, cmd: QueryAccount) -> anyhow::Result<()> {
-        if let Some(account_id_num) = Self::parse_account_num_from_account_id(cmd.account_id) {
-            self.ensure_account_id_num_known(account_id_num)?;
-            *self.account_id_num.lock().expect(MUTEX_POISONED) = Some(account_id_num);
-        }
+        let account_id = canonicalize_projectx_account_id(cmd.account_id)?;
+        let account_id_num = self
+            .account_num_from_account_id(account_id)
+            .or_else(|| Self::parse_account_num_from_account_id(account_id))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ProjectX query account {} does not resolve to the selected subscription",
+                    cmd.account_id
+                )
+            })?;
+        self.ensure_account_id_num_known(account_id_num)?;
+        *self.account_id_num.lock().expect(MUTEX_POISONED) = Some(account_id_num);
         let context = self.account_state_context();
-        get_runtime().spawn(async move {
+        let reconciliation = self.reconciliation_context();
+        let handle = get_runtime().spawn(async move {
             if let Err(e) = context.refresh().await {
                 log::warn!("ProjectX query_account refresh failed: {e:?}");
+                reconciliation
+                    .reconcile("query account refresh failure")
+                    .await;
             }
         });
+        self.pending_tasks.push(handle);
         Ok(())
     }
 
@@ -2775,15 +3657,19 @@ impl ExecutionClient for ProjectXExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        let reports = self
-            .fetch_order_status_reports(
-                false,
-                cmd.instrument_id,
-                Some(cmd.ts_init),
-                None,
-                cmd.ts_init,
-            )
-            .await?;
+        let (mut reports, historical_reports) = tokio::try_join!(
+            self.fetch_order_status_reports(true, cmd.instrument_id, None, None, cmd.ts_init),
+            self.fetch_order_status_reports(false, cmd.instrument_id, None, None, cmd.ts_init),
+        )?;
+        let open_order_ids = reports
+            .iter()
+            .map(|report| report.venue_order_id)
+            .collect::<HashSet<_>>();
+        reports.extend(
+            historical_reports
+                .into_iter()
+                .filter(|report| !open_order_ids.contains(&report.venue_order_id)),
+        );
 
         let found = reports.into_iter().find(|report| {
             if cmd
@@ -2856,25 +3742,34 @@ impl ExecutionClient for ProjectXExecutionClient {
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         let ts_now = get_atomic_clock_realtime().get_time_ns();
-        if lookback_mins.is_some() {
-            log::debug!(
-                "ProjectX startup mass status ignores historical lookback and reconciles current open state only"
-            );
-        }
+        let start = Self::lookback_start_unix_nanos(lookback_mins.unwrap_or(24 * 60))?;
 
-        let (order_reports, position_reports) = tokio::try_join!(
+        let (open_order_reports, historical_order_reports, fill_reports, position_reports) = tokio::try_join!(
             self.fetch_order_status_reports(true, None, None, None, ts_now),
+            self.fetch_order_status_reports(false, None, Some(start), None, ts_now),
+            self.fetch_fill_reports(None, None, Some(start), None, ts_now),
             self.fetch_position_status_reports(None, ts_now),
         )?;
 
+        let mut orders_by_venue_id =
+            HashMap::with_capacity(open_order_reports.len() + historical_order_reports.len());
+        for report in historical_order_reports {
+            orders_by_venue_id.insert(report.venue_order_id, report);
+        }
+        for report in open_order_reports {
+            orders_by_venue_id.insert(report.venue_order_id, report);
+        }
+
         Ok(Some(self.build_current_state_mass_status(
             ts_now,
-            order_reports,
+            orders_by_venue_id.into_values().collect(),
+            fill_reports,
             position_reports,
         )))
     }
 }
 
+#[cfg(test)]
 impl Default for ProjectXExecutionClient {
     fn default() -> Self {
         let core = ExecutionClientCore::new(
@@ -2887,7 +3782,15 @@ impl Default for ProjectXExecutionClient {
             None,
             std::rc::Rc::new(std::cell::RefCell::new(Cache::default())),
         );
-        Self::new(core, ProjectXExecClientConfig::default())
+        let config = ProjectXExecClientConfig::new(
+            TraderId::from("TRADER-001"),
+            AccountId::from("PROJECTX-001"),
+            crate::common::enums::ProjectXEnvironment::TopstepX,
+            "test-user",
+            "test-key",
+        )
+        .expect("test ProjectX config should be valid");
+        Self::new(core, config)
             .expect("default ProjectXExecutionClient construction should succeed")
     }
 }
@@ -2923,7 +3826,7 @@ mod tests {
         factories::projectx_contract_to_instrument,
     };
     use projectx_client::{Account, Order, Position, Trade};
-    use rust_decimal::prelude::ToPrimitive;
+    use rust_decimal::{Decimal, prelude::ToPrimitive};
 
     fn load_fixture(name: &str) -> Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3014,7 +3917,15 @@ mod tests {
             None,
             Rc::clone(&cache),
         );
-        let client = ProjectXExecutionClient::new(core, ProjectXExecClientConfig::default())
+        let config = ProjectXExecClientConfig::new(
+            TraderId::from("TRADER-001"),
+            AccountId::from("PROJECTX-001"),
+            crate::common::enums::ProjectXEnvironment::TopstepX,
+            "test-user",
+            "test-key",
+        )
+        .expect("test ProjectX config should be valid");
+        let client = ProjectXExecutionClient::new(core, config)
             .expect("test ProjectXExecutionClient construction should succeed");
         (client, cache)
     }
@@ -3073,13 +3984,13 @@ mod tests {
     fn map_order_status_prefers_fill_volume() {
         let partial = base_order(1, Some(1), 2);
         assert_eq!(
-            ProjectXExecutionClient::map_order_status(&partial),
+            ProjectXExecutionClient::map_order_status(&partial).unwrap(),
             OrderStatus::PartiallyFilled
         );
 
         let filled = base_order(1, Some(2), 2);
         assert_eq!(
-            ProjectXExecutionClient::map_order_status(&filled),
+            ProjectXExecutionClient::map_order_status(&filled).unwrap(),
             OrderStatus::Filled
         );
     }
@@ -3087,16 +3998,24 @@ mod tests {
     #[rstest::rstest]
     fn map_order_status_uses_projectx_status_codes() {
         assert_eq!(
-            ProjectXExecutionClient::map_order_status(&base_order(6, None, 2)),
-            OrderStatus::Accepted
+            ProjectXExecutionClient::map_order_status(&base_order(6, None, 2)).unwrap(),
+            OrderStatus::Submitted
         );
         assert_eq!(
-            ProjectXExecutionClient::map_order_status(&base_order(3, None, 2)),
+            ProjectXExecutionClient::map_order_status(&base_order(3, None, 2)).unwrap(),
             OrderStatus::Canceled
         );
         assert_eq!(
-            ProjectXExecutionClient::map_order_status(&base_order(5, None, 2)),
+            ProjectXExecutionClient::map_order_status(&base_order(5, None, 2)).unwrap(),
             OrderStatus::Rejected
+        );
+        assert_eq!(
+            ProjectXExecutionClient::map_order_status(&base_order(4, None, 2)).unwrap(),
+            OrderStatus::Expired
+        );
+        assert_eq!(
+            ProjectXExecutionClient::map_order_status(&base_order(7, None, 2)).unwrap(),
+            OrderStatus::PendingCancel
         );
     }
 
@@ -3106,7 +4025,8 @@ mod tests {
         let weighted = ProjectXExecutionClient::weighted_trade_avg_px_by_order_id(&[
             base_trade(order.id.get(), 10, 5200.0, 1),
             base_trade(order.id.get(), 11, 5202.0, 2),
-        ]);
+        ])
+        .expect("valid weighted average");
 
         ProjectXExecutionClient::backfill_order_filled_price(&mut order, &weighted);
 
@@ -3124,7 +4044,8 @@ mod tests {
         let weighted = ProjectXExecutionClient::weighted_trade_avg_px_by_order_id(&[
             voided,
             base_trade(order.id.get(), 11, 5201.0, 2),
-        ]);
+        ])
+        .expect("valid weighted average");
 
         ProjectXExecutionClient::backfill_order_filled_price(&mut order, &weighted);
 
@@ -3147,7 +4068,8 @@ mod tests {
         ];
         let mut orders = vec![order_a, order_b];
 
-        ProjectXExecutionClient::backfill_orders_filled_prices(&mut orders, &trades);
+        ProjectXExecutionClient::backfill_orders_filled_prices(&mut orders, &trades)
+            .expect("valid fill price backfill");
 
         assert_eq!(
             orders[0]
@@ -3166,35 +4088,36 @@ mod tests {
     #[rstest::rstest]
     fn map_side_type_and_position_side() {
         assert_eq!(
-            ProjectXExecutionClient::map_order_side_code(0),
+            ProjectXExecutionClient::map_order_side(projectx_client::Side::Bid).unwrap(),
             OrderSide::Buy
         );
         assert_eq!(
-            ProjectXExecutionClient::map_order_side_code(1),
+            ProjectXExecutionClient::map_order_side(projectx_client::Side::Ask).unwrap(),
             OrderSide::Sell
         );
         assert_eq!(
-            ProjectXExecutionClient::map_order_type_code(1),
+            ProjectXExecutionClient::map_order_type(projectx_client::OrderType::Limit).unwrap(),
             OrderType::Limit
         );
         assert_eq!(
-            ProjectXExecutionClient::map_order_type_code(5),
+            ProjectXExecutionClient::map_order_type(projectx_client::OrderType::TrailingStop)
+                .unwrap(),
             OrderType::TrailingStopMarket
         );
 
         let mut position = base_position(1, 2, 5200.25);
         assert_eq!(
-            ProjectXExecutionClient::map_position_side(&position),
+            ProjectXExecutionClient::map_position_side(&position).unwrap(),
             PositionSideSpecified::Long
         );
         position.position_type = projectx_client::PositionType::Short;
         assert_eq!(
-            ProjectXExecutionClient::map_position_side(&position),
+            ProjectXExecutionClient::map_position_side(&position).unwrap(),
             PositionSideSpecified::Short
         );
         position.size = 0;
         assert_eq!(
-            ProjectXExecutionClient::map_position_side(&position),
+            ProjectXExecutionClient::map_position_side(&position).unwrap(),
             PositionSideSpecified::Flat
         );
     }
@@ -3202,8 +4125,10 @@ mod tests {
     #[rstest::rstest]
     fn reconciliation_snapshot_emits_monotonic_diffs_and_prunes_state() {
         let (emitter, mut rx) = test_emitter();
+        let order_meta_by_client = DashMap::new();
         let venue_to_client = DashMap::new();
         let seen_trade_ids = DashSet::new();
+        let voided_trade_ids = DashSet::new();
         let open_order_state = DashMap::new();
         let open_position_state = DashMap::new();
         let account_ids = Arc::new(ParkingRwLock::new(AHashMap::new()));
@@ -3226,14 +4151,17 @@ mod tests {
             Venue::from("PROJECTX"),
             None,
             &emitter,
+            &order_meta_by_client,
             &venue_to_client,
             &seen_trade_ids,
+            &voided_trade_ids,
             &open_order_state,
             &open_position_state,
             ts,
             true,
             None,
-        );
+        )
+        .expect("valid reconciliation snapshot");
         assert_eq!(count_reports(&mut rx), 3);
 
         let same_snapshot = super::ReconciliationSnapshot {
@@ -3248,14 +4176,17 @@ mod tests {
             Venue::from("PROJECTX"),
             None,
             &emitter,
+            &order_meta_by_client,
             &venue_to_client,
             &seen_trade_ids,
+            &voided_trade_ids,
             &open_order_state,
             &open_position_state,
             ts,
             true,
             None,
-        );
+        )
+        .expect("valid reconciliation snapshot");
         assert_eq!(count_reports(&mut rx), 0);
 
         let mut changed_order = order.clone();
@@ -3272,14 +4203,17 @@ mod tests {
             Venue::from("PROJECTX"),
             None,
             &emitter,
+            &order_meta_by_client,
             &venue_to_client,
             &seen_trade_ids,
+            &voided_trade_ids,
             &open_order_state,
             &open_position_state,
             ts,
             true,
             None,
-        );
+        )
+        .expect("valid reconciliation snapshot");
         assert_eq!(count_reports(&mut rx), 1);
 
         // Prune tracked open-order/open-position cache entries.
@@ -3294,14 +4228,17 @@ mod tests {
             Venue::from("PROJECTX"),
             None,
             &emitter,
+            &order_meta_by_client,
             &venue_to_client,
             &seen_trade_ids,
+            &voided_trade_ids,
             &open_order_state,
             &open_position_state,
             ts,
             true,
             None,
-        );
+        )
+        .expect("valid reconciliation snapshot");
         assert_eq!(open_order_state.len(), 0);
         assert_eq!(open_position_state.len(), 0);
 
@@ -3317,22 +4254,27 @@ mod tests {
             Venue::from("PROJECTX"),
             None,
             &emitter,
+            &order_meta_by_client,
             &venue_to_client,
             &seen_trade_ids,
+            &voided_trade_ids,
             &open_order_state,
             &open_position_state,
             ts,
             true,
             None,
-        );
+        )
+        .expect("valid reconciliation snapshot");
         assert_eq!(count_reports(&mut rx), 2);
     }
 
     #[rstest::rstest]
     fn reconciliation_snapshot_can_seed_state_without_emitting_reports() {
         let (emitter, mut rx) = test_emitter();
+        let order_meta_by_client = DashMap::new();
         let venue_to_client = DashMap::new();
         let seen_trade_ids = DashSet::new();
+        let voided_trade_ids = DashSet::new();
         let open_order_state = DashMap::new();
         let open_position_state = DashMap::new();
         let account_ids = Arc::new(ParkingRwLock::new(AHashMap::new()));
@@ -3353,14 +4295,17 @@ mod tests {
             Venue::from("PROJECTX"),
             None,
             &emitter,
+            &order_meta_by_client,
             &venue_to_client,
             &seen_trade_ids,
+            &voided_trade_ids,
             &open_order_state,
             &open_position_state,
             UnixNanos::from(1_000),
             false,
             None,
-        );
+        )
+        .expect("valid reconciliation snapshot");
 
         assert_eq!(count_reports(&mut rx), 0);
         assert_eq!(open_order_state.len(), 1);
@@ -3376,10 +4321,57 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn reconciliation_snapshot_emits_recent_closed_order_before_fill() {
+    fn reconciliation_snapshot_does_not_commit_partial_invalid_state() {
         let (emitter, mut rx) = test_emitter();
+        let order_meta_by_client = DashMap::new();
         let venue_to_client = DashMap::new();
         let seen_trade_ids = DashSet::new();
+        let voided_trade_ids = DashSet::new();
+        let open_order_state = DashMap::new();
+        let open_position_state = DashMap::new();
+        let account_ids = Arc::new(ParkingRwLock::new(AHashMap::new()));
+        account_ids.write().insert(1, AccountId::from("PROJECTX-1"));
+        let order = base_order(1, Some(1), 2);
+        let trade = base_trade(order.id.get(), 20, 5200.5, 1);
+        let invalid_position = base_position(99, 1, 5200.25);
+
+        let result = ProjectXExecutionClient::apply_reconciliation_snapshot_with_context(
+            super::ReconciliationSnapshot {
+                open_orders: vec![order],
+                recent_trade_orders: vec![],
+                positions: vec![invalid_position],
+                trades: vec![trade],
+            },
+            &account_ids,
+            Venue::from("PROJECTX"),
+            None,
+            &emitter,
+            &order_meta_by_client,
+            &venue_to_client,
+            &seen_trade_ids,
+            &voided_trade_ids,
+            &open_order_state,
+            &open_position_state,
+            UnixNanos::from(1_000),
+            true,
+            None,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(count_reports(&mut rx), 0);
+        assert!(open_order_state.is_empty());
+        assert!(open_position_state.is_empty());
+        assert!(seen_trade_ids.is_empty());
+        assert!(venue_to_client.is_empty());
+    }
+
+    #[rstest::rstest]
+    fn reconciliation_snapshot_emits_recent_closed_order_before_fill() {
+        let (emitter, mut rx) = test_emitter();
+        let order_meta_by_client = DashMap::new();
+        let venue_to_client = DashMap::new();
+        let seen_trade_ids = DashSet::new();
+        let voided_trade_ids = DashSet::new();
         let open_order_state = DashMap::new();
         let open_position_state = DashMap::new();
         let account_ids = Arc::new(ParkingRwLock::new(AHashMap::new()));
@@ -3403,14 +4395,17 @@ mod tests {
             Venue::from("PROJECTX"),
             None,
             &emitter,
+            &order_meta_by_client,
             &venue_to_client,
             &seen_trade_ids,
+            &voided_trade_ids,
             &open_order_state,
             &open_position_state,
             UnixNanos::from(1_000),
             true,
             None,
-        );
+        )
+        .expect("valid reconciliation snapshot");
 
         let reports = collect_reports(&mut rx);
         assert_eq!(reports.len(), 2);
@@ -3426,8 +4421,10 @@ mod tests {
     #[rstest::rstest]
     fn reconciliation_snapshot_skips_known_closed_order_report_when_fill_exists() {
         let (emitter, mut rx) = test_emitter();
+        let order_meta_by_client = DashMap::new();
         let venue_to_client = DashMap::new();
         let seen_trade_ids = DashSet::new();
+        let voided_trade_ids = DashSet::new();
         let open_order_state = DashMap::new();
         let open_position_state = DashMap::new();
         let account_ids = Arc::new(ParkingRwLock::new(AHashMap::new()));
@@ -3454,14 +4451,17 @@ mod tests {
             Venue::from("PROJECTX"),
             None,
             &emitter,
+            &order_meta_by_client,
             &venue_to_client,
             &seen_trade_ids,
+            &voided_trade_ids,
             &open_order_state,
             &open_position_state,
             UnixNanos::from(1_000),
             true,
             None,
-        );
+        )
+        .expect("valid reconciliation snapshot");
 
         let reports = collect_reports(&mut rx);
         assert_eq!(reports.len(), 1);
@@ -3478,6 +4478,7 @@ mod tests {
         let order_meta_by_client = DashMap::new();
         let venue_to_client = DashMap::new();
         let seen_trade_ids = DashSet::new();
+        let voided_trade_ids = DashSet::new();
         let pending_trades_by_order_id: DashMap<i64, Vec<Trade>> = DashMap::new();
         let client_order_id = ClientOrderId::from("PXEMA-TEST-001");
         let venue_order_id = 42;
@@ -3516,7 +4517,9 @@ mod tests {
             &order_meta_by_client,
             &venue_to_client,
             &seen_trade_ids,
+            &voided_trade_ids,
             &pending_trades_by_order_id,
+            None,
         );
 
         assert_eq!(count_filled_order_events(&mut rx), 0);
@@ -3538,7 +4541,9 @@ mod tests {
             &order_meta_by_client,
             &venue_to_client,
             &seen_trade_ids,
+            &voided_trade_ids,
             &pending_trades_by_order_id,
+            None,
         );
 
         assert_eq!(count_filled_order_events(&mut rx), 1);
@@ -3554,7 +4559,9 @@ mod tests {
             &order_meta_by_client,
             &venue_to_client,
             &seen_trade_ids,
+            &voided_trade_ids,
             &pending_trades_by_order_id,
+            None,
         );
 
         assert_eq!(count_filled_order_events(&mut rx), 0);
@@ -3580,6 +4587,25 @@ mod tests {
 
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].profit_and_loss, None);
+    }
+
+    #[rstest::rstest]
+    fn trade_commission_preserves_signed_rebates() {
+        let mut trade = base_trade(42, 7, 5200.25, 1);
+        trade.fees = Decimal::new(-125, 2);
+        trade.commissions = Some(Decimal::new(25, 2));
+
+        let commission = ProjectXExecutionClient::trade_commission(&trade, Currency::USD())
+            .expect("signed commission should convert");
+
+        assert_eq!(commission.as_decimal(), Decimal::NEGATIVE_ONE);
+    }
+
+    #[rstest::rstest]
+    fn malformed_provider_contract_id_is_rejected_without_panicking() {
+        let result = ProjectXExecutionClient::instrument_id_from_contract_id("", None);
+
+        assert!(result.is_err());
     }
 
     #[rstest::rstest]
@@ -3614,9 +4640,11 @@ mod tests {
         let order_meta_by_client = DashMap::new();
         let venue_to_client = DashMap::new();
         let last_order_state = DashMap::new();
+        let last_order_status = DashMap::new();
         let open_order_state: DashMap<i64, super::OpenOrderState> = DashMap::new();
         let open_position_state: DashMap<i64, super::PositionState> = DashMap::new();
         let seen_trade_ids = DashSet::new();
+        let voided_trade_ids = DashSet::new();
         let pending_trades_by_order_id: DashMap<i64, Vec<Trade>> = DashMap::new();
         let client_order_id = ClientOrderId::from("PXEMA-TEST-FIXTURE-001");
 
@@ -3647,7 +4675,8 @@ mod tests {
             Venue::from("PROJECTX"),
             AccountType::Margin,
             Some(Currency::USD()),
-        );
+        )
+        .expect("valid account update");
         assert_eq!(count_account_events(&mut rx), 1);
 
         let changed_accounts =
@@ -3663,9 +4692,12 @@ mod tests {
             &order_meta_by_client,
             &venue_to_client,
             &last_order_state,
+            &last_order_status,
             &open_order_state,
             &seen_trade_ids,
+            &voided_trade_ids,
             &pending_trades_by_order_id,
+            None,
         );
         assert!(initial_refresh_accounts.is_empty());
         assert_eq!(count_reports(&mut rx), 0);
@@ -3683,9 +4715,12 @@ mod tests {
             &order_meta_by_client,
             &venue_to_client,
             &last_order_state,
+            &last_order_status,
             &open_order_state,
             &seen_trade_ids,
+            &voided_trade_ids,
             &pending_trades_by_order_id,
+            None,
         );
         assert!(progress_refresh_accounts.is_empty());
         assert_eq!(count_reports(&mut rx), 1);
@@ -3699,7 +4734,9 @@ mod tests {
             &order_meta_by_client,
             &venue_to_client,
             &seen_trade_ids,
+            &voided_trade_ids,
             &pending_trades_by_order_id,
+            None,
         );
         assert_eq!(count_filled_order_events(&mut rx), 1);
         assert!(seen_trade_ids.contains(&9101));
@@ -3714,8 +4751,10 @@ mod tests {
         let order_meta_by_client = DashMap::new();
         let venue_to_client = DashMap::new();
         let last_order_state = DashMap::new();
+        let last_order_status = DashMap::new();
         let open_order_state: DashMap<i64, super::OpenOrderState> = DashMap::new();
         let seen_trade_ids = DashSet::new();
+        let voided_trade_ids = DashSet::new();
         let pending_trades_by_order_id: DashMap<i64, Vec<Trade>> = DashMap::new();
         let client_order_id = ClientOrderId::from("PXEMA-TEST-002");
 
@@ -3754,9 +4793,12 @@ mod tests {
             &order_meta_by_client,
             &venue_to_client,
             &last_order_state,
+            &last_order_status,
             &open_order_state,
             &seen_trade_ids,
+            &voided_trade_ids,
             &pending_trades_by_order_id,
+            None,
         );
 
         assert!(accounts.is_empty());
@@ -3772,8 +4814,10 @@ mod tests {
         let order_meta_by_client = DashMap::new();
         let venue_to_client = DashMap::new();
         let last_order_state = DashMap::new();
+        let last_order_status = DashMap::new();
         let open_order_state: DashMap<i64, super::OpenOrderState> = DashMap::new();
         let seen_trade_ids = DashSet::new();
+        let voided_trade_ids = DashSet::new();
         let pending_trades_by_order_id: DashMap<i64, Vec<Trade>> = DashMap::new();
 
         let accounts = ProjectXExecutionClient::handle_user_orders_event(
@@ -3800,9 +4844,12 @@ mod tests {
             &order_meta_by_client,
             &venue_to_client,
             &last_order_state,
+            &last_order_status,
             &open_order_state,
             &seen_trade_ids,
+            &voided_trade_ids,
             &pending_trades_by_order_id,
+            None,
         );
 
         assert_eq!(accounts, HashSet::from([1]));
@@ -3831,7 +4878,15 @@ mod tests {
         );
 
         assert_eq!(accounts, HashSet::from([1]));
-        assert_eq!(open_position_state.len(), 1);
+        assert!(open_position_state.is_empty());
+        open_position_state.insert(
+            10,
+            super::PositionState {
+                size: 1,
+                type_: projectx_client::PositionType::Long.code(),
+                average_price: Decimal::new(520_025, 2),
+            },
+        );
 
         let accounts = ProjectXExecutionClient::handle_user_positions_event(
             vec![
@@ -3875,7 +4930,8 @@ mod tests {
             Venue::from("PROJECTX"),
             AccountType::Margin,
             Some(Currency::USD()),
-        );
+        )
+        .expect("valid account update");
 
         assert_eq!(count_account_events(&mut rx), 1);
     }
@@ -3888,8 +4944,10 @@ mod tests {
         let order_meta_by_client = DashMap::new();
         let venue_to_client = DashMap::new();
         let last_order_state = DashMap::new();
+        let last_order_status = DashMap::new();
         let open_order_state: DashMap<i64, super::OpenOrderState> = DashMap::new();
         let seen_trade_ids = DashSet::new();
+        let voided_trade_ids = DashSet::new();
         let pending_trades_by_order_id: DashMap<i64, Vec<Trade>> = DashMap::new();
         let client_order_id = ClientOrderId::from("PXEMA-TEST-003");
 
@@ -3928,9 +4986,12 @@ mod tests {
             &order_meta_by_client,
             &venue_to_client,
             &last_order_state,
+            &last_order_status,
             &open_order_state,
             &seen_trade_ids,
+            &voided_trade_ids,
             &pending_trades_by_order_id,
+            None,
         );
         assert!(accounts.is_empty());
         assert_eq!(count_reports(&mut rx), 0);
@@ -3949,9 +5010,12 @@ mod tests {
             &order_meta_by_client,
             &venue_to_client,
             &last_order_state,
+            &last_order_status,
             &open_order_state,
             &seen_trade_ids,
+            &voided_trade_ids,
             &pending_trades_by_order_id,
+            None,
         );
         assert!(accounts.is_empty());
         assert_eq!(count_reports(&mut rx), 1);
@@ -3965,7 +5029,8 @@ mod tests {
             AccountId::from("PROJECTX-PRAC-V2-64413-98419885"),
             UnixNanos::from(1_000),
             None,
-        );
+        )
+        .expect("valid position report");
 
         assert_eq!(report.venue_position_id, None);
         assert_eq!(
@@ -3992,12 +5057,17 @@ mod tests {
     fn current_state_mass_status_omits_historical_fill_reports() {
         let client = ProjectXExecutionClient::default();
         let ts_now = UnixNanos::from(42);
-        let order_report = client.map_order_report(base_order(1, Some(1), 2), ts_now);
-        let position_report = client.map_position_report(base_position(1, 1, 5200.25), ts_now);
+        let order_report = client
+            .map_order_report(base_order(1, Some(1), 2), ts_now)
+            .expect("valid order report");
+        let position_report = client
+            .map_position_report(base_position(1, 1, 5200.25), ts_now)
+            .expect("valid position report");
 
         let mass_status = client.build_current_state_mass_status(
             ts_now,
             vec![order_report],
+            Vec::new(),
             vec![position_report],
         );
 
@@ -4029,7 +5099,9 @@ mod tests {
         ];
 
         let context = client.account_state_context();
-        let ids = context.cache_account_ids(&accounts);
+        let ids = context
+            .cache_account_ids(&accounts)
+            .expect("valid account IDs");
         let selected = context
             .select_subscribed_account_id_num(&ids)
             .expect("configured account should be selected");
@@ -4100,13 +5172,14 @@ mod tests {
             ProjectXExecutionClient::instrument_aliases_from_cache(&cache)
         };
         let instrument_id =
-            ProjectXExecutionClient::instrument_id_from_contract_id("MNQM6", Some(&aliases));
+            ProjectXExecutionClient::instrument_id_from_contract_id("MNQM6", Some(&aliases))
+                .expect("valid cached alias");
 
         assert_eq!(instrument_id, InstrumentId::from("MNQM26.PROJECTX"));
     }
 
     #[rstest::rstest]
-    fn cancel_all_orders_is_noop_when_no_matching_orders() {
+    fn cancel_all_orders_rejects_when_user_stream_is_missing() {
         let client = ProjectXExecutionClient::default();
         client.core.set_connected();
         client
@@ -4125,10 +5198,10 @@ mod tests {
             None,
         );
 
-        assert!(
-            client.cancel_all_orders(cmd).is_ok(),
-            "cancel_all_orders should be a no-op when cache has no matching orders"
-        );
+        let err = client
+            .cancel_all_orders(cmd)
+            .expect_err("missing user stream should fence cancel_all_orders");
+        assert!(err.to_string().contains("user stream"));
     }
 
     #[rstest::rstest]

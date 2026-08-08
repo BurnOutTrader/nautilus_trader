@@ -14,8 +14,13 @@
 
 from __future__ import annotations
 
+import warnings
+
+import pytest
+
 from nautilus_trader.adapters.projectx import backtest as projectx_backtest
 from nautilus_trader.adapters.projectx import build_external_bar_type
+from nautilus_trader.adapters.projectx import download_bars_to_catalog_async
 from nautilus_trader.model import InstrumentId
 
 
@@ -63,6 +68,8 @@ class _FakeHttpClient:
         self.started = False
         self.stopped = False
         self.live_calls: list[bool] = []
+        self.fallback_calls: list[bool] = []
+        self.instrument_queries: list[tuple[bool, str | None]] = []
 
     @classmethod
     def from_config(cls, _config) -> _FakeHttpClient:
@@ -76,32 +83,43 @@ class _FakeHttpClient:
 
     async def available_instruments(self, live, active_only, product_root):
         self.live_calls.append(live)
+        self.instrument_queries.append((active_only, product_root))
+        # Model an expired contract: it is unavailable when active-only filtering is requested.
+        if active_only or product_root is not None:
+            return []
         return [_FakeInstrument()]
 
     async def retrieve_bars(
         self,
-        contract_id,
-        bar_type,
-        start_time,
-        end_time,
-        unit,
-        unit_number,
-        limit,
+        *,
         live,
+        allow_live_history_fallback,
+        **_kwargs,
     ):
         self.live_calls.append(live)
+        self.fallback_calls.append(allow_live_history_fallback)
         return _bars_payload()
 
 
 class _FakeCatalog:
+    last_instance: _FakeCatalog | None = None
+
     def __init__(self, path: str) -> None:
+        type(self).last_instance = self
         self.path = path
+        self.instruments_written: list[object] = []
+        self.bars_written: list[object] = []
+        self.query: dict[str, object] = {}
 
-    def write_data(self, _data) -> None:
-        pass
+    def write_instruments(self, data) -> None:
+        self.instruments_written.extend(data)
 
-    def bars(self, **_kwargs) -> list[object]:
-        return [object(), object()]
+    def write_bars(self, data) -> None:
+        self.bars_written.extend(data)
+
+    def query_bars(self, **kwargs) -> list[object]:
+        self.query = kwargs
+        return list(self.bars_written)
 
 
 def test_download_bars_to_catalog_uses_live_history_fallback_flag(monkeypatch, tmp_path):
@@ -127,6 +145,17 @@ def test_download_bars_to_catalog_uses_live_history_fallback_flag(monkeypatch, t
     assert fake_client.started is True
     assert fake_client.stopped is True
     assert fake_client.live_calls == [True, True]
+    assert fake_client.fallback_calls == [True]
+    assert fake_client.instrument_queries == [(False, None)]
+    fake_catalog = _FakeCatalog.last_instance
+    assert fake_catalog is not None
+    assert len(fake_catalog.instruments_written) == 1
+    assert len(fake_catalog.bars_written) == 2
+    assert fake_catalog.query["identifiers"] == [
+        "MNQM26.PROJECTX-1-MINUTE-LAST-EXTERNAL",
+    ]
+    assert fake_catalog.query["start"] == 1_775_520_000_000_000_000
+    assert fake_catalog.query["end"] == 1_775_523_600_000_000_000
     assert result.bar_count == 2
     assert result.instrument_count == 1
     assert result.bar_count == 2
@@ -150,6 +179,7 @@ def test_download_bars_to_catalog_defaults_to_no_live_history_fallback(monkeypat
     fake_client = _FakeHttpClient.last_instance
     assert fake_client is not None
     assert fake_client.live_calls == [False, False]
+    assert fake_client.fallback_calls == [False]
 
 
 def test_build_external_bar_type_normalizes_spec():
@@ -158,3 +188,43 @@ def test_build_external_bar_type_normalizes_spec():
     assert str(build_external_bar_type(instrument_id, "1-MINUTE-LAST-EXTERNAL")) == (
         "MNQM26.PROJECTX-1-MINUTE-LAST-EXTERNAL"
     )
+
+
+@pytest.mark.asyncio
+async def test_async_download_helper_is_available(monkeypatch, tmp_path):
+    monkeypatch.setattr(projectx_backtest, "load_projectx_env", lambda: None)
+    monkeypatch.setenv("PROJECTX_USERNAME", "test-user")
+    monkeypatch.setenv("PROJECTX_API_KEY", "test-api-key")
+    monkeypatch.setattr(projectx_backtest, "ProjectXHttpClient", _FakeHttpClient)
+    monkeypatch.setattr(projectx_backtest, "ParquetDataCatalog", _FakeCatalog)
+
+    result = await download_bars_to_catalog_async(
+        catalog_path=tmp_path,
+        instrument_id="MNQM26.PROJECTX",
+        bar_spec="1-MINUTE-LAST",
+        start_time="2026-04-07T00:00:00Z",
+        end_time="2026-04-07T01:00:00Z",
+    )
+
+    assert result.bar_count == 2
+
+
+@pytest.mark.asyncio
+async def test_sync_download_inside_event_loop_does_not_leak_coroutine(monkeypatch, tmp_path):
+    def fail_if_called():
+        pytest.fail("sync helper constructed the coroutine before checking the event loop")
+
+    monkeypatch.setattr(projectx_backtest, "load_projectx_env", fail_if_called)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(RuntimeError, match="download_bars_to_catalog_async"):
+            projectx_backtest.download_bars_to_catalog(
+                catalog_path=tmp_path,
+                instrument_id="MNQM26.PROJECTX",
+                bar_spec="1-MINUTE-LAST",
+                start_time="2026-04-07T00:00:00Z",
+                end_time="2026-04-07T01:00:00Z",
+            )
+
+    assert not any("was never awaited" in str(warning.message) for warning in caught)

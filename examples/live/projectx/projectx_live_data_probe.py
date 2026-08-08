@@ -16,30 +16,40 @@
 
 from __future__ import annotations
 
+import sys
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from examples.live.live_node_run_helpers import interrupt_live_node_run
-from examples.live.live_node_run_helpers import sleep_or_cancel
-from examples.live.live_node_run_helpers import start_live_node_monitor
-from examples.live.live_node_run_helpers import wait_for_event_or_cancel
-from examples.live.projectx.projectx_data_probe import clear_probe_state
-from examples.live.projectx.projectx_data_probe import register_probe_state
-from examples.live.projectx.projectx_data_probe import snapshot_probe_state
-from examples.live.projectx.projectx_data_probe import wait_for_probe_data
-from examples.live.projectx.projectx_data_probe import wait_for_probe_instrument
-from examples.live.projectx.projectx_data_probe import wait_for_probe_stop
+_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+sys.path[:] = [_REPO_ROOT, *(path for path in sys.path if path != _REPO_ROOT)]
 
 from nautilus_trader._libnautilus.common import Environment
 from nautilus_trader._libnautilus.model import TraderId
-from nautilus_trader.adapters.projectx import PROJECTX_CLIENT_ID
-from nautilus_trader.adapters.projectx import ProjectXDataClientConfig
-from nautilus_trader.adapters.projectx import ProjectXDataClientFactory
-from nautilus_trader.adapters.projectx import load_projectx_env
+from nautilus_trader.adapters.projectx import (
+    PROJECTX_CLIENT_ID,
+    ProjectXDataClientConfig,
+    ProjectXDataClientFactory,
+    load_projectx_env,
+)
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import InstrumentId
 
+from examples.live.live_node_run_helpers import (
+    interrupt_live_node_run,
+    sleep_or_cancel,
+    start_live_node_monitor,
+    wait_for_event_or_cancel,
+)
+from examples.live.projectx.projectx_data_probe import (
+    clear_probe_state,
+    register_probe_state,
+    snapshot_probe_state,
+    wait_for_probe_data,
+    wait_for_probe_instrument,
+    wait_for_probe_stop,
+)
 
 if TYPE_CHECKING:
     from nautilus_trader.config import ImportableStrategyConfig
@@ -64,7 +74,9 @@ FAIL_ON_TIMEOUT = False
 
 TRADER_ID = TraderId("TESTER-001")
 _STRATEGY_PATH = "examples.live.projectx.projectx_data_probe:ProjectXDataProbeStrategy"
-_CONFIG_PATH = "examples.live.projectx.projectx_data_probe:ProjectXDataProbeStrategyConfig"
+_CONFIG_PATH = (
+    "examples.live.projectx.projectx_data_probe:ProjectXDataProbeStrategyConfig"
+)
 
 
 def _print_probe_summary(summary: dict[str, object]) -> None:
@@ -260,8 +272,8 @@ def run_probe(
 def main() -> None:
     try:
         instrument_id = INSTRUMENT_ID
-    except Exception as exc:
-        print(f"ProjectX instrument resolution failed: {exc}")
+    except Exception as e:  # noqa: BLE001 - CLI boundary reports startup failures
+        print(f"ProjectX instrument resolution failed: {e}")
 
         if FAIL_ON_TIMEOUT:
             raise SystemExit(1) from None

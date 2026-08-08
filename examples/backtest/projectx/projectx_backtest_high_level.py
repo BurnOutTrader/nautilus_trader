@@ -16,21 +16,32 @@
 from __future__ import annotations
 
 import os
+import sys
 from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
-
-from nautilus_trader.backtest.node import BacktestDataConfig
-from nautilus_trader.backtest.node import BacktestEngineConfig
-from nautilus_trader.backtest.node import BacktestNode
-from nautilus_trader.backtest.node import BacktestRunConfig
-from nautilus_trader.backtest.node import BacktestVenueConfig
+from nautilus_trader.backtest import (
+    BacktestDataConfig,
+    BacktestEngineConfig,
+    BacktestNode,
+    BacktestRunConfig,
+    BacktestVenueConfig,
+)
 from nautilus_trader.config import ImportableStrategyConfig
-from nautilus_trader.model import Bar
-from nautilus_trader.model import BarType
-from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import (
+    AccountType,
+    BarType,
+    BookType,
+    Currency,
+    InstrumentId,
+    OmsType,
+)
 from nautilus_trader.persistence import ParquetDataCatalog
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def _require_example_root() -> Path:
@@ -55,22 +66,82 @@ BACKTEST_START = None
 BACKTEST_END = None
 
 
-def _resolve_time_range(catalog: ParquetDataCatalog, bar_type: BarType) -> tuple[str, str]:
-    bars = catalog.bars(bar_types=[str(bar_type)])
+def _resolve_time_range(
+    catalog: ParquetDataCatalog, bar_type: BarType
+) -> tuple[int, int]:
+    bars = catalog.query_bars(identifiers=[str(bar_type)])
     if not bars:
         raise RuntimeError(
             f"No bars found for {bar_type} in catalog {CATALOG_PATH}. "
             "Run examples/backtest/projectx/projectx_download_bars.py first.",
         )
 
-    start_time = BACKTEST_START
-    end_time = BACKTEST_END
-    if start_time and end_time:
-        return start_time, end_time
+    start_time = (
+        int(pd.Timestamp(BACKTEST_START).value)
+        if BACKTEST_START is not None
+        else int(bars[0].ts_init)
+    )
+    end_time = (
+        int(pd.Timestamp(BACKTEST_END).value)
+        if BACKTEST_END is not None
+        else int(bars[-1].ts_init)
+    )
+    if start_time > end_time:
+        raise ValueError(f"Backtest start {start_time} is after end {end_time}")
+    return start_time, end_time
 
-    first_bar = pd.Timestamp(bars[0].ts_init, unit="ns", tz="UTC")
-    last_bar = pd.Timestamp(bars[-1].ts_init, unit="ns", tz="UTC")
-    return first_bar.isoformat(), last_bar.isoformat()
+
+def _build_run_config(
+    *,
+    instrument_id: InstrumentId,
+    bar_type: BarType,
+    start_time: int,
+    end_time: int,
+) -> tuple[BacktestRunConfig, list[ImportableStrategyConfig]]:
+    venue_config = BacktestVenueConfig(
+        name="PROJECTX",
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        book_type=BookType.L1_MBP,
+        base_currency=Currency.from_str("USD"),
+        starting_balances=[STARTING_BALANCE],
+        bar_execution=True,
+    )
+    data_config = BacktestDataConfig(
+        catalog_path=str(CATALOG_PATH),
+        data_type="Bar",
+        instrument_id=instrument_id,
+        bar_spec=bar_type.spec,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    strategies = [
+        ImportableStrategyConfig(
+            strategy_path=(
+                "examples.live.projectx.projectx_ema_cross:ProjectXEMACrossStrategy"
+            ),
+            config_path=(
+                "examples.live.projectx.projectx_ema_cross:ProjectXEMACrossStrategyConfig"
+            ),
+            config={
+                "instrument_id": instrument_id,
+                "bar_type": str(bar_type),
+                "fast_ema_period": FAST_EMA,
+                "slow_ema_period": SLOW_EMA,
+                "trade_size": TRADE_SIZE,
+                "request_bars": False,
+                "cleanup_on_stop": False,
+            },
+        ),
+    ]
+    return (
+        BacktestRunConfig(
+            engine=BacktestEngineConfig(),
+            data=[data_config],
+            venues=[venue_config],
+        ),
+        strategies,
+    )
 
 
 def main() -> None:
@@ -86,54 +157,27 @@ def main() -> None:
 
     start_time, end_time = _resolve_time_range(catalog, bar_type)
 
-    venue_configs = [
-        BacktestVenueConfig(
-            name="PROJECTX",
-            oms_type="NETTING",
-            account_type="CASH",
-            base_currency="USD",
-            starting_balances=[STARTING_BALANCE],
-        ),
-    ]
-
-    data_configs = [
-        BacktestDataConfig(
-            catalog_path=str(CATALOG_PATH),
-            data_cls=Bar,
-            instrument_id=instrument_id,
-            bar_spec=BAR_SPEC,
-            start_time=start_time,
-            end_time=end_time,
-        ),
-    ]
-
-    strategies = [
-        ImportableStrategyConfig(
-            strategy_path="nautilus_trader.examples.strategies.ema_cross:EMACross",
-            config_path="nautilus_trader.examples.strategies.ema_cross:EMACrossConfig",
-            config={
-                "instrument_id": instrument_id,
-                "bar_type": str(bar_type),
-                "fast_ema_period": FAST_EMA,
-                "slow_ema_period": SLOW_EMA,
-                "trade_size": TRADE_SIZE,
-            },
-        ),
-    ]
-
-    config = BacktestRunConfig(
-        engine=BacktestEngineConfig(strategies=strategies),
-        data=data_configs,
-        venues=venue_configs,
+    config, strategies = _build_run_config(
+        instrument_id=instrument_id,
+        bar_type=bar_type,
+        start_time=start_time,
+        end_time=end_time,
     )
 
     node = BacktestNode(configs=[config])
+    node.build()
+    for strategy in strategies:
+        node.add_strategy_from_config(config.id, strategy)
     results = node.run()
 
     print(f"Catalog path: {CATALOG_PATH}")
     print(f"Instrument ID: {instrument_id}")
     print(f"Bar type: {bar_type}")
-    print(f"Backtest range: {start_time} -> {end_time}")
+    print(
+        "Backtest range: "
+        f"{pd.Timestamp(start_time, unit='ns', tz='UTC').isoformat()} -> "
+        f"{pd.Timestamp(end_time, unit='ns', tz='UTC').isoformat()}"
+    )
     print(results)
 
 

@@ -16,13 +16,18 @@
 
 use std::{env, path::PathBuf};
 
+#[path = "input.rs"]
+mod input;
+
 use chrono::{DateTime, Utc};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::BarType,
     identifiers::{ClientId, InstrumentId, TraderId},
     instruments::Instrument,
+    types::Quantity,
 };
+use nautilus_persistence::backend::catalog::ParquetDataCatalog;
 use projectx_client::Contract;
 use projectx_nt::{
     ProjectXConfig, ProjectXDataClientConfig, ProjectXEnvironment, ProjectXExecClientConfig,
@@ -64,8 +69,9 @@ pub(crate) fn projectx_client_id() -> ClientId {
     ClientId::from("PROJECTX")
 }
 
-pub(crate) fn trader_id_from_env(key: &str, default: &str) -> TraderId {
-    TraderId::from(env::var(key).unwrap_or_else(|_| default.to_string()))
+pub(crate) fn trader_id_from_env(key: &str, default: &str) -> anyhow::Result<TraderId> {
+    let value = env::var(key).unwrap_or_else(|_| default.to_string());
+    input::parse_trader_id(key, &value)
 }
 
 fn required_env(key: &str) -> anyhow::Result<String> {
@@ -74,6 +80,11 @@ fn required_env(key: &str) -> anyhow::Result<String> {
 
 pub(crate) fn env_string(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+pub(crate) fn positive_quantity_from_env(key: &str, default: &str) -> anyhow::Result<Quantity> {
+    let value = env_string(key, default);
+    input::parse_positive_quantity(key, &value)
 }
 
 pub(crate) fn projectx_transport_config_from_env() -> anyhow::Result<ProjectXConfig> {
@@ -103,11 +114,11 @@ pub(crate) fn exec_config_from_env(
 
     Ok(ProjectXExecClientConfig::new(
         trader_id,
-        projectx_account_id_from_raw(&account_id),
+        projectx_account_id_from_raw(&account_id)?,
         ProjectXEnvironment::TopstepX,
         required_env("PROJECTX_USERNAME")?,
         required_env("PROJECTX_API_KEY")?,
-    ))
+    )?)
 }
 
 pub(crate) async fn resolve_instrument_id_from_env(live: bool) -> anyhow::Result<InstrumentId> {
@@ -189,10 +200,10 @@ pub(crate) async fn resolve_contract_from_env(live: bool) -> anyhow::Result<Cont
 }
 
 pub(crate) fn resolve_catalog_instrument_id(
-    catalog: &nautilus_persistence::backend::catalog::ParquetDataCatalog,
+    catalog: &ParquetDataCatalog,
 ) -> anyhow::Result<InstrumentId> {
     if let Ok(instrument_id) = env::var("PROJECTX_INSTRUMENT_ID") {
-        return Ok(InstrumentId::from(instrument_id));
+        return input::parse_instrument_id("PROJECTX_INSTRUMENT_ID", &instrument_id);
     }
 
     let instruments = catalog.instruments(None, None, None)?;
@@ -206,7 +217,7 @@ pub(crate) fn resolve_catalog_instrument_id(
 }
 
 pub(crate) fn resolve_catalog_backtest_window(
-    catalog: &mut nautilus_persistence::backend::catalog::ParquetDataCatalog,
+    catalog: &mut ParquetDataCatalog,
     instrument_id: InstrumentId,
     bar_type: BarType,
 ) -> anyhow::Result<(UnixNanos, UnixNanos)> {
