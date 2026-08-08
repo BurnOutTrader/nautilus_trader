@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # mypy: disable-error-code="attr-defined"
-# ruff: noqa: E402
 # -------------------------------------------------------------------------------------------------
 #  Copyright (C) 2026 Kevin Monaghan. All rights reserved.
 #
@@ -24,37 +23,39 @@ Run this workflow to:
 Warning:
     This example can submit live orders to both configured accounts.
     Use demo accounts first.
+
+Configure the secondary profile with the same login and system as the default profile, but a
+different account ID (for example, `RITHMIC_SECONDARY_ACCOUNT_ID`). Matching session credentials
+allow both execution clients to share one upstream gateway.
 """
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
-
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from examples.live.rithmic.rithmic_live_node_helpers import TRADER_ID
-from examples.live.rithmic.rithmic_live_node_helpers import RithmicDataClientFactory
-from examples.live.rithmic.rithmic_live_node_helpers import RithmicExecClientFactory
-from examples.live.rithmic.rithmic_live_node_helpers import build_adapter_account_id
-from examples.live.rithmic.rithmic_live_node_helpers import build_data_client_config
-from examples.live.rithmic.rithmic_live_node_helpers import build_data_client_id
-from examples.live.rithmic.rithmic_live_node_helpers import build_exec_client_config
-from examples.live.rithmic.rithmic_live_node_helpers import build_exec_client_id
-from examples.live.rithmic.rithmic_live_node_helpers import load_rithmic_env_file
-from examples.live.rithmic.rithmic_live_node_helpers import normalize_rithmic_client_component
-from examples.live.rithmic.rithmic_live_node_helpers import schedule_stop
 from nautilus_trader._libnautilus.common import Environment
 from nautilus_trader.live import LiveNode
-from nautilus_trader.model import BarType
-from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import BarType, InstrumentId
 
+from examples.live.rithmic.rithmic_live_node_helpers import (
+    TRADER_ID,
+    RithmicDataClientFactory,
+    RithmicExecClientFactory,
+    build_adapter_account_id,
+    build_data_client_config,
+    build_data_client_id,
+    build_exec_client_config,
+    build_exec_client_id,
+    load_rithmic_env_file,
+    schedule_stop,
+)
 
 if TYPE_CHECKING:
     from nautilus_trader.config import ImportableStrategyConfig
@@ -64,8 +65,9 @@ else:
 
 load_rithmic_env_file()
 
-PROFILE = None
-INSTRUMENT_ID = InstrumentId.from_str("MNQM6.RITHMIC")
+PRIMARY_PROFILE = None
+SECONDARY_PROFILE = "SECONDARY"
+INSTRUMENT_ID = InstrumentId.from_str("MNQM6.CME.RITHMIC")
 BAR_SPEC = "15-SECOND-LAST-EXTERNAL"
 TRADE_SIZE = "1"
 FAST_EMA_PERIOD = 10
@@ -73,39 +75,26 @@ SLOW_EMA_PERIOD = 20
 WARMUP_MINUTES = 30
 RUN_SECONDS = 0
 
-_STRATEGY_PATH = "examples.live.rithmic.rithmic_ema_cross_strategy:RithmicEMACrossStrategy"
-_CONFIG_PATH = "examples.live.rithmic.rithmic_ema_cross_strategy:RithmicEMACrossStrategyConfig"
+_STRATEGY_PATH = (
+    "examples.live.rithmic.rithmic_ema_cross_strategy:RithmicEMACrossStrategy"
+)
+_CONFIG_PATH = (
+    "examples.live.rithmic.rithmic_ema_cross_strategy:RithmicEMACrossStrategyConfig"
+)
 
 
-def _profile_env_candidates(key: str, profile: str | None) -> list[str]:
-    candidates: list[str] = []
-
-    if profile:
-        profile_token = normalize_rithmic_client_component(profile)
-        candidates.append(f"RITHMIC_{profile_token}_{key}")
-    candidates.append(f"RITHMIC_{key}")
-    return candidates
-
-
-def _required_secondary_account_id(profile: str | None) -> str:
-    for key in _profile_env_candidates("ACCOUNT_ID_2", profile):
-        value = os.environ.get(key)
-
-        if value:
-            return value
-
-    missing_key = _profile_env_candidates("ACCOUNT_ID_2", profile)[0]
-    raise ValueError(f"{missing_key} environment variable not set")
+def _required_profiles() -> tuple[str | None, str]:
+    if SECONDARY_PROFILE is None:
+        raise ValueError("Edit SECONDARY_PROFILE to match the secondary account prefix")
+    return PRIMARY_PROFILE, SECONDARY_PROFILE
 
 
 def main() -> None:
-    profile = PROFILE
+    primary_profile, secondary_profile = _required_profiles()
     instrument_id = INSTRUMENT_ID
     bar_type = BarType.from_str(f"{instrument_id}-{BAR_SPEC.strip().upper()}")
     warmup_minutes = int(WARMUP_MINUTES)
     run_seconds = int(RUN_SECONDS)
-    secondary_account_id = _required_secondary_account_id(profile)
-
     if warmup_minutes < 0:
         raise ValueError("WARMUP_MINUTES cannot be negative")
 
@@ -114,14 +103,11 @@ def main() -> None:
 
     history_enabled = bar_type.is_externally_aggregated()
     request_bars = history_enabled and warmup_minutes > 0
-    data_client_id = build_data_client_id(profile)
-    primary_exec_client_id = build_exec_client_id(profile)
-    primary_adapter_account_id = build_adapter_account_id(profile)
-    secondary_exec_client_id = build_exec_client_id(profile, account_id=secondary_account_id)
-    secondary_adapter_account_id = build_adapter_account_id(
-        profile,
-        account_id=secondary_account_id,
-    )
+    data_client_id = build_data_client_id(primary_profile)
+    primary_exec_client_id = build_exec_client_id(primary_profile)
+    primary_adapter_account_id = build_adapter_account_id(primary_profile)
+    secondary_exec_client_id = build_exec_client_id(secondary_profile)
+    secondary_adapter_account_id = build_adapter_account_id(secondary_profile)
 
     node = (
         LiveNode.builder("TESTER-001", TRADER_ID, Environment.LIVE)
@@ -132,22 +118,22 @@ def main() -> None:
         .with_timeout_disconnection_secs(10)
         .with_delay_post_stop_secs(5)
         .add_data_client(
-            None,
+            data_client_id,
             RithmicDataClientFactory(),
             build_data_client_config(
-                profile,
+                primary_profile,
                 enable_history=history_enabled,
             ),
         )
         .add_exec_client(
-            None,
+            primary_exec_client_id,
             RithmicExecClientFactory(),
-            build_exec_client_config(profile),
+            build_exec_client_config(primary_profile),
         )
         .add_exec_client(
-            None,
+            secondary_exec_client_id,
             RithmicExecClientFactory(),
-            build_exec_client_config(profile, account_id=secondary_account_id),
+            build_exec_client_config(secondary_profile),
         )
         .build()
     )
@@ -189,11 +175,16 @@ def main() -> None:
 
     print("Rithmic Live EMA Cross (Two Accounts)")
     print("=" * 50)
-    print(f"Profile: {profile or '<default>'}")
+    print(f"Primary profile: {primary_profile or '<default>'}")
+    print(f"Secondary profile: {secondary_profile}")
     print(f"Configured instrument: {instrument_id}")
     print(f"Data client ID: {data_client_id}")
-    print(f"Primary exec/account: {primary_exec_client_id} / {primary_adapter_account_id}")
-    print(f"Secondary exec/account: {secondary_exec_client_id} / {secondary_adapter_account_id}")
+    print(
+        f"Primary exec/account: {primary_exec_client_id} / {primary_adapter_account_id}"
+    )
+    print(
+        f"Secondary exec/account: {secondary_exec_client_id} / {secondary_adapter_account_id}"
+    )
     print(f"Bar type: {bar_type}")
     print(f"Trade size per account: {TRADE_SIZE}")
     print(f"Fast/slow EMA periods: {FAST_EMA_PERIOD}/{SLOW_EMA_PERIOD}")

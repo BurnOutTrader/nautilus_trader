@@ -12,229 +12,151 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Python bindings for enums.
+//! Python enum projections for Rithmic types.
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
-use rithmic_rs::{OrderSide, OrderStatus, OrderType, TimeInForce};
+use rithmic_rs::{OrderSide, OrderType, TimeInForce};
 
 use crate::common::enums::ConnectionState;
 
 #[cfg(feature = "python")]
-#[pyclass(name = "OrderSide", from_py_object)]
-#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.rithmic")]
-#[derive(Clone)]
-pub(crate) struct PyOrderSide {
-    inner: OrderSide,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-#[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl PyOrderSide {
-    #[classattr]
-    const BUY: Self = Self {
-        inner: OrderSide::Buy,
-    };
-
-    #[classattr]
-    const SELL: Self = Self {
-        inner: OrderSide::Sell,
-    };
-
-    #[pyo3(name = "__repr__")]
-    fn py_repr(&self) -> String {
-        format!("OrderSide.{}", self.inner)
-    }
+#[pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.rithmic")]
+#[pyclass(
+    name = "OrderSide",
+    module = "nautilus_trader.adapters.rithmic",
+    frozen,
+    eq,
+    eq_int,
+    from_py_object,
+    rename_all = "SCREAMING_SNAKE_CASE"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum PyOrderSide {
+    Buy,
+    Sell,
 }
 
 impl From<PyOrderSide> for OrderSide {
-    fn from(py_side: PyOrderSide) -> Self {
-        py_side.inner
+    fn from(value: PyOrderSide) -> Self {
+        match value {
+            PyOrderSide::Buy => Self::Buy,
+            PyOrderSide::Sell => Self::Sell,
+        }
     }
 }
 
 #[cfg(feature = "python")]
-#[pyclass(name = "OrderType", from_py_object)]
-#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.rithmic")]
-#[derive(Clone)]
-pub(crate) struct PyOrderType {
-    inner: OrderType,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-#[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl PyOrderType {
-    #[classattr]
-    const MARKET: Self = Self {
-        inner: OrderType::Market,
-    };
-
-    #[classattr]
-    const LIMIT: Self = Self {
-        inner: OrderType::Limit,
-    };
-
-    #[classattr]
-    const STOP_MARKET: Self = Self {
-        inner: OrderType::StopMarket,
-    };
-
-    #[classattr]
-    const STOP_LIMIT: Self = Self {
-        inner: OrderType::StopLimit,
-    };
-
-    #[pyo3(name = "__repr__")]
-    fn py_repr(&self) -> String {
-        format!("OrderType.{}", self.inner)
-    }
+#[pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.rithmic")]
+#[pyclass(
+    name = "OrderType",
+    module = "nautilus_trader.adapters.rithmic",
+    frozen,
+    eq,
+    eq_int,
+    from_py_object,
+    rename_all = "SCREAMING_SNAKE_CASE"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum PyOrderType {
+    Market,
+    Limit,
+    StopMarket,
+    StopLimit,
 }
 
 impl From<PyOrderType> for OrderType {
-    fn from(py_type: PyOrderType) -> Self {
-        py_type.inner
+    fn from(value: PyOrderType) -> Self {
+        match value {
+            PyOrderType::Market => Self::Market,
+            PyOrderType::Limit => Self::Limit,
+            PyOrderType::StopMarket => Self::StopMarket,
+            PyOrderType::StopLimit => Self::StopLimit,
+        }
     }
 }
 
 #[cfg(feature = "python")]
-#[pyclass(name = "TimeInForce", from_py_object)]
-#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.rithmic")]
-#[derive(Clone)]
-pub(crate) struct PyTimeInForce {
-    inner: TimeInForce,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-#[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl PyTimeInForce {
-    #[classattr]
-    const DAY: Self = Self {
-        inner: TimeInForce::Day,
-    };
-
-    #[classattr]
-    const GTC: Self = Self {
-        inner: TimeInForce::Gtc,
-    };
-
-    #[classattr]
-    const IOC: Self = Self {
-        inner: TimeInForce::Ioc,
-    };
-
-    #[classattr]
-    const FOK: Self = Self {
-        inner: TimeInForce::Fok,
-    };
-
-    #[pyo3(name = "__repr__")]
-    fn py_repr(&self) -> String {
-        format!("TimeInForce.{}", self.inner)
-    }
+#[pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.rithmic")]
+#[pyclass(
+    name = "TimeInForce",
+    module = "nautilus_trader.adapters.rithmic",
+    frozen,
+    eq,
+    eq_int,
+    from_py_object,
+    rename_all = "SCREAMING_SNAKE_CASE"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum PyTimeInForce {
+    Day,
+    Gtc,
+    Ioc,
+    Fok,
 }
 
 impl From<PyTimeInForce> for TimeInForce {
-    fn from(py_tif: PyTimeInForce) -> Self {
-        py_tif.inner
+    fn from(value: PyTimeInForce) -> Self {
+        match value {
+            PyTimeInForce::Day => Self::Day,
+            PyTimeInForce::Gtc => Self::Gtc,
+            PyTimeInForce::Ioc => Self::Ioc,
+            PyTimeInForce::Fok => Self::Fok,
+        }
     }
 }
 
 #[cfg(feature = "python")]
-#[pyclass(name = "OrderStatus", skip_from_py_object)]
-#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.rithmic")]
-#[derive(Clone)]
-pub(crate) struct PyOrderStatus {
-    inner: OrderStatus,
+#[pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.rithmic")]
+#[pyclass(
+    name = "OrderStatus",
+    module = "nautilus_trader.adapters.rithmic",
+    frozen,
+    eq,
+    eq_int,
+    from_py_object,
+    rename_all = "SCREAMING_SNAKE_CASE"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum PyOrderStatus {
+    Pending,
+    Open,
+    Partial,
+    Complete,
+    Cancelled,
+    Rejected,
+    Expired,
 }
 
 #[cfg(feature = "python")]
-#[pymethods]
-#[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl PyOrderStatus {
-    #[classattr]
-    const PENDING: Self = Self {
-        inner: OrderStatus::Pending,
-    };
-
-    #[classattr]
-    const OPEN: Self = Self {
-        inner: OrderStatus::Open,
-    };
-
-    #[classattr]
-    const PARTIAL: Self = Self {
-        inner: OrderStatus::Partial,
-    };
-
-    #[classattr]
-    const COMPLETE: Self = Self {
-        inner: OrderStatus::Complete,
-    };
-
-    #[classattr]
-    const CANCELLED: Self = Self {
-        inner: OrderStatus::Cancelled,
-    };
-
-    #[classattr]
-    const REJECTED: Self = Self {
-        inner: OrderStatus::Rejected,
-    };
-
-    #[classattr]
-    const EXPIRED: Self = Self {
-        inner: OrderStatus::Expired,
-    };
-
-    #[pyo3(name = "__repr__")]
-    fn py_repr(&self) -> String {
-        format!("OrderStatus.{}", self.inner)
-    }
+#[pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.rithmic")]
+#[pyclass(
+    name = "ConnectionState",
+    module = "nautilus_trader.adapters.rithmic",
+    frozen,
+    eq,
+    eq_int,
+    from_py_object,
+    rename_all = "SCREAMING_SNAKE_CASE"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum PyConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Reconnecting,
+    Error,
 }
 
-#[cfg(feature = "python")]
-#[pyclass(name = "ConnectionState", skip_from_py_object)]
-#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.rithmic")]
-#[derive(Clone)]
-pub(crate) struct PyConnectionState {
-    inner: ConnectionState,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-#[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl PyConnectionState {
-    #[classattr]
-    const DISCONNECTED: Self = Self {
-        inner: ConnectionState::Disconnected,
-    };
-
-    #[classattr]
-    const CONNECTING: Self = Self {
-        inner: ConnectionState::Connecting,
-    };
-
-    #[classattr]
-    const CONNECTED: Self = Self {
-        inner: ConnectionState::Connected,
-    };
-
-    #[classattr]
-    const RECONNECTING: Self = Self {
-        inner: ConnectionState::Reconnecting,
-    };
-
-    #[classattr]
-    const ERROR: Self = Self {
-        inner: ConnectionState::Error,
-    };
-
-    #[pyo3(name = "__repr__")]
-    fn py_repr(&self) -> String {
-        format!("ConnectionState.{:?}", self.inner)
+impl From<ConnectionState> for PyConnectionState {
+    fn from(value: ConnectionState) -> Self {
+        match value {
+            ConnectionState::Disconnected => Self::Disconnected,
+            ConnectionState::Connecting => Self::Connecting,
+            ConnectionState::Connected => Self::Connected,
+            ConnectionState::Reconnecting => Self::Reconnecting,
+            ConnectionState::Error => Self::Error,
+        }
     }
 }
 

@@ -24,103 +24,111 @@
 )]
 
 use nautilus_core::python::to_pyvalue_err;
-use nautilus_model::identifiers::TraderId;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 use crate::config::{
-    RithmicDataClientConfig, RithmicEnv, RithmicExecClientConfig, load_rithmic_env_file,
+    RithmicDataClientConfig, RithmicEnv, RithmicExecClientConfig, adapter_account_id,
+    configured_env_profiles, data_client_id, exec_client_id, load_rithmic_env_file,
+    normalize_rithmic_client_component, parse_rithmic_env, parse_rithmic_trader_id,
 };
 
-/// Python wrapper for RithmicEnv.
+/// Rithmic trading environment exposed to Python.
 #[cfg(feature = "python")]
+#[pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.rithmic")]
 #[pyclass(
     name = "RithmicEnv",
     module = "nautilus_trader.adapters.rithmic",
-    from_py_object
+    frozen,
+    eq,
+    eq_int,
+    from_py_object,
+    rename_all = "SCREAMING_SNAKE_CASE"
 )]
-#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.rithmic")]
-#[derive(Clone)]
-pub(crate) struct PyRithmicEnv {
-    inner: RithmicEnv,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-#[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl PyRithmicEnv {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PyRithmicEnv {
     /// Demo/paper trading environment.
-    #[classattr]
-    const DEMO: Self = Self {
-        inner: RithmicEnv::Demo,
-    };
-
+    Demo,
     /// Live trading environment.
-    #[classattr]
-    const LIVE: Self = Self {
-        inner: RithmicEnv::Live,
-    };
-
+    Live,
     /// Test environment.
-    #[classattr]
-    const TEST: Self = Self {
-        inner: RithmicEnv::Test,
-    };
-
-    #[pyo3(name = "__repr__")]
-    fn py_repr(&self) -> String {
-        format!("RithmicEnv.{}", self.inner.to_string().to_uppercase())
-    }
+    Test,
 }
 
 #[cfg(feature = "python")]
 impl From<PyRithmicEnv> for RithmicEnv {
     fn from(py_env: PyRithmicEnv) -> Self {
-        py_env.inner
+        match py_env {
+            PyRithmicEnv::Demo => Self::Demo,
+            PyRithmicEnv::Live => Self::Live,
+            PyRithmicEnv::Test => Self::Test,
+        }
     }
 }
 
-/// Deprecated: Use [`PyRithmicEnv`] instead.
-///
-/// This class is provided for backwards compatibility and will be removed
-/// in a future major version.
 #[cfg(feature = "python")]
-#[pyclass(name = "RithmicEnvironment", skip_from_py_object)]
-#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.rithmic")]
-#[derive(Clone)]
-pub(crate) struct PyRithmicEnvironment {
-    inner: RithmicEnv,
+impl From<RithmicEnv> for PyRithmicEnv {
+    fn from(environment: RithmicEnv) -> Self {
+        match environment {
+            RithmicEnv::Demo => Self::Demo,
+            RithmicEnv::Live => Self::Live,
+            RithmicEnv::Test => Self::Test,
+        }
+    }
 }
 
 #[cfg(feature = "python")]
-#[pymethods]
-#[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl PyRithmicEnvironment {
-    /// Demo/paper trading environment.
-    #[classattr]
-    const DEMO: Self = Self {
-        inner: RithmicEnv::Demo,
-    };
+#[pyfunction(name = "normalize_rithmic_client_component")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.rithmic")]
+fn py_normalize_rithmic_client_component(value: &str) -> PyResult<String> {
+    normalize_rithmic_client_component(value).map_err(|e| to_pyvalue_err(e.to_string()))
+}
 
-    /// Live trading environment.
-    #[classattr]
-    const LIVE: Self = Self {
-        inner: RithmicEnv::Live,
-    };
+#[cfg(feature = "python")]
+#[pyfunction(name = "get_rithmic_data_client_id")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.rithmic")]
+fn py_get_rithmic_data_client_id(system_name: &str) -> PyResult<String> {
+    data_client_id(system_name)
+        .map(|value| value.to_string())
+        .map_err(|e| to_pyvalue_err(e.to_string()))
+}
 
-    /// Test environment.
-    #[classattr]
-    const TEST: Self = Self {
-        inner: RithmicEnv::Test,
-    };
+#[cfg(feature = "python")]
+#[pyfunction(name = "get_rithmic_exec_client_id")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.rithmic")]
+fn py_get_rithmic_exec_client_id(system_name: &str, account_id: &str) -> PyResult<String> {
+    exec_client_id(system_name, account_id)
+        .map(|value| value.to_string())
+        .map_err(|e| to_pyvalue_err(e.to_string()))
+}
 
-    #[pyo3(name = "__repr__")]
-    fn py_repr(&self) -> String {
-        format!(
-            "RithmicEnvironment.{} (deprecated, use RithmicEnv)",
-            self.inner.to_string().to_uppercase()
-        )
-    }
+#[cfg(feature = "python")]
+#[pyfunction(name = "get_rithmic_adapter_account_id")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.rithmic")]
+fn py_get_rithmic_adapter_account_id(system_name: &str, account_id: &str) -> PyResult<String> {
+    let client_id =
+        exec_client_id(system_name, account_id).map_err(|e| to_pyvalue_err(e.to_string()))?;
+    adapter_account_id(client_id, account_id)
+        .map(|value| value.to_string())
+        .map_err(|e| to_pyvalue_err(e.to_string()))
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "get_rithmic_profiles_from_env")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.rithmic")]
+fn py_get_rithmic_profiles_from_env() -> PyResult<Vec<String>> {
+    configured_env_profiles().map_err(|e| to_pyvalue_err(e.to_string()))
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "parse_rithmic_env")]
+#[pyo3(signature = (value=None))]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.rithmic")]
+fn py_parse_rithmic_env(value: Option<&str>) -> PyResult<PyRithmicEnv> {
+    value
+        .map_or(Ok(RithmicEnv::Demo), parse_rithmic_env)
+        .map(Into::into)
+        .map_err(|e| to_pyvalue_err(e.to_string()))
 }
 
 /// Python wrapper for RithmicDataClientConfig.
@@ -138,44 +146,52 @@ pub(crate) struct PyRithmicDataClientConfig {
 impl PyRithmicDataClientConfig {
     /// Creates a new data client configuration.
     #[new]
-    #[pyo3(signature = (environment, username, password, system_name, app_name="", app_version="1.0", fcm_id=None, ib_id=None, server=None, alt_server=None, enable_history=false))]
+    #[pyo3(signature = (environment, username, password, system_name, app_name, app_version=None, fcm_id=None, ib_id=None, server=None, alt_server=None, enable_history=false))]
     fn py_new(
         environment: PyRithmicEnv,
         username: String,
         password: String,
         system_name: String,
         app_name: &str,
-        app_version: &str,
+        app_version: Option<String>,
         fcm_id: Option<String>,
         ib_id: Option<String>,
         server: Option<String>,
         alt_server: Option<String>,
         enable_history: bool,
-    ) -> Self {
-        Self {
-            inner: RithmicDataClientConfig {
-                environment: environment.inner,
-                username,
-                password,
-                system_name,
-                app_name: app_name.to_string(),
-                app_version: app_version.to_string(),
-                fcm_id,
-                ib_id,
-                server,
-                alt_server,
-                enable_history,
-            },
+    ) -> PyResult<Self> {
+        let mut inner = RithmicDataClientConfig::new(
+            environment.into(),
+            username,
+            password,
+            system_name,
+            app_name,
+        )
+        .map_err(|e| to_pyvalue_err(e.to_string()))?;
+        if let Some(app_version) = app_version {
+            inner.app_version = app_version;
         }
+        inner.fcm_id = fcm_id;
+        inner.ib_id = ib_id;
+        inner.server = server;
+        inner.alt_server = alt_server;
+        inner.enable_history = enable_history;
+        inner
+            .validate()
+            .map_err(|e| to_pyvalue_err(e.to_string()))?;
+        Ok(Self { inner })
     }
 
     /// Creates configuration from environment variables.
     #[staticmethod]
-    #[pyo3(signature = (profile=None))]
+    #[pyo3(signature = (profile=None, enable_history=None))]
     #[pyo3(name = "from_env")]
-    fn py_from_env(profile: Option<String>) -> PyResult<Self> {
-        let config = RithmicDataClientConfig::from_env_with_profile(profile.as_deref())
+    fn py_from_env(profile: Option<String>, enable_history: Option<bool>) -> PyResult<Self> {
+        let mut config = RithmicDataClientConfig::from_env_with_profile(profile.as_deref())
             .map_err(|e| to_pyvalue_err(e.to_string()))?;
+        if let Some(enable_history) = enable_history {
+            config.enable_history = enable_history;
+        }
         Ok(Self { inner: config })
     }
 
@@ -201,9 +217,7 @@ impl PyRithmicDataClientConfig {
 
     #[getter(environment)]
     fn py_environment(&self) -> PyRithmicEnv {
-        PyRithmicEnv {
-            inner: self.inner.environment,
-        }
+        self.inner.environment.into()
     }
 
     #[getter(system_name)]
@@ -279,9 +293,9 @@ impl PyRithmicExecClientConfig {
         password,
         system_name,
         account_id,
-        trader_id="TRADER-001",
-        app_name="",
-        app_version="1.0",
+        app_name,
+        trader_id=None,
+        app_version=None,
         fcm_id=None,
         ib_id=None,
         server=None,
@@ -294,41 +308,58 @@ impl PyRithmicExecClientConfig {
         password: String,
         system_name: String,
         account_id: String,
-        trader_id: &str,
         app_name: &str,
-        app_version: &str,
+        trader_id: Option<String>,
+        app_version: Option<String>,
         fcm_id: Option<String>,
         ib_id: Option<String>,
         server: Option<String>,
         alt_server: Option<String>,
         execution_replay_lookback_secs: u64,
-    ) -> Self {
-        Self {
-            inner: RithmicExecClientConfig {
-                trader_id: TraderId::from(trader_id),
-                environment: environment.inner,
-                username,
-                password,
-                system_name,
-                app_name: app_name.to_string(),
-                app_version: app_version.to_string(),
-                fcm_id,
-                ib_id,
-                account_id,
-                server,
-                alt_server,
-                execution_replay_lookback_secs,
-            },
+    ) -> PyResult<Self> {
+        let trader_id = trader_id.map_or_else(
+            || Ok(Default::default()),
+            |value| parse_rithmic_trader_id(&value).map_err(|e| to_pyvalue_err(e.to_string())),
+        )?;
+        let mut inner = RithmicExecClientConfig::new(
+            trader_id,
+            environment.into(),
+            username,
+            password,
+            system_name,
+            account_id,
+            app_name,
+        )
+        .map_err(|e| to_pyvalue_err(e.to_string()))?;
+        if let Some(app_version) = app_version {
+            inner.app_version = app_version;
         }
+        inner.fcm_id = fcm_id;
+        inner.ib_id = ib_id;
+        inner.server = server;
+        inner.alt_server = alt_server;
+        inner.execution_replay_lookback_secs = execution_replay_lookback_secs;
+        inner
+            .validate()
+            .map_err(|e| to_pyvalue_err(e.to_string()))?;
+        Ok(Self { inner })
     }
 
     /// Creates configuration from environment variables.
     #[staticmethod]
-    #[pyo3(signature = (profile=None))]
+    #[pyo3(signature = (profile=None, account_id=None, trader_id=None))]
     #[pyo3(name = "from_env")]
-    fn py_from_env(profile: Option<String>) -> PyResult<Self> {
-        let config = RithmicExecClientConfig::from_env_with_profile(profile.as_deref())
-            .map_err(|e| to_pyvalue_err(e.to_string()))?;
+    fn py_from_env(
+        profile: Option<String>,
+        account_id: Option<String>,
+        trader_id: Option<String>,
+    ) -> PyResult<Self> {
+        let config = RithmicExecClientConfig::from_env_with_profile_and_overrides(
+            profile.as_deref(),
+            account_id.as_deref(),
+            trader_id.as_deref(),
+        )
+        .map_err(|e| to_pyvalue_err(e.to_string()))?;
         Ok(Self { inner: config })
     }
 
@@ -354,9 +385,7 @@ impl PyRithmicExecClientConfig {
 
     #[getter(environment)]
     fn py_environment(&self) -> PyRithmicEnv {
-        PyRithmicEnv {
-            inner: self.inner.environment,
-        }
+        self.inner.environment.into()
     }
 
     #[getter(account_id)]
@@ -426,8 +455,15 @@ impl PyRithmicExecClientConfig {
 #[cfg(feature = "python")]
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRithmicEnv>()?;
-    m.add_class::<PyRithmicEnvironment>()?; // Deprecated alias
+    // Backwards-compatible alias. Keeping one class preserves equality and constructor extraction.
+    m.add("RithmicEnvironment", m.getattr("RithmicEnv")?)?;
     m.add_class::<PyRithmicDataClientConfig>()?;
     m.add_class::<PyRithmicExecClientConfig>()?;
+    m.add_function(wrap_pyfunction!(py_normalize_rithmic_client_component, m)?)?;
+    m.add_function(wrap_pyfunction!(py_get_rithmic_data_client_id, m)?)?;
+    m.add_function(wrap_pyfunction!(py_get_rithmic_exec_client_id, m)?)?;
+    m.add_function(wrap_pyfunction!(py_get_rithmic_adapter_account_id, m)?)?;
+    m.add_function(wrap_pyfunction!(py_get_rithmic_profiles_from_env, m)?)?;
+    m.add_function(wrap_pyfunction!(py_parse_rithmic_env, m)?)?;
     Ok(())
 }

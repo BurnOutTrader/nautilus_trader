@@ -243,6 +243,19 @@ async fn subscribe_bars_connected_path_emits_live_bar_updates() {
     let server = crate::common::MockHistoryPlant::start().await;
     let config = crate::common::test_history_only_gateway_config(&server.url);
     let mut gateway = rithmic_nt::RithmicGateway::new(config);
+    gateway.instruments().write().await.insert(
+        "CME:ESM6".to_string(),
+        rithmic_nt::InstrumentInfo {
+            symbol: "ESM6".to_string(),
+            exchange: "CME".to_string(),
+            tick_size: Some(0.25),
+            point_value: Some(50.0),
+            product_code: Some("ES".to_string()),
+            description: Some("E-mini S&P 500".to_string()),
+            currency: Some("USD".to_string()),
+            is_tradeable: true,
+        },
+    );
     let mut rx = gateway.subscribe_market_data_events();
 
     gateway.connect().await.unwrap();

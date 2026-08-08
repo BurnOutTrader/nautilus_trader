@@ -51,11 +51,12 @@ pub(crate) fn test_gateway_config() -> GatewayConfig {
         "user",
         "pass",
         "system",
+        "TestApp",
         "fcm",
         "ib",
         "account",
     )
-    .with_app_name("TestApp")
+    .unwrap()
     .with_history(true)
 }
 
@@ -77,11 +78,12 @@ fn base_test_gateway_config(url: &str) -> GatewayConfig {
         "user",
         "pass",
         "system",
+        "TestApp",
         "fcm",
         "ib",
         "account",
     )
-    .with_app_name("TestApp")
+    .unwrap()
     .with_url_override(url)
 }
 

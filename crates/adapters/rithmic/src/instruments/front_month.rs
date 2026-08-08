@@ -44,9 +44,9 @@ struct FrontMonthCandidate {
     expiration_ns: u64,
 }
 
-fn is_retriable_front_month_error(error: &RsRithmicError) -> bool {
+fn is_retriable_front_month_error(e: &RsRithmicError) -> bool {
     matches!(
-        error,
+        e,
         RsRithmicError::ConnectionClosed
             | RsRithmicError::SendFailed
             | RsRithmicError::ConnectionFailed(_)
@@ -164,9 +164,7 @@ fn front_month_candidate_from_underlying_response(
 }
 
 fn select_front_month_candidate(candidates: &[FrontMonthCandidate]) -> Option<FrontMonthCandidate> {
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos() as u64);
+    let now_ns = crate::common::converters::now_unix_nanos().as_u64();
 
     candidates
         .iter()
@@ -363,7 +361,7 @@ pub(crate) async fn fetch_instrument_with_handle(
                 if let RithmicMessage::ResponseAuxilliaryReferenceData(aux_data) =
                     &aux_response.message
                 {
-                    apply_auxiliary_reference_data(&mut instrument, aux_data);
+                    apply_auxiliary_reference_data(&mut instrument, aux_data)?;
                 }
             } else if let Some(e) = aux_response.error {
                 tracing::debug!(
@@ -440,7 +438,7 @@ pub(crate) async fn load_supported_front_months_with_handle(
 mod tests {
     use nautilus_model::{
         enums::AssetClass,
-        identifiers::{InstrumentId, Symbol},
+        identifiers::Symbol,
         instruments::{FuturesContract, Instrument},
         types::{Currency, Price, Quantity},
     };
@@ -457,7 +455,7 @@ mod tests {
         );
 
         InstrumentAny::FuturesContract(FuturesContract::new(
-            InstrumentId::from(format!("{symbol}.RITHMIC")),
+            crate::common::converters::rithmic_instrument_id(symbol, exchange).unwrap(),
             Symbol::new(symbol),
             AssetClass::Index,
             Some(Ustr::from(exchange)),
@@ -530,14 +528,13 @@ mod tests {
             "ES: connection closed".to_string(),
             "NQ: connection closed".to_string(),
         ];
-        let error = finalize_supported_front_months("CME", &["ES", "NQ"], Vec::new(), &errors)
+        let e = finalize_supported_front_months("CME", &["ES", "NQ"], Vec::new(), &errors)
             .expect_err("all failures should bubble up");
 
         assert!(
-            error
-                .to_string()
+            e.to_string()
                 .contains("Failed to load any supported front months on CME")
         );
-        assert!(error.to_string().contains("ES: connection closed"));
+        assert!(e.to_string().contains("ES: connection closed"));
     }
 }

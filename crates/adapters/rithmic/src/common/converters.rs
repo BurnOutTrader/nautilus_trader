@@ -31,14 +31,43 @@ pub fn now_unix_nanos() -> UnixNanos {
     UnixNanos::from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos() as u64),
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+            }),
     )
 }
 
-/// Builds a Rithmic `InstrumentId` from a venue symbol.
-#[must_use]
-pub fn rithmic_instrument_id(symbol: &str) -> InstrumentId {
-    InstrumentId::new(Symbol::new(symbol), *RITHMIC_VENUE_ID)
+/// Builds a Rithmic `InstrumentId` from a venue symbol and exchange.
+///
+/// Rithmic symbols are not globally unique: the same symbol can be listed by
+/// more than one exchange. Encoding the exchange into the Nautilus symbol
+/// component makes the mapping reversible while retaining `RITHMIC` as the
+/// venue (`{symbol}.{exchange}.RITHMIC`).
+pub fn rithmic_instrument_id(symbol: &str, exchange: &str) -> Result<InstrumentId> {
+    let symbol = symbol.trim();
+    let exchange = exchange.trim();
+    if symbol.is_empty() || exchange.is_empty() {
+        return Err(RithmicError::Instrument(
+            "Rithmic instrument symbol and exchange must be non-empty".to_string(),
+        ));
+    }
+    if symbol.contains('.') || exchange.contains('.') {
+        return Err(RithmicError::Instrument(format!(
+            "Rithmic instrument components cannot contain '.': symbol={symbol:?}, exchange={exchange:?}"
+        )));
+    }
+
+    let canonical = format!(
+        "{}.{}",
+        symbol.to_ascii_uppercase(),
+        exchange.to_ascii_uppercase()
+    );
+    let symbol = Symbol::new_checked(&canonical).map_err(|e| {
+        RithmicError::Instrument(format!(
+            "Invalid Rithmic instrument identity {canonical:?}: {e}"
+        ))
+    })?;
+    Ok(InstrumentId::new(symbol, *RITHMIC_VENUE_ID))
 }
 
 fn clean_input(value: &str) -> String {
@@ -47,7 +76,13 @@ fn clean_input(value: &str) -> String {
 
 fn reference_year_two_digit() -> u16 {
     let year = Utc::now().year().rem_euclid(100);
-    u16::try_from(year).expect("UTC year modulo 100 should fit in u16")
+    match u16::try_from(year) {
+        Ok(year) => year,
+        Err(e) => {
+            log::error!("Failed to convert current UTC year to two digits: {e}");
+            0
+        }
+    }
 }
 
 fn extract_year(value: &str, context: &str) -> Result<(u16, usize)> {
@@ -102,22 +137,23 @@ fn resolve_year_two_digit(year: u16, digits: usize, reference_year: u16) -> u16 
 }
 
 fn parse_contract_symbol_parts(symbol: &str) -> Result<(String, char, u16, usize)> {
+    if !symbol.trim().is_ascii() {
+        return Err(RithmicError::Parse(format!(
+            "Symbol must contain only ASCII characters: {symbol}"
+        )));
+    }
     let upper = clean_input(symbol);
 
     if upper.is_empty() {
         return Err(RithmicError::Parse("symbol cannot be empty".to_string()));
     }
 
-    let cleaned: String = upper
-        .chars()
-        .filter(|c| matches!(c, 'A'..='Z' | '0'..='9'))
-        .collect();
-
-    if cleaned.is_empty() {
+    if !upper.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err(RithmicError::Parse(format!(
-            "Symbol '{symbol}' did not contain alphanumeric characters"
+            "Symbol '{symbol}' contains unsupported characters"
         )));
     }
+    let cleaned = upper;
 
     let trailing_digit_count = cleaned
         .chars()
@@ -132,9 +168,13 @@ fn parse_contract_symbol_parts(symbol: &str) -> Result<(String, char, u16, usize
     }
 
     if trailing_digit_count > 2 {
+        let invalid_year = cleaned
+            .len()
+            .checked_sub(trailing_digit_count)
+            .and_then(|start| cleaned.get(start..))
+            .unwrap_or("<invalid>");
         return Err(RithmicError::Parse(format!(
-            "Invalid year '{}' in symbol '{symbol}'",
-            &cleaned[cleaned.len() - trailing_digit_count..]
+            "Invalid year '{invalid_year}' in symbol '{symbol}'"
         )));
     }
 
@@ -143,7 +183,9 @@ fn parse_contract_symbol_parts(symbol: &str) -> Result<(String, char, u16, usize
         .checked_sub(trailing_digit_count + 1)
         .ok_or_else(|| RithmicError::Parse(format!("Unable to locate month code in '{symbol}'")))?;
 
-    let root = &cleaned[..month_idx];
+    let root = cleaned.get(..month_idx).ok_or_else(|| {
+        RithmicError::Parse(format!("Unable to locate product root in '{symbol}'"))
+    })?;
     if root.is_empty() {
         return Err(RithmicError::Parse(format!(
             "Symbol '{symbol}' is missing product root"
@@ -151,9 +193,11 @@ fn parse_contract_symbol_parts(symbol: &str) -> Result<(String, char, u16, usize
     }
 
     let month = cleaned
-        .chars()
-        .nth(month_idx)
-        .expect("month index should be in bounds");
+        .as_bytes()
+        .get(month_idx)
+        .copied()
+        .map(char::from)
+        .ok_or_else(|| RithmicError::Parse(format!("Unable to locate month code in '{symbol}'")))?;
 
     if !VALID_MONTH_CODES.contains(&month) {
         return Err(RithmicError::Parse(format!(
@@ -161,7 +205,13 @@ fn parse_contract_symbol_parts(symbol: &str) -> Result<(String, char, u16, usize
         )));
     }
 
-    let (year_two, year_digits) = extract_year(&cleaned[month_idx + 1..], symbol)?;
+    let year = month_idx
+        .checked_add(1)
+        .and_then(|start| cleaned.get(start..))
+        .ok_or_else(|| {
+            RithmicError::Parse(format!("Unable to locate year designator in '{symbol}'"))
+        })?;
+    let (year_two, year_digits) = extract_year(year, symbol)?;
     Ok((root.to_string(), month, year_two, year_digits))
 }
 
@@ -169,6 +219,11 @@ fn parse_projectx_symbol_with_year(
     symbol: &str,
     reference_year: u16,
 ) -> Result<(String, char, u16)> {
+    if !symbol.trim().is_ascii() {
+        return Err(RithmicError::Parse(format!(
+            "ProjectX symbol must contain only ASCII characters: {symbol}"
+        )));
+    }
     let upper = clean_input(symbol);
     if upper.is_empty() {
         return Err(RithmicError::Parse(
@@ -228,20 +283,41 @@ fn format_rithmic_symbol(root: &str, month: char, year_two_digit: u16) -> String
 /// Returns [`RithmicError::Parse`] if the symbol is too short or the last two
 /// characters are not a valid expiry code (month letter + digit).
 pub fn parse_symbol(symbol: &str) -> Result<(&str, &str)> {
-    if symbol.len() < 3 {
+    if !symbol.is_ascii() {
+        return Err(RithmicError::Parse(format!(
+            "Symbol must contain only ASCII characters: {symbol}"
+        )));
+    }
+    if !symbol.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(RithmicError::Parse(format!(
+            "Symbol '{symbol}' contains unsupported characters"
+        )));
+    }
+
+    let mut chars = symbol.char_indices().rev();
+    let Some((_, year_char)) = chars.next() else {
+        return Err(RithmicError::Parse(format!("Invalid symbol: {symbol}")));
+    };
+    let Some((split_idx, month_char)) = chars.next() else {
+        return Err(RithmicError::Parse(format!("Invalid symbol: {symbol}")));
+    };
+    if split_idx == 0 {
         return Err(RithmicError::Parse(format!("Invalid symbol: {symbol}")));
     }
-    let split_idx = symbol.len() - 2;
-    let expiry = &symbol[split_idx..];
-    let month_char = expiry.chars().next().unwrap().to_ascii_uppercase();
-    let year_char = expiry.chars().nth(1).unwrap();
+    let month_char = month_char.to_ascii_uppercase();
 
     if !VALID_MONTH_CODES.contains(&month_char) || !year_char.is_ascii_digit() {
         return Err(RithmicError::Parse(format!(
             "Invalid expiry in symbol: {symbol}"
         )));
     }
-    Ok((&symbol[..split_idx], expiry))
+    let product = symbol.get(..split_idx).ok_or_else(|| {
+        RithmicError::Parse(format!("Invalid product component in symbol: {symbol}"))
+    })?;
+    let expiry = symbol.get(split_idx..).ok_or_else(|| {
+        RithmicError::Parse(format!("Invalid expiry component in symbol: {symbol}"))
+    })?;
+    Ok((product, expiry))
 }
 
 /// Converts futures month code to month number (F=1, G=2, ..., Z=12).
@@ -320,6 +396,17 @@ mod tests {
     }
 
     #[rstest::rstest]
+    fn test_checked_rithmic_instrument_identity() {
+        assert_eq!(
+            rithmic_instrument_id("mnqm6", "cme").unwrap(),
+            InstrumentId::from("MNQM6.CME.RITHMIC")
+        );
+        assert!(rithmic_instrument_id("", "CME").is_err());
+        assert!(rithmic_instrument_id("MNQM6", "").is_err());
+        assert!(rithmic_instrument_id("MNQM6.CME", "CME").is_err());
+    }
+
+    #[rstest::rstest]
     fn test_parse_symbol_rejects_invalid_expiry() {
         // Non-month-code letter
         assert!(parse_symbol("ESA4").is_err());
@@ -331,6 +418,23 @@ mod tests {
         assert!(parse_symbol("ESZ4").is_ok());
         assert!(parse_symbol("ESH5").is_ok());
         assert!(parse_symbol("MESM4").is_ok());
+    }
+
+    #[rstest::rstest]
+    fn test_symbol_parsers_reject_unexpected_ascii_punctuation() {
+        assert!(parse_symbol("$ES-Z4!").is_err());
+        assert!(databento_to_rithmic_symbol("$ES-Z4!").is_err());
+        assert!(rithmic_to_databento_symbol("$ES-Z4!").is_err());
+    }
+
+    #[rstest::rstest]
+    #[case("ES💥")]
+    #[case("ESZ４")]
+    #[case("ÉSZ4")]
+    fn test_parse_symbol_rejects_unicode_without_panicking(#[case] symbol: &str) {
+        assert!(parse_symbol(symbol).is_err());
+        assert!(databento_to_rithmic_symbol(symbol).is_err());
+        assert!(projectx_to_rithmic_symbol(symbol).is_err());
     }
 
     #[rstest::rstest]

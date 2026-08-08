@@ -28,12 +28,12 @@
 use nautilus_common::enums::Environment;
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
-    identifiers::{ClientId, InstrumentId, TraderId},
+    identifiers::{InstrumentId, TraderId},
     types::Quantity,
 };
 use nautilus_testkit::testers::{ExecTester, ExecTesterConfig};
 use rithmic_nt::{
-    config::{RithmicDataClientConfig, RithmicExecClientConfig},
+    config::{RithmicDataClientConfig, RithmicExecClientConfig, data_client_id, exec_client_id},
     factories::{RithmicDataClientFactory, RithmicExecClientFactory},
 };
 
@@ -44,24 +44,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let environment = Environment::Live;
     let trader_id = TraderId::from("RITHMIC-TESTER-001");
     let node_name = "RITHMIC-EXEC-TESTER-001".to_string();
-    let client_id = ClientId::new("RITHMIC");
 
     // Adjust to a contract active at the time of testing.
-    let instrument_id = InstrumentId::from("ESM5.RITHMIC");
+    let instrument_id = InstrumentId::from("ESM5.CME.RITHMIC");
 
     // Data client for market data subscriptions (quotes needed by ExecTester).
     let data_config = RithmicDataClientConfig::from_env()?;
 
     // Execution client for order management.
     let exec_config = RithmicExecClientConfig::from_env()?;
+    let data_id = data_client_id(&data_config.system_name)?;
+    let client_id = exec_client_id(&exec_config.system_name, &exec_config.account_id)?;
 
     let data_factory = RithmicDataClientFactory::new();
     let exec_factory = RithmicExecClientFactory::new();
 
     let mut node = LiveNode::builder(trader_id, environment)?
         .with_name(node_name)
-        .add_data_client(None, Box::new(data_factory), Box::new(data_config))?
-        .add_exec_client(None, Box::new(exec_factory), Box::new(exec_config))?
+        .add_data_client(
+            Some(data_id.to_string()),
+            Box::new(data_factory),
+            Box::new(data_config),
+        )?
+        .add_exec_client(
+            Some(client_id.to_string()),
+            Box::new(exec_factory),
+            Box::new(exec_config),
+        )?
         .with_reconciliation(true)
         .with_delay_post_stop_secs(5)
         .build()?;

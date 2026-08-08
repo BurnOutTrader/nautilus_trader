@@ -93,7 +93,7 @@ macro_rules! impl_rithmic_custom_data {
 
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", frozen, from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -114,7 +114,7 @@ impl_rithmic_custom_data!(RithmicTradeStatistics, TRADE_STATISTICS_TYPE_NAME);
 
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", frozen, from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -134,7 +134,7 @@ impl_rithmic_custom_data!(RithmicQuoteStatistics, QUOTE_STATISTICS_TYPE_NAME);
 
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", frozen, from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -154,7 +154,7 @@ impl_rithmic_custom_data!(RithmicIndicatorPrices, INDICATOR_PRICES_TYPE_NAME);
 
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", frozen, from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -174,7 +174,7 @@ impl_rithmic_custom_data!(RithmicOpenInterest, OPEN_INTEREST_TYPE_NAME);
 
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", frozen, from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -199,7 +199,7 @@ impl_rithmic_custom_data!(RithmicEndOfDayPrices, END_OF_DAY_PRICES_TYPE_NAME);
 
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", frozen, from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -219,7 +219,7 @@ impl_rithmic_custom_data!(RithmicOrderPriceLimits, ORDER_PRICE_LIMITS_TYPE_NAME)
 
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", frozen, from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -238,7 +238,7 @@ impl_rithmic_custom_data!(RithmicSymbolMarginRate, SYMBOL_MARGIN_RATE_TYPE_NAME)
 
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", frozen, from_py_object)
 )]
 #[cfg_attr(
     feature = "python",

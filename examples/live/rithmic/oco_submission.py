@@ -58,18 +58,19 @@ import asyncio
 import math
 import time
 
-from nautilus_trader.adapters.rithmic import RithmicDataClient
-from nautilus_trader.adapters.rithmic import RithmicGateway
-from nautilus_trader.adapters.rithmic import load_rithmic_env_file
-from nautilus_trader.adapters.rithmic.bindings import OrderSide
-from nautilus_trader.adapters.rithmic.bindings import OrderType
-from nautilus_trader.adapters.rithmic.bindings import RithmicExecutionClient
-from nautilus_trader.adapters.rithmic.bindings import RithmicInstrumentProvider
-from nautilus_trader.adapters.rithmic.bindings import TimeInForce
-
+from nautilus_trader.adapters.rithmic import (
+    OrderSide,
+    OrderType,
+    RithmicDataClient,
+    RithmicExecutionClient,
+    RithmicGateway,
+    RithmicInstrumentProvider,
+    TimeInForce,
+    load_rithmic_env_file,
+)
 
 PROFILE = None
-INSTRUMENT_ID = "MNQM6.RITHMIC"
+INSTRUMENT_ID = "MNQM6.CME.RITHMIC"
 EXCHANGE = "CME"
 QUANTITY = 1
 SIDE = "BUY"
@@ -98,9 +99,9 @@ def round_up_to_tick(price: float, tick_size: float) -> float:
 def contract_symbol_from_instrument_id(instrument_id: str) -> str:
     parts = instrument_id.split(".")
 
-    if len(parts) != 2 or parts[1] != "RITHMIC":
+    if len(parts) != 3 or parts[2] != "RITHMIC":
         raise ValueError(
-            f"Expected a symbol.RITHMIC instrument ID, received {instrument_id}",
+            f"Expected a symbol.exchange.RITHMIC instrument ID, received {instrument_id}",
         )
     return parts[0]
 
@@ -195,7 +196,7 @@ async def wait_for_quote(data_queue: asyncio.Queue, symbol: str, exchange: str):
                 return quote
 
 
-def _buffered_matching_event(  # noqa: C901
+def _buffered_matching_event(
     pending_events: list[object],
     client_order_id: str,
     *,
@@ -244,7 +245,7 @@ def _buffered_matching_event(  # noqa: C901
     return None
 
 
-async def wait_for_execution_event(  # noqa: C901
+async def wait_for_execution_event(
     execution_queue: asyncio.Queue,
     pending_events: list[object],
     client_order_id: str,
@@ -313,7 +314,7 @@ async def wait_for_execution_event(  # noqa: C901
         pending_events.append(event)
 
 
-async def main() -> None:  # noqa: C901
+async def main() -> None:
     profile = PROFILE
     symbol = contract_symbol_from_instrument_id(INSTRUMENT_ID)
     exchange = EXCHANGE
@@ -327,7 +328,9 @@ async def main() -> None:  # noqa: C901
         raise ValueError("QUANTITY must be positive")
 
     if limit_points_from_market <= 0 or stop_points_from_market <= 0:
-        raise ValueError("LIMIT_POINTS_FROM_MARKET and STOP_POINTS_FROM_MARKET must be positive")
+        raise ValueError(
+            "LIMIT_POINTS_FROM_MARKET and STOP_POINTS_FROM_MARKET must be positive"
+        )
 
     if hold_seconds < 0:
         raise ValueError("HOLD_SECONDS cannot be negative")
@@ -478,7 +481,9 @@ async def main() -> None:  # noqa: C901
                 submitted = first_event.as_submitted()
 
                 if client_order_id == limit_client_order_id:
-                    limit_venue_order_id = submitted.venue_order_id or limit_venue_order_id
+                    limit_venue_order_id = (
+                        submitted.venue_order_id or limit_venue_order_id
+                    )
                 try:
                     accepted_event = await wait_for_execution_event(
                         execution_queue,
@@ -519,7 +524,9 @@ async def main() -> None:  # noqa: C901
                 limit_venue_order_id = tracked.get("venue_order_id")
 
         if not limit_venue_order_id:
-            raise RuntimeError("Venue did not provide a venue_order_id for the limit OCO leg")
+            raise RuntimeError(
+                "Venue did not provide a venue_order_id for the limit OCO leg"
+            )
 
         if hold_seconds > 0:
             print(f"Holding OCO pair open for {hold_seconds:.1f}s before cancel...")
@@ -545,15 +552,19 @@ async def main() -> None:  # noqa: C901
 
         print()
         print("OCO example completed successfully.")
-        print("The native OCO pair was accepted and cancelling one leg cancelled the peer leg.")
+        print(
+            "The native OCO pair was accepted and cancelling one leg cancelled the peer leg."
+        )
     finally:
         print("\nCleaning up...")
 
         if execution_client is not None and limit_venue_order_id and not terminal:
             try:
-                print(f"Best-effort cancel for OCO limit leg venue_order_id={limit_venue_order_id}")
+                print(
+                    f"Best-effort cancel for OCO limit leg venue_order_id={limit_venue_order_id}"
+                )
                 await execution_client.cancel_order(limit_venue_order_id)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 (best-effort cleanup boundary)
                 print(f"Best-effort cancel failed: {e}")
 
         if data_client is not None:
@@ -563,7 +574,7 @@ async def main() -> None:  # noqa: C901
             for symbol, exchange_name in data_subscriptions:
                 try:
                     await data_client.unsubscribe(symbol, exchange_name)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 (best-effort cleanup boundary)
                     print(f"Failed to unsubscribe {symbol}@{exchange_name}: {e}")
 
         if execution_client is not None:

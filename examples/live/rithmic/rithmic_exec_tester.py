@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # mypy: disable-error-code="arg-type,attr-defined,index"
-# ruff: noqa: E402
 # -------------------------------------------------------------------------------------------------
 #  Copyright (C) 2026 Kevin Monaghan. All rights reserved.
 #
@@ -23,38 +22,41 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from examples.live.live_node_run_helpers import interrupt_live_node_run
-from examples.live.live_node_run_helpers import sleep_or_cancel
-from examples.live.live_node_run_helpers import start_live_node_monitor
-from examples.live.live_node_run_helpers import wait_for_event_or_cancel
-
-from examples.live.rithmic.rithmic_exec_strategy import clear_exec_state
-from examples.live.rithmic.rithmic_exec_strategy import register_exec_state
-from examples.live.rithmic.rithmic_exec_strategy import snapshot_exec_state
-from examples.live.rithmic.rithmic_exec_strategy import wait_for_exec_instrument
-from examples.live.rithmic.rithmic_exec_strategy import wait_for_exec_stop
-from examples.live.rithmic.rithmic_exec_strategy import wait_for_exec_terminal
-from examples.live.rithmic.rithmic_live_node_helpers import TRADER_ID
-from examples.live.rithmic.rithmic_live_node_helpers import RithmicDataClientFactory
-from examples.live.rithmic.rithmic_live_node_helpers import RithmicExecClientFactory
-from examples.live.rithmic.rithmic_live_node_helpers import build_adapter_account_id
-from examples.live.rithmic.rithmic_live_node_helpers import build_data_client_config
-from examples.live.rithmic.rithmic_live_node_helpers import build_data_client_id
-from examples.live.rithmic.rithmic_live_node_helpers import build_exec_client_config
-from examples.live.rithmic.rithmic_live_node_helpers import build_exec_client_id
-from examples.live.rithmic.rithmic_live_node_helpers import load_rithmic_env_file
-from nautilus_trader._libnautilus.model import OrderSide
-from nautilus_trader._libnautilus.model import TimeInForce
 from nautilus_trader._libnautilus.common import Environment
+from nautilus_trader._libnautilus.model import OrderSide, TimeInForce
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import InstrumentId
 
+from examples.live.live_node_run_helpers import (
+    interrupt_live_node_run,
+    sleep_or_cancel,
+    start_live_node_monitor,
+    wait_for_event_or_cancel,
+)
+from examples.live.rithmic.rithmic_exec_strategy import (
+    clear_exec_state,
+    register_exec_state,
+    snapshot_exec_state,
+    wait_for_exec_instrument,
+    wait_for_exec_stop,
+    wait_for_exec_terminal,
+)
+from examples.live.rithmic.rithmic_live_node_helpers import (
+    TRADER_ID,
+    RithmicDataClientFactory,
+    RithmicExecClientFactory,
+    build_adapter_account_id,
+    build_data_client_config,
+    build_data_client_id,
+    build_exec_client_config,
+    build_exec_client_id,
+    load_rithmic_env_file,
+)
 
 if TYPE_CHECKING:
     from nautilus_trader.config import ImportableStrategyConfig
@@ -68,7 +70,7 @@ else:
 load_rithmic_env_file()
 
 PROFILE = None
-INSTRUMENT_ID = InstrumentId.from_str("MNQM6.RITHMIC")
+INSTRUMENT_ID = InstrumentId.from_str("MNQM6.CME.RITHMIC")
 ORDER_QTY = "1"
 ENTRY_SIDE = OrderSide.BUY
 ENTRY_TIME_IN_FORCE = TimeInForce.IOC
@@ -82,7 +84,9 @@ _STRATEGY_PATH = "examples.live.rithmic.rithmic_exec_strategy:RithmicExecStrateg
 _CONFIG_PATH = "examples.live.rithmic.rithmic_exec_strategy:RithmicExecStrategyConfig"
 
 
-def _build_node(profile: str | None, instrument_id: InstrumentId, state_key: str) -> LiveNode:
+def _build_node(
+    profile: str | None, instrument_id: InstrumentId, state_key: str
+) -> LiveNode:
     data_config = build_data_client_config(profile)
     exec_config = build_exec_client_config(profile)
     data_client_id = build_data_client_id(profile)
@@ -98,12 +102,12 @@ def _build_node(profile: str | None, instrument_id: InstrumentId, state_key: str
         .with_timeout_disconnection_secs(10)
         .with_delay_post_stop_secs(5)
         .add_data_client(
-            None,
+            data_client_id,
             RithmicDataClientFactory(),
             data_config,
         )
         .add_exec_client(
-            None,
+            exec_client_id,
             RithmicExecClientFactory(),
             exec_config,
         )
@@ -170,7 +174,7 @@ def _print_exec_summary(summary: dict[str, object]) -> None:
         print(f"Errors: {summary['errors']}")
 
 
-def run_exec_smoke(  # noqa: C901
+def run_exec_smoke(
     profile: str | None,
     instrument_id: InstrumentId,
 ) -> dict[str, object]:

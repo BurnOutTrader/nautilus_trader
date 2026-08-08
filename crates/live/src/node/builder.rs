@@ -15,7 +15,13 @@
 
 //! Builder for constructing [`LiveNode`] instances.
 
-use std::{cell::RefCell, collections::HashMap, fmt::Debug, rc::Rc, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    rc::Rc,
+    time::Duration,
+};
 
 use nautilus_common::{
     cache::CacheConfig,
@@ -637,6 +643,7 @@ impl LiveNodeBuilder {
         }
 
         let mut exec_clients = Vec::new();
+        let mut instrument_subscription_venues = HashSet::new();
 
         for (name, factory) in self.exec_client_factories {
             if let Some(config) = self.exec_client_configs.remove(&name) {
@@ -673,7 +680,9 @@ impl LiveNodeBuilder {
                         }
                     }
                 }
-                ExecutionEngine::subscribe_venue_instruments(&kernel.exec_engine, venue);
+                if instrument_subscription_venues.insert(venue) {
+                    ExecutionEngine::subscribe_venue_instruments(&kernel.exec_engine, venue);
+                }
                 exec_clients.push(client);
 
                 log::info!("Registered ExecutionClient-{client_id}");

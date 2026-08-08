@@ -18,9 +18,12 @@
 //! gateway can own the single upstream plant connections for all local clients
 //! attached to the same Rithmic login/system.
 
-use std::sync::{
-    Arc, LazyLock, Mutex, Weak,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    fmt::Debug,
+    sync::{
+        Arc, LazyLock, Mutex, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use ahash::AHashMap;
@@ -31,7 +34,7 @@ use crate::{
     gateway::{GatewayConfig, RithmicGateway},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct GatewayRegistryKey {
     environment: u8,
     username: String,
@@ -39,10 +42,47 @@ struct GatewayRegistryKey {
     system_name: String,
     app_name: String,
     app_version: String,
+    fcm_id: String,
+    ib_id: String,
     server: Option<String>,
     alt_server: Option<String>,
     url_override: Option<String>,
     beta_url_override: Option<String>,
+}
+
+impl Debug for GatewayRegistryKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let fcm_id = if self.fcm_id.is_empty() {
+            ""
+        } else {
+            "[REDACTED]"
+        };
+        let ib_id = if self.ib_id.is_empty() {
+            ""
+        } else {
+            "[REDACTED]"
+        };
+        f.debug_struct(stringify!(GatewayRegistryKey))
+            .field("environment", &self.environment)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("system_name", &self.system_name)
+            .field("app_name", &self.app_name)
+            .field("app_version", &self.app_version)
+            .field("fcm_id", &fcm_id)
+            .field("ib_id", &ib_id)
+            .field("server", &self.server)
+            .field("alt_server", &self.alt_server)
+            .field(
+                "url_override",
+                &self.url_override.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "beta_url_override",
+                &self.beta_url_override.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl GatewayRegistryKey {
@@ -54,6 +94,8 @@ impl GatewayRegistryKey {
             system_name: config.system_name.clone(),
             app_name: config.app_name.clone(),
             app_version: config.app_version.clone(),
+            fcm_id: config.fcm_id.clone(),
+            ib_id: config.ib_id.clone(),
             server: config.server.clone(),
             alt_server: config.alt_server.clone(),
             url_override: config.url_override.clone(),
@@ -81,25 +123,39 @@ impl SharedGatewayInner {
         })
     }
 
+    /// Retains this inner only while it is live. A zero count is terminal: the
+    /// last releaser owns shutdown and callers must create a fresh gateway.
+    fn try_retain(&self) -> bool {
+        self.ref_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count > 0).then(|| count.checked_add(1)).flatten()
+            })
+            .is_ok()
+    }
+
     async fn release(self: Arc<Self>) {
         if self.ref_count.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
 
-        if let Err(e) = self.gateway.write().await.disconnect().await {
-            log::warn!("Shared Rithmic gateway disconnect failed during release: {e}");
+        // Remove the terminal zero-ref entry before awaiting disconnect. This
+        // prevents an acquire from resurrecting a gateway which is shutting down.
+        {
+            let mut registry = SHARED_GATEWAYS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let remove = registry
+                .get(&self.key)
+                .and_then(Weak::upgrade)
+                .is_some_and(|current| Arc::ptr_eq(&current, &self));
+
+            if remove {
+                registry.remove(&self.key);
+            }
         }
 
-        let mut registry = SHARED_GATEWAYS
-            .lock()
-            .expect("shared gateway registry poisoned");
-        let remove = registry
-            .get(&self.key)
-            .and_then(Weak::upgrade)
-            .is_some_and(|current| Arc::ptr_eq(&current, &self));
-
-        if remove {
-            registry.remove(&self.key);
+        if let Err(e) = self.gateway.write().await.disconnect().await {
+            log::warn!("Shared Rithmic gateway disconnect failed during release: {e}");
         }
     }
 }
@@ -107,6 +163,7 @@ impl SharedGatewayInner {
 /// Reference-counted lease on a shared live gateway.
 pub(crate) struct SharedGatewayLease {
     inner: Option<Arc<SharedGatewayInner>>,
+    gateway: Arc<tokio::sync::RwLock<RithmicGateway>>,
 }
 
 impl SharedGatewayLease {
@@ -114,31 +171,39 @@ impl SharedGatewayLease {
         let key = GatewayRegistryKey::from_config(&config);
         let mut registry = SHARED_GATEWAYS
             .lock()
-            .expect("shared gateway registry poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
-            existing.ref_count.fetch_add(1, Ordering::AcqRel);
-            return Self {
-                inner: Some(existing),
-            };
+            if existing.try_retain() {
+                let gateway = Arc::clone(&existing.gateway);
+                return Self {
+                    inner: Some(existing),
+                    gateway,
+                };
+            }
+
+            registry.remove(&key);
         }
 
         let inner = SharedGatewayInner::new(config);
+        let gateway = Arc::clone(&inner.gateway);
         registry.insert(key, Arc::downgrade(&inner));
-        Self { inner: Some(inner) }
+        Self {
+            inner: Some(inner),
+            gateway,
+        }
     }
 
     pub(crate) fn gateway(&self) -> Arc<tokio::sync::RwLock<RithmicGateway>> {
-        Arc::clone(
-            &self
-                .inner
-                .as_ref()
-                .expect("shared gateway lease already released")
-                .gateway,
-        )
+        Arc::clone(&self.gateway)
     }
 
     pub(crate) async fn connect(&self, requested: &GatewayConfig) -> Result<()> {
+        if self.inner.is_none() {
+            return Err(crate::error::RithmicError::Connection(
+                "Shared gateway lease has already been released".to_string(),
+            ));
+        }
         self.gateway()
             .write()
             .await
@@ -484,12 +549,21 @@ mod tests {
     }
 
     fn data_config() -> GatewayConfig {
-        GatewayConfig::new(RithmicEnv::Demo, "user", "pass", "system", "", "", "")
-            .with_app_name("TestApp")
-            .with_ticker(true)
-            .with_order(false)
-            .with_pnl(false)
-            .with_history(false)
+        GatewayConfig::new(
+            RithmicEnv::Demo,
+            "user",
+            "pass",
+            "system",
+            "TestApp",
+            "",
+            "",
+            "",
+        )
+        .unwrap()
+        .with_ticker(true)
+        .with_order(false)
+        .with_pnl(false)
+        .with_history(false)
     }
 
     fn exec_config(account_id: &str) -> GatewayConfig {
@@ -498,11 +572,12 @@ mod tests {
             "user",
             "pass",
             "system",
+            "TestApp",
             "fcm",
             "ib",
             account_id,
         )
-        .with_app_name("TestApp")
+        .unwrap()
         .with_ticker(false)
         .with_order(true)
         .with_pnl(true)
@@ -524,6 +599,40 @@ mod tests {
         assert_eq!(key_a, key_b);
     }
 
+    #[rstest::rstest]
+    fn registry_key_separates_clearing_identities() {
+        let config = exec_config("account-1");
+        let key_a = GatewayRegistryKey::from_config(&config);
+
+        let mut different_fcm = config.clone();
+        different_fcm.fcm_id = "other-fcm".to_string();
+        assert_ne!(key_a, GatewayRegistryKey::from_config(&different_fcm));
+
+        let mut different_ib = config;
+        different_ib.ib_id = "other-ib".to_string();
+        assert_ne!(key_a, GatewayRegistryKey::from_config(&different_ib));
+    }
+
+    #[rstest::rstest]
+    fn registry_debug_redacts_password() {
+        let mut config = data_config();
+        config.password = "super-secret".to_string();
+        let key = GatewayRegistryKey::from_config(&config);
+        let output = format!("{key:?}");
+
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("super-secret"));
+    }
+
+    #[rstest::rstest]
+    fn zero_ref_gateway_cannot_be_resurrected() {
+        let inner = SharedGatewayInner::new(data_config());
+        inner.ref_count.store(0, Ordering::Release);
+
+        assert!(!inner.try_retain());
+        assert_eq!(inner.ref_count.load(Ordering::Acquire), 0);
+    }
+
     #[tokio::test]
     async fn acquire_reuses_same_gateway_for_matching_key() {
         let config = data_config();
@@ -536,6 +645,18 @@ mod tests {
         let mut lease_b = lease_b;
         lease_a.release().await;
         lease_b.release().await;
+    }
+
+    #[tokio::test]
+    async fn released_lease_rejects_reconnect_without_panicking() {
+        let config = data_config();
+        let mut lease = SharedGatewayLease::acquire(config.clone());
+        lease.release().await;
+
+        assert!(matches!(
+            lease.connect(&config).await,
+            Err(crate::error::RithmicError::Connection(_))
+        ));
     }
 
     #[tokio::test]

@@ -23,14 +23,16 @@
 //! ```rust,ignore
 //! let factory = RithmicDataClientFactory::new();
 //! let config  = RithmicDataClientConfig::from_env()?;
+//! let name    = data_client_id(&config.system_name)?.to_string();
 //! let node    = LiveNode::builder(trader_id, Environment::Live)?
-//!     .add_data_client(None, Box::new(factory), Box::new(config))?
+//!     .add_data_client(Some(name), Box::new(factory), Box::new(config))?
 //!     .build()?;
 //! ```
 
 use std::{any::Any, cell::RefCell, rc::Rc};
 
 use nautilus_common::{
+    cache::CacheView,
     clients::{DataClient, ExecutionClient},
     clock::Clock,
     factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
@@ -38,64 +40,15 @@ use nautilus_common::{
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     enums::{AccountType, OmsType},
-    identifiers::{AccountId, ClientId, Venue},
+    identifiers::{ClientId, Venue},
 };
 
 use crate::{
-    config::{RithmicDataClientConfig, RithmicExecClientConfig},
+    common::consts::RITHMIC_VENUE,
+    config::{RithmicDataClientConfig, RithmicExecClientConfig, adapter_account_id},
     data::live::RithmicLiveDataClient,
     execution::live::RithmicLiveExecClient,
 };
-
-const RITHMIC_VENUE: &str = "RITHMIC";
-
-fn normalize_rithmic_client_component(value: &str) -> anyhow::Result<String> {
-    let normalized: String = value
-        .trim()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
-
-    let collapsed = normalized
-        .split('_')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("_");
-
-    if collapsed.is_empty() {
-        anyhow::bail!("Rithmic client component cannot be empty after normalization");
-    }
-
-    if collapsed.contains('-') {
-        anyhow::bail!("Rithmic client component cannot contain '-'");
-    }
-
-    Ok(collapsed)
-}
-
-fn data_client_id(system_name: &str) -> anyhow::Result<ClientId> {
-    Ok(ClientId::from(
-        normalize_rithmic_client_component(system_name)?.as_str(),
-    ))
-}
-
-fn exec_client_id(system_name: &str, account_id: &str) -> anyhow::Result<ClientId> {
-    let system_key = normalize_rithmic_client_component(system_name)?;
-    let account_key = normalize_rithmic_client_component(account_id)?;
-    Ok(ClientId::from(
-        format!("{system_key}_{account_key}").as_str(),
-    ))
-}
-
-fn adapter_account_id(client_id: ClientId, account_id: &str) -> AccountId {
-    AccountId::from(format!("{RITHMIC_VENUE}-{client_id}-{account_id}").as_str())
-}
 
 // ---- ClientConfig marker impls ------------------------------------------------------------------
 
@@ -148,9 +101,9 @@ impl DataClientFactory for RithmicDataClientFactory {
     /// the data event sender is unavailable.
     fn create(
         &self,
-        _name: &str,
+        name: &str,
         config: &dyn ClientConfig,
-        _cache: nautilus_common::cache::CacheView,
+        _cache: CacheView,
         _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn DataClient>> {
         let rithmic_config = config
@@ -163,8 +116,10 @@ impl DataClientFactory for RithmicDataClientFactory {
                 )
             })?
             .clone();
+        rithmic_config.validate()?;
 
-        let client_id = data_client_id(&rithmic_config.system_name)?;
+        let client_id = ClientId::new_checked(name)
+            .map_err(|e| anyhow::anyhow!("Invalid Rithmic data client name '{name}': {e}"))?;
         let client = RithmicLiveDataClient::new(client_id, rithmic_config);
         Ok(Box::new(client))
     }
@@ -214,9 +169,9 @@ impl ExecutionClientFactory for RithmicExecClientFactory {
     /// Returns an error if `config` is not a [`RithmicExecClientConfig`].
     fn create(
         &self,
-        _name: &str,
+        name: &str,
         config: &dyn ClientConfig,
-        cache: nautilus_common::cache::CacheView,
+        cache: CacheView,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let rithmic_config = config
             .as_any()
@@ -228,10 +183,12 @@ impl ExecutionClientFactory for RithmicExecClientFactory {
                 )
             })?
             .clone();
+        rithmic_config.validate()?;
 
-        let client_id = exec_client_id(&rithmic_config.system_name, &rithmic_config.account_id)?;
+        let client_id = ClientId::new_checked(name)
+            .map_err(|e| anyhow::anyhow!("Invalid Rithmic execution client name '{name}': {e}"))?;
         let venue = Venue::from(RITHMIC_VENUE);
-        let account_id = adapter_account_id(client_id, &rithmic_config.account_id);
+        let account_id = adapter_account_id(client_id, &rithmic_config.account_id)?;
 
         let core = ExecutionClientCore::new(
             rithmic_config.trader_id,
@@ -262,13 +219,17 @@ impl ExecutionClientFactory for RithmicExecClientFactory {
 #[cfg(test)]
 mod tests {
     use nautilus_common::{cache::Cache, clock::TestClock};
-    use nautilus_model::identifiers::TraderId;
+    use nautilus_model::identifiers::{AccountId, TraderId};
 
     use super::*;
-    use crate::config::{RithmicDataClientConfig, RithmicEnv, RithmicExecClientConfig};
+    use crate::config::{
+        RithmicDataClientConfig, RithmicEnv, RithmicExecClientConfig,
+        normalize_rithmic_client_component,
+    };
 
     fn make_data_config() -> RithmicDataClientConfig {
-        RithmicDataClientConfig::new(RithmicEnv::Demo, "user", "pass", "TestSystem")
+        RithmicDataClientConfig::new(RithmicEnv::Demo, "user", "pass", "TestSystem", "TestApp")
+            .unwrap()
     }
 
     fn make_exec_config() -> RithmicExecClientConfig {
@@ -279,7 +240,9 @@ mod tests {
             "pass",
             "TestSystem",
             "ACC-001",
+            "TestApp",
         )
+        .unwrap()
     }
 
     #[rstest::rstest]
@@ -340,6 +303,24 @@ mod tests {
     }
 
     #[rstest::rstest]
+    fn test_factories_reject_unvalidated_deserialized_defaults() {
+        let data_result = RithmicDataClientFactory::new().create(
+            "RITHMIC",
+            &RithmicDataClientConfig::default(),
+            Rc::new(RefCell::new(Cache::default())).into(),
+            Rc::new(RefCell::new(TestClock::new())),
+        );
+        let exec_result = RithmicExecClientFactory::new().create(
+            "RITHMIC",
+            &RithmicExecClientConfig::default(),
+            Rc::new(RefCell::new(Cache::default())).into(),
+        );
+
+        assert!(data_result.is_err());
+        assert!(exec_result.is_err());
+    }
+
+    #[rstest::rstest]
     fn test_normalize_rithmic_client_component() {
         assert_eq!(normalize_rithmic_client_component("Apex").unwrap(), "APEX");
         assert_eq!(
@@ -353,12 +334,12 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn test_factory_uses_system_name_for_data_client_id() {
+    fn test_factory_uses_supplied_data_client_name() {
         let factory = RithmicDataClientFactory::new();
         let config = make_data_config();
         let client = factory
             .create(
-                "RITHMIC",
+                "TESTSYSTEM",
                 &config,
                 Rc::new(RefCell::new(Cache::default())).into(),
                 Rc::new(RefCell::new(TestClock::new())),
@@ -370,12 +351,12 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn test_factory_uses_system_name_and_account_for_exec_identity() {
+    fn test_factory_uses_supplied_exec_client_name() {
         let factory = RithmicExecClientFactory::new();
         let config = make_exec_config();
         let client = factory
             .create(
-                "RITHMIC",
+                "TESTSYSTEM_ACC_001",
                 &config,
                 Rc::new(RefCell::new(Cache::default())).into(),
             )
@@ -397,7 +378,7 @@ mod tests {
         config_a.account_id = "PA-123456".to_string();
         let client_a = factory
             .create(
-                "RITHMIC_APEX_EXEC_1",
+                "APEX_PA_123456",
                 &config_a,
                 Rc::new(RefCell::new(Cache::default())).into(),
             )
@@ -408,7 +389,7 @@ mod tests {
         config_b.account_id = "PA-654321".to_string();
         let client_b = factory
             .create(
-                "RITHMIC_APEX_EXEC_2",
+                "APEX_PA_654321",
                 &config_b,
                 Rc::new(RefCell::new(Cache::default())).into(),
             )
@@ -433,34 +414,40 @@ mod tests {
 
 #[cfg(feature = "python")]
 #[pyo3::pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl RithmicDataClientFactory {
     #[new]
     fn py_new() -> Self {
         Self::new()
     }
 
-    fn name(&self) -> &'static str {
+    #[pyo3(name = "name")]
+    fn py_name(&self) -> &'static str {
         "RITHMIC"
     }
 
-    fn __repr__(&self) -> &'static str {
+    #[pyo3(name = "__repr__")]
+    fn py_repr(&self) -> &'static str {
         "RithmicDataClientFactory()"
     }
 }
 
 #[cfg(feature = "python")]
 #[pyo3::pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl RithmicExecClientFactory {
     #[new]
     fn py_new() -> Self {
         Self::new()
     }
 
-    fn name(&self) -> &'static str {
+    #[pyo3(name = "name")]
+    fn py_name(&self) -> &'static str {
         "RITHMIC"
     }
 
-    fn __repr__(&self) -> &'static str {
+    #[pyo3(name = "__repr__")]
+    fn py_repr(&self) -> &'static str {
         "RithmicExecClientFactory()"
     }
 }

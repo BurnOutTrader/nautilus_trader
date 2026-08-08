@@ -88,16 +88,26 @@ def split_exchange_from_symbol(symbol: str) -> tuple[str, str | None]:
     Split an exchange suffix from a symbol when encoded as `SYMBOL.EXCHANGE` or
     `SYMBOL:EXCHANGE`.
     """
-    for separator in (".", ":"):
-        if separator not in symbol:
-            continue
+    normalized = symbol.strip().upper()
 
-        base, _, suffix = symbol.rpartition(separator)
+    if not normalized:
+        raise ValueError("Rithmic symbol cannot be empty")
 
-        if suffix in KNOWN_EXCHANGES:
-            return base, suffix
+    separator_count = normalized.count(".") + normalized.count(":")
 
-    return symbol, None
+    if separator_count == 0:
+        return normalized, None
+
+    if separator_count != 1:
+        raise ValueError(f"Malformed exchange-qualified Rithmic symbol {symbol!r}")
+
+    separator = "." if "." in normalized else ":"
+    base, suffix = normalized.split(separator, maxsplit=1)
+
+    if not base or suffix not in KNOWN_EXCHANGES:
+        raise ValueError(f"Malformed exchange-qualified Rithmic symbol {symbol!r}")
+
+    return base, suffix
 
 
 def normalize_rithmic_symbol(symbol: str) -> str:
@@ -131,22 +141,22 @@ def candidate_exchanges_for_symbol(
     product = supported_product_for_symbol(symbol)
 
     if product is None:
-        return ((preferred_exchange.upper(),) if preferred_exchange else ())
+        if preferred_exchange is None:
+            return ()
+        preferred_exchange = preferred_exchange.strip().upper()
+        return (preferred_exchange,) if preferred_exchange in KNOWN_EXCHANGES else ()
 
     exchanges = SUPPORTED_PRODUCT_EXCHANGE_CANDIDATES[product]
 
     if preferred_exchange is None:
         return exchanges
 
-    preferred_exchange = preferred_exchange.upper()
+    preferred_exchange = preferred_exchange.strip().upper()
 
     if preferred_exchange not in exchanges:
-        return (preferred_exchange, *exchanges)
+        return ()
 
-    return (
-        preferred_exchange,
-        *(exchange for exchange in exchanges if exchange != preferred_exchange),
-    )
+    return (preferred_exchange,)
 
 
 def resolve_exchange_hint(symbol: str, filters: dict | None = None) -> str | None:
@@ -157,12 +167,12 @@ def resolve_exchange_hint(symbol: str, filters: dict | None = None) -> str | Non
         exchange = filters.get("exchange")
 
         if exchange:
-            return exchange
+            return str(exchange).strip().upper()
 
         exchanges = filters.get("exchanges")
 
         if isinstance(exchanges, (list, tuple)) and exchanges:
-            return exchanges[0]
+            return str(exchanges[0]).strip().upper()
 
     _, exchange = split_exchange_from_symbol(symbol)
     return exchange

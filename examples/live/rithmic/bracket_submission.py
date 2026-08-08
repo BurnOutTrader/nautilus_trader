@@ -58,18 +58,19 @@ import asyncio
 import math
 import time
 
-from nautilus_trader.adapters.rithmic import RithmicDataClient
-from nautilus_trader.adapters.rithmic import RithmicGateway
-from nautilus_trader.adapters.rithmic import load_rithmic_env_file
-from nautilus_trader.adapters.rithmic.bindings import OrderSide
-from nautilus_trader.adapters.rithmic.bindings import OrderType
-from nautilus_trader.adapters.rithmic.bindings import RithmicExecutionClient
-from nautilus_trader.adapters.rithmic.bindings import RithmicInstrumentProvider
-from nautilus_trader.adapters.rithmic.bindings import TimeInForce
-
+from nautilus_trader.adapters.rithmic import (
+    OrderSide,
+    OrderType,
+    RithmicDataClient,
+    RithmicExecutionClient,
+    RithmicGateway,
+    RithmicInstrumentProvider,
+    TimeInForce,
+    load_rithmic_env_file,
+)
 
 PROFILE = None
-INSTRUMENT_ID = "MNQM6.RITHMIC"
+INSTRUMENT_ID = "MNQM6.CME.RITHMIC"
 EXCHANGE = "CME"
 QUANTITY = 1
 ENTRY_SIDE = "BUY"
@@ -99,9 +100,9 @@ def round_up_to_tick(price: float, tick_size: float) -> float:
 def contract_symbol_from_instrument_id(instrument_id: str) -> str:
     parts = instrument_id.split(".")
 
-    if len(parts) != 2 or parts[1] != "RITHMIC":
+    if len(parts) != 3 or parts[2] != "RITHMIC":
         raise ValueError(
-            f"Expected a symbol.RITHMIC instrument ID, received {instrument_id}",
+            f"Expected a symbol.exchange.RITHMIC instrument ID, received {instrument_id}",
         )
     return parts[0]
 
@@ -117,7 +118,7 @@ def parse_side(value: str) -> OrderSide:
     raise ValueError("ENTRY_SIDE must be BUY or SELL")
 
 
-def describe_execution_event(event) -> str:  # noqa: C901
+def describe_execution_event(event) -> str:
     def suffix(payload) -> str:
         bracket_type = getattr(payload, "bracket_type", None)
         original_basket_id = getattr(payload, "original_basket_id", None)
@@ -214,7 +215,7 @@ async def wait_for_quote(data_queue: asyncio.Queue, symbol: str, exchange: str):
                 return quote
 
 
-async def wait_for_execution_event(  # noqa: C901
+async def wait_for_execution_event(
     execution_queue: asyncio.Queue,
     client_order_id: str,
     label: str,
@@ -224,7 +225,9 @@ async def wait_for_execution_event(  # noqa: C901
     allow_cancelled: bool = False,
 ) -> object:
     while True:
-        event = await asyncio.wait_for(execution_queue.get(), timeout=EVENT_TIMEOUT_SECONDS)
+        event = await asyncio.wait_for(
+            execution_queue.get(), timeout=EVENT_TIMEOUT_SECONDS
+        )
         print(f"{label}: {describe_execution_event(event)}")
 
         if event.is_error():
@@ -265,7 +268,7 @@ async def wait_for_execution_event(  # noqa: C901
                 return event
 
 
-async def main() -> None:  # noqa: C901
+async def main() -> None:
     profile = PROFILE
     symbol = contract_symbol_from_instrument_id(INSTRUMENT_ID)
     exchange = EXCHANGE
@@ -298,7 +301,9 @@ async def main() -> None:  # noqa: C901
     print(f"Stop ticks: {stop_ticks}")
     print(f"Hold seconds before cancel: {hold_seconds}")
     print()
-    print("WARNING: this submits a real native bracket request to the configured account.")
+    print(
+        "WARNING: this submits a real native bracket request to the configured account."
+    )
     print()
 
     try:
@@ -426,10 +431,14 @@ async def main() -> None:  # noqa: C901
             venue_order_id = accepted.venue_order_id
 
         if not venue_order_id:
-            raise RuntimeError("Venue did not provide a venue_order_id for the bracket parent")
+            raise RuntimeError(
+                "Venue did not provide a venue_order_id for the bracket parent"
+            )
 
         if hold_seconds > 0:
-            print(f"Holding bracket parent open for {hold_seconds:.1f}s before cancel...")
+            print(
+                f"Holding bracket parent open for {hold_seconds:.1f}s before cancel..."
+            )
             await asyncio.sleep(hold_seconds)
 
         print(f"Cancelling bracket parent: venue_order_id={venue_order_id}")
@@ -452,9 +461,11 @@ async def main() -> None:  # noqa: C901
 
         if execution_client is not None and venue_order_id and not terminal:
             try:
-                print(f"Best-effort cancel for bracket parent venue_order_id={venue_order_id}")
+                print(
+                    f"Best-effort cancel for bracket parent venue_order_id={venue_order_id}"
+                )
                 await execution_client.cancel_order(venue_order_id)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 (best-effort cleanup boundary)
                 print(f"Best-effort cancel failed: {e}")
 
         if data_client is not None:
@@ -464,7 +475,7 @@ async def main() -> None:  # noqa: C901
             for symbol, exchange_name in data_subscriptions:
                 try:
                     await data_client.unsubscribe(symbol, exchange_name)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 (best-effort cleanup boundary)
                     print(f"Failed to unsubscribe {symbol}@{exchange_name}: {e}")
 
         if execution_client is not None:

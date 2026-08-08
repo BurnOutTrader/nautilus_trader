@@ -21,7 +21,7 @@
 //!
 //! The adapter follows NautilusTrader's layered architecture:
 //! - **Rust layer**: Performance-critical networking, parsing, and data transformation
-//! - **Python layer**: Integration with NautilusTrader's data and execution engines
+//! - **Python layer**: Thin PyO3 projection of the Rust configs, factories, and data types
 //!
 //! # Modules
 //!
@@ -35,12 +35,17 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use rithmic_nt::{RithmicDataClient, RithmicDataClientConfig};
+//! use rithmic_nt::RithmicDataClientConfig;
 //!
 //! let config = RithmicDataClientConfig::from_env()?;
-//! let mut client = RithmicDataClient::new(config);
-//! client.connect().await?;
+//! config.validate()?;
 //! ```
+
+#![warn(rustc::all)]
+#![deny(unsafe_code)]
+#![deny(nonstandard_style)]
+#![deny(missing_debug_implementations)]
+#![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod common;
 pub mod config;
@@ -65,6 +70,7 @@ pub use common::{
 #[allow(deprecated)]
 pub use config::{
     RithmicDataClientConfig, RithmicEnv, RithmicEnvironment, RithmicExecClientConfig,
+    adapter_account_id, data_client_id, exec_client_id, normalize_rithmic_client_component,
 };
 pub use data::{
     RithmicBarType, RithmicDataClient, RithmicEndOfDayPrices, RithmicIndicatorPrices,

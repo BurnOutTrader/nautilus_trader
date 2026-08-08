@@ -14,13 +14,17 @@
 
 //! Credential handling for Rithmic authentication.
 
-use crate::error::{Result, RithmicError};
+use std::fmt::Debug;
 
-const DEFAULT_APP_NAME: &str = "";
+use crate::{
+    config::RithmicDataClientConfig,
+    error::{Result, RithmicError},
+};
+
 const DEFAULT_APP_VERSION: &str = "1.0";
 
 /// Rithmic API credentials.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RithmicCredentials {
     /// Rithmic username.
     pub username: String,
@@ -38,22 +42,39 @@ pub struct RithmicCredentials {
     pub ib_id: Option<String>,
 }
 
+impl Debug for RithmicCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(RithmicCredentials))
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("system_name", &self.system_name)
+            .field("app_name", &self.app_name)
+            .field("app_version", &self.app_version)
+            .field("fcm_id", &self.fcm_id)
+            .field("ib_id", &self.ib_id)
+            .finish()
+    }
+}
+
 impl RithmicCredentials {
     /// Creates new credentials.
     pub fn new(
         username: impl Into<String>,
         password: impl Into<String>,
         system_name: impl Into<String>,
-    ) -> Self {
-        Self {
+        app_name: impl Into<String>,
+    ) -> Result<Self> {
+        let credentials = Self {
             username: username.into(),
             password: password.into(),
             system_name: system_name.into(),
-            app_name: DEFAULT_APP_NAME.to_string(),
+            app_name: app_name.into(),
             app_version: DEFAULT_APP_VERSION.to_string(),
             fcm_id: None,
             ib_id: None,
-        }
+        };
+        credentials.validate()?;
+        Ok(credentials)
     }
 
     /// Loads credentials from environment variables.
@@ -71,25 +92,20 @@ impl RithmicCredentials {
     /// - `RITHMIC_FCM_ID`
     /// - `RITHMIC_IB_ID`
     pub fn from_env() -> Result<Self> {
-        let username = std::env::var("RITHMIC_USERNAME")
-            .map_err(|_| RithmicError::Config("RITHMIC_USERNAME not set".to_string()))?;
+        Self::from_env_with_profile(None)
+    }
 
-        let password = std::env::var("RITHMIC_PASSWORD")
-            .map_err(|_| RithmicError::Config("RITHMIC_PASSWORD not set".to_string()))?;
-
-        let system_name = std::env::var("RITHMIC_SYSTEM_NAME")
-            .map_err(|_| RithmicError::Config("RITHMIC_SYSTEM_NAME not set".to_string()))?;
-
+    /// Loads credentials from canonical or profile-scoped environment variables.
+    pub fn from_env_with_profile(profile: Option<&str>) -> Result<Self> {
+        let config = RithmicDataClientConfig::from_env_with_profile(profile)?;
         Ok(Self {
-            username,
-            password,
-            system_name,
-            app_name: std::env::var("RITHMIC_APP_NAME")
-                .map_err(|_| RithmicError::Config("RITHMIC_APP_NAME not set".to_string()))?,
-            app_version: std::env::var("RITHMIC_APP_VERSION")
-                .unwrap_or_else(|_| DEFAULT_APP_VERSION.to_string()),
-            fcm_id: std::env::var("RITHMIC_FCM_ID").ok(),
-            ib_id: std::env::var("RITHMIC_IB_ID").ok(),
+            username: config.username,
+            password: config.password,
+            system_name: config.system_name,
+            app_name: config.app_name,
+            app_version: config.app_version,
+            fcm_id: config.fcm_id,
+            ib_id: config.ib_id,
         })
     }
 
@@ -124,14 +140,20 @@ mod tests {
 
     #[rstest::rstest]
     fn test_credentials_validation() {
-        let mut creds = RithmicCredentials::new("user", "pass", "system");
-        creds.app_name = "OwnApp".to_string();
+        let creds = RithmicCredentials::new("user", "pass", "system", "OwnApp").unwrap();
         assert!(creds.validate().is_ok());
 
-        let empty_user = RithmicCredentials::new("", "pass", "system");
-        assert!(empty_user.validate().is_err());
+        assert!(RithmicCredentials::new("", "pass", "system", "OwnApp").is_err());
+        assert!(RithmicCredentials::new("user", "pass", "system", "").is_err());
+    }
 
-        let empty_app = RithmicCredentials::new("user", "pass", "system");
-        assert!(empty_app.validate().is_err());
+    #[rstest::rstest]
+    fn test_credentials_debug_redacts_password() {
+        let credentials =
+            RithmicCredentials::new("user", "super-secret", "system", "OwnApp").unwrap();
+        let output = format!("{credentials:?}");
+
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("super-secret"));
     }
 }

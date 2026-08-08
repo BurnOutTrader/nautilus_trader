@@ -22,6 +22,7 @@ def _test_gateway() -> RithmicGateway:
         fcm_id="test_fcm",
         ib_id="test_ib",
         account_id="test_account",
+        app_name="TestApp",
     )
 
 

@@ -778,13 +778,24 @@ impl LiveNode {
                     if !result.external_orders.is_empty() {
                         let exec_engine = self.kernel.exec_engine.borrow();
                         for external in result.external_orders {
-                            exec_engine.register_external_order(
-                                external.client_order_id,
-                                external.venue_order_id,
-                                external.instrument_id,
-                                external.strategy_id,
-                                external.ts_init,
-                            );
+                            if let Some(client_id) = external.client_id {
+                                exec_engine.register_external_order_for_client(
+                                    client_id,
+                                    external.client_order_id,
+                                    external.venue_order_id,
+                                    external.instrument_id,
+                                    external.strategy_id,
+                                    external.ts_init,
+                                );
+                            } else {
+                                exec_engine.register_external_order(
+                                    external.client_order_id,
+                                    external.venue_order_id,
+                                    external.instrument_id,
+                                    external.strategy_id,
+                                    external.ts_init,
+                                );
+                            }
                         }
                     }
                 }

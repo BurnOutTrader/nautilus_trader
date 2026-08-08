@@ -14,20 +14,16 @@
 
 //! Position state provider for Rithmic.
 //!
-//! The `RithmicPositionProvider` receives position updates from the PnL plant
-//! via the `RithmicGateway`. It tracks per-instrument positions including
-//! quantity, average price, and P&L calculations.
+//! The `RithmicPositionProvider` is an explicit state container for position
+//! events routed by the owner of a gateway PnL subscription.
 
 use std::{fmt::Debug, sync::Arc};
 
-use dashmap::DashMap;
-use tokio::task::JoinHandle;
-
 use crate::{
     common::types::{ExchangeId, RithmicAccountId, RithmicSymbol, UnixNanos},
-    error::Result,
     gateway::{PnlEvent, RithmicGateway},
 };
+use dashmap::DashMap;
 
 /// Position information.
 #[derive(Debug, Clone)]
@@ -94,15 +90,13 @@ pub enum PositionEvent {
 
 /// Provides position state from Rithmic.
 ///
-/// The provider receives position updates from the gateway's PnL plant
-/// and maintains the current position state for all instruments. It tracks
-/// position lifecycle (opened, updated, closed) and emits appropriate events.
+/// Call [`Self::process_pnl_event`] with events from the owning gateway PnL
+/// subscription. The provider tracks lifecycle for its configured account.
 pub struct RithmicPositionProvider {
     gateway: Arc<RithmicGateway>,
     account_id: String,
     positions: Arc<DashMap<String, Position>>,
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<PositionEvent>>,
-    task_handle: Option<JoinHandle<()>>,
 }
 
 impl RithmicPositionProvider {
@@ -117,7 +111,6 @@ impl RithmicPositionProvider {
             account_id: account_id.into(),
             positions: Arc::new(DashMap::new()),
             event_tx: None,
-            task_handle: None,
         }
     }
 
@@ -129,31 +122,6 @@ impl RithmicPositionProvider {
     /// Returns a reference to the gateway.
     pub fn gateway(&self) -> &Arc<RithmicGateway> {
         &self.gateway
-    }
-
-    /// Starts receiving position updates from the gateway.
-    ///
-    /// This prepares the provider to process PnL events from the gateway.
-    /// Call this after the gateway is connected.
-    pub async fn start(&mut self) -> Result<()> {
-        if self.task_handle.is_some() {
-            tracing::warn!("Position provider already started");
-            return Ok(());
-        }
-
-        // Note: The gateway already subscribes to PnL updates during connect().
-        // Position updates come from the same PnL subscription as account updates.
-        tracing::debug!("Position provider started for account {}", self.account_id);
-        Ok(())
-    }
-
-    /// Stops receiving position updates.
-    pub async fn stop(&mut self) -> Result<()> {
-        if let Some(handle) = self.task_handle.take() {
-            handle.abort();
-        }
-        tracing::debug!("Position provider stopped");
-        Ok(())
     }
 
     /// Returns position for a symbol.
@@ -268,6 +236,9 @@ impl RithmicPositionProvider {
     /// This method determines whether the position was opened, updated, or closed
     /// based on the previous state and emits the appropriate event.
     pub(crate) fn update_position(&self, position: Position) {
+        if position.account_id != self.account_id {
+            return;
+        }
         let key = format!("{}:{}", position.exchange, position.symbol);
         let was_flat = self.positions.get(&key).is_none_or(|p| p.is_flat());
         let is_flat = position.is_flat();
@@ -333,10 +304,12 @@ mod tests {
             "user",
             "pass",
             "system",
+            "TestApp",
             "fcm",
             "ib",
             "ACCOUNT123",
-        );
+        )
+        .unwrap();
         Arc::new(RithmicGateway::new(config))
     }
 

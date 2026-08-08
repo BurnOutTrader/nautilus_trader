@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # mypy: disable-error-code="attr-defined"
-# ruff: noqa: E402
 # -------------------------------------------------------------------------------------------------
 #  Copyright (C) 2026 Kevin Monaghan. All rights reserved.
 #
@@ -34,31 +33,27 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from examples.live.rithmic.rithmic_live_node_helpers import TRADER_ID
-from examples.live.rithmic.rithmic_live_node_helpers import RithmicDataClientFactory
-from examples.live.rithmic.rithmic_live_node_helpers import build_data_client_config
-from examples.live.rithmic.rithmic_live_node_helpers import build_data_client_id
-from examples.live.rithmic.rithmic_live_node_helpers import load_rithmic_env_file
-from examples.live.rithmic.rithmic_live_node_helpers import resolve_instrument_id
-from examples.live.rithmic.rithmic_live_node_helpers import schedule_stop
-from nautilus_trader._libnautilus.model import BookType
-from nautilus_trader._libnautilus.model import ClientId
+from nautilus_trader._libnautilus.common import Environment, LogColor
+from nautilus_trader._libnautilus.model import BookType, ClientId, OrderBook, StrategyId
 from nautilus_trader._libnautilus.model import InstrumentId as PyInstrumentId
-from nautilus_trader._libnautilus.common import LogColor
-from nautilus_trader._libnautilus.model import OrderBook
-from nautilus_trader._libnautilus.model import StrategyId
-from nautilus_trader._libnautilus.common import Environment
-from nautilus_trader._libnautilus.trading import Strategy
-from nautilus_trader._libnautilus.trading import StrategyConfig
+from nautilus_trader._libnautilus.trading import Strategy, StrategyConfig
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import InstrumentId
 
+from examples.live.rithmic.rithmic_live_node_helpers import (
+    TRADER_ID,
+    RithmicDataClientFactory,
+    build_data_client_config,
+    build_data_client_id,
+    load_rithmic_env_file,
+    resolve_instrument_id,
+    schedule_stop,
+)
 
 if TYPE_CHECKING:
     from nautilus_trader.config import ImportableStrategyConfig
@@ -121,7 +116,7 @@ def _coerce_book_type(value: str | BookType) -> BookType:
 class RithmicOrderBookProbeStrategyConfig(StrategyConfig):
     def __new__(
         cls,
-        instrument_id: str | PyInstrumentId = "MNQM6.RITHMIC",
+        instrument_id: str | PyInstrumentId = "MNQM6.CME.RITHMIC",
         data_client_id: str | ClientId = "RITHMIC",
         strategy_id: str | StrategyId = "RITHMIC-ORDERBOOK-001",
         stream_mode: str = "book",
@@ -218,7 +213,9 @@ def main() -> None:
     if run_seconds < 0:
         raise ValueError("RUN_SECONDS cannot be negative")
 
-    instrument_id = resolve_instrument_id(profile, INSTRUMENT_ID, PRODUCT_CODE, EXCHANGE)
+    instrument_id = resolve_instrument_id(
+        profile, INSTRUMENT_ID, PRODUCT_CODE, EXCHANGE
+    )
     data_client_id = build_data_client_id(profile)
 
     node = (
@@ -228,7 +225,7 @@ def main() -> None:
         .with_timeout_disconnection_secs(10)
         .with_delay_post_stop_secs(5)
         .add_data_client(
-            None,
+            data_client_id,
             RithmicDataClientFactory(),
             build_data_client_config(profile),
         )
@@ -259,7 +256,9 @@ def main() -> None:
     print(f"Levels to print: {levels_to_print}")
 
     if STREAM_MODE.strip().lower() == "depth":
-        print("Raw depth callbacks are not exposed on PyO3 strategies; using managed book output.")
+        print(
+            "Raw depth callbacks are not exposed on PyO3 strategies; using managed book output."
+        )
     print("Press CTRL+C to stop.")
     print()
 

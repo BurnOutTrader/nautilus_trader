@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -------------------------------------------------------------------------------------------------
 #  Copyright (C) 2026 Kevin Monaghan. All rights reserved.
 #
@@ -17,19 +16,19 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import dataclass, field
 from typing import Any
 
-from nautilus_trader._libnautilus.model import Bar
-from nautilus_trader._libnautilus.model import BarType
-from nautilus_trader._libnautilus.model import BookType
-from nautilus_trader._libnautilus.model import ClientId
-from nautilus_trader._libnautilus.model import InstrumentId
-from nautilus_trader._libnautilus.model import StrategyId
-from nautilus_trader._libnautilus.model import TimeInForce
-from nautilus_trader._libnautilus.trading import Strategy
-from nautilus_trader._libnautilus.trading import StrategyConfig
+from nautilus_trader._libnautilus.model import (
+    Bar,
+    BarType,
+    BookType,
+    ClientId,
+    InstrumentId,
+    StrategyId,
+    TimeInForce,
+)
+from nautilus_trader._libnautilus.trading import Strategy, StrategyConfig
 
 
 @dataclass
@@ -247,7 +246,7 @@ def _coerce_bar_type(value: str | BarType | None) -> BarType | None:
 class RithmicDataCaptureStrategyConfig(StrategyConfig):
     def __new__(
         cls,
-        instrument_id: str | InstrumentId = "MNQM6.RITHMIC",
+        instrument_id: str | InstrumentId = "MNQM6.CME.RITHMIC",
         data_client_id: str | ClientId = "RITHMIC",
         strategy_id: str | StrategyId = "RITHMIC-DATA-CAPTURE-001",
         state_key: str = "rithmic-data-capture",
@@ -333,7 +332,9 @@ class RithmicDataCaptureStrategy(Strategy):
         if self.config.subscribe_bars and self.config.bar_type is not None:
             if self.config.request_bars:
                 end_ns = self.clock.timestamp_ns()
-                lookback_ns = int(self.config.historical_lookback_minutes) * 60 * 1_000_000_000
+                lookback_ns = (
+                    int(self.config.historical_lookback_minutes) * 60 * 1_000_000_000
+                )
                 self.request_bars(
                     bar_type=self.config.bar_type,
                     start=end_ns - lookback_ns if lookback_ns > 0 else None,

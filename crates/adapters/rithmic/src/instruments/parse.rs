@@ -339,26 +339,13 @@ pub(crate) fn search_exchange_candidates(
     product: SupportedProduct,
     preferred_exchange: &str,
 ) -> Vec<&'static str> {
-    let mut ordered = Vec::with_capacity(product.exchange_candidates.len());
-
-    if let Some(preferred) = product
+    product
         .exchange_candidates
         .iter()
         .copied()
         .find(|candidate| candidate.eq_ignore_ascii_case(preferred_exchange))
-    {
-        ordered.push(preferred);
-    }
-
-    ordered.extend(
-        product
-            .exchange_candidates
-            .iter()
-            .copied()
-            .filter(|candidate| !candidate.eq_ignore_ascii_case(preferred_exchange)),
-    );
-
-    ordered
+        .into_iter()
+        .collect()
 }
 
 pub(crate) fn supported_product_for_symbol(symbol: &str) -> Option<SupportedProduct> {
@@ -426,8 +413,8 @@ fn supported_product_for_reference(
     })
 }
 
-fn build_instrument_id(symbol: &str, _exchange: &str) -> InstrumentId {
-    InstrumentId::from(format!("{symbol}.RITHMIC"))
+fn build_instrument_id(symbol: &str, exchange: &str) -> Result<InstrumentId> {
+    crate::common::converters::rithmic_instrument_id(symbol, exchange)
 }
 
 fn build_info(exchange: &str, product_code: &str, description: &str, is_tradeable: bool) -> Params {
@@ -472,53 +459,96 @@ Only the hard-coded supported product list is available."
             ))
         })?;
 
-    let tick_size = ref_data.min_qprice_change.unwrap_or_else(|| {
-        tracing::warn!(
-            "No tick size in reference data for {}, using default 0.01",
-            symbol
-        );
-        0.01
-    });
+    let tick_size = ref_data.min_qprice_change.ok_or_else(|| {
+        RithmicError::Instrument(format!("Missing tick size in reference data for {symbol}"))
+    })?;
+    if !tick_size.is_finite() || tick_size <= 0.0 {
+        return Err(RithmicError::Instrument(format!(
+            "Invalid tick size {tick_size} in reference data for {symbol}"
+        )));
+    }
 
-    let point_value = ref_data.single_point_value.unwrap_or_else(|| {
-        tracing::warn!(
-            "No point value in reference data for {}, using default 1.0",
-            symbol
-        );
-        1.0
-    });
+    let point_value = ref_data.single_point_value.ok_or_else(|| {
+        RithmicError::Instrument(format!(
+            "Missing point value in reference data for {symbol}"
+        ))
+    })?;
+    if !point_value.is_finite() || point_value <= 0.0 {
+        return Err(RithmicError::Instrument(format!(
+            "Invalid point value {point_value} in reference data for {symbol}"
+        )));
+    }
 
-    let currency_code = ref_data
-        .currency
-        .clone()
-        .unwrap_or_else(|| "USD".to_string());
-    let currency = Currency::from_str(currency_code.as_str()).map_err(|e| {
+    let currency_code = ref_data.currency.as_deref().ok_or_else(|| {
+        RithmicError::Instrument(format!("Missing currency in reference data for {symbol}"))
+    })?;
+    let currency_code = currency_code.trim();
+    if currency_code.is_empty() {
+        return Err(RithmicError::Instrument(format!(
+            "Empty currency in reference data for {symbol}"
+        )));
+    }
+    if !currency_code.eq_ignore_ascii_case("USD") {
+        return Err(RithmicError::Instrument(format!(
+            "Unsupported settlement currency '{currency_code}' for {symbol}; the supported Rithmic catalog is USD-margined"
+        )));
+    }
+    let currency = Currency::from_str("USD").map_err(|e| {
         RithmicError::Instrument(format!(
             "Invalid currency '{currency_code}' in reference data for {symbol}: {e}"
         ))
     })?;
 
-    let price_precision = tick_size_to_precision(tick_size);
-    let price_increment = Price::new(tick_size, price_precision);
-    let multiplier = Quantity::from(point_value.to_string());
-    let lot_size = Quantity::from(1);
+    let price_precision = tick_size_to_precision(tick_size)?;
+    let price_increment = Price::new_checked(tick_size, price_precision).map_err(|e| {
+        RithmicError::Instrument(format!(
+            "Invalid tick size {tick_size} in reference data for {symbol}: {e}"
+        ))
+    })?;
+    let multiplier = point_value.to_string().parse::<Quantity>().map_err(|e| {
+        RithmicError::Instrument(format!(
+            "Invalid point value {point_value} in reference data for {symbol}: {e}"
+        ))
+    })?;
+    let lot_size = Quantity::from_mantissa_exponent_checked(1, 0, 0)
+        .map_err(|e| RithmicError::Instrument(format!("Invalid lot size for {symbol}: {e}")))?;
     let asset_class = supported_product.asset_class;
     let underlying = supported_product.code;
 
-    let expiration_ns = ref_data
-        .expiration_date
-        .as_ref()
-        .and_then(|date_str| parse_expiration_date(date_str).ok())
-        .unwrap_or(0);
+    let expiration_date = ref_data.expiration_date.as_deref().ok_or_else(|| {
+        RithmicError::Instrument(format!(
+            "Missing expiration date in reference data for {symbol}"
+        ))
+    })?;
+    let expiration_ns = parse_expiration_date(expiration_date).map_err(|e| {
+        RithmicError::Instrument(format!(
+            "Invalid expiration date '{expiration_date}' in reference data for {symbol}: {e}"
+        ))
+    })?;
 
-    let is_tradeable = ref_data
-        .is_tradable
-        .as_ref()
-        .is_none_or(|s| s.eq_ignore_ascii_case("true") || s == "1");
+    let is_tradeable = match ref_data.is_tradable.as_deref().map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("true") || value == "1" => true,
+        Some(value) if value.eq_ignore_ascii_case("false") || value == "0" => false,
+        Some(value) => {
+            return Err(RithmicError::Instrument(format!(
+                "Invalid is_tradable value '{value}' in reference data for {symbol}"
+            )));
+        }
+        None => {
+            return Err(RithmicError::Instrument(format!(
+                "Missing is_tradable value in reference data for {symbol}"
+            )));
+        }
+    };
 
-    Ok(FuturesContract::new(
-        build_instrument_id(&symbol, &exchange),
-        Symbol::new(&symbol),
+    let instrument_id = build_instrument_id(&symbol, &exchange)?;
+    let raw_symbol = Symbol::new_checked(&symbol).map_err(|e| {
+        RithmicError::Instrument(format!("Invalid Rithmic raw symbol {symbol:?}: {e}"))
+    })?;
+
+    FuturesContract::new_checked(
+        instrument_id,
+        raw_symbol,
         asset_class,
         Some(Ustr::from(exchange.as_str())),
         Ustr::from(underlying),
@@ -546,20 +576,19 @@ Only the hard-coded supported product list is available."
         )),
         ts_init,
         ts_init,
-    ))
+    )
+    .map_err(|e| RithmicError::Instrument(format!("Invalid futures contract for {symbol}: {e}")))
 }
 
 /// Applies auxiliary reference data to an already parsed instrument.
 pub fn apply_auxiliary_reference_data(
     instrument: &mut FuturesContract,
     aux_data: &ResponseAuxilliaryReferenceData,
-) {
-    instrument.activation_ns = aux_data
-        .first_trading_date
-        .as_ref()
-        .and_then(|date_str| parse_expiration_date(date_str).ok())
-        .map(UnixNanos::from)
-        .unwrap_or_default();
+) -> Result<()> {
+    if let Some(date) = aux_data.first_trading_date.as_deref() {
+        instrument.activation_ns = UnixNanos::from(parse_expiration_date(date)?);
+    }
+    Ok(())
 }
 
 /// Parses a Rithmic expiration date string to Unix timestamp (nanoseconds).
@@ -635,7 +664,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(instrument.id, InstrumentId::from("ESH5.RITHMIC"));
+        assert_eq!(instrument.id, InstrumentId::from("ESH5.CME.RITHMIC"));
         assert_eq!(instrument.raw_symbol, Symbol::new("ESH5"));
         assert_eq!(instrument.asset_class, AssetClass::Index);
         assert_eq!(instrument.exchange, Some(Ustr::from("CME")));
@@ -669,7 +698,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_response_to_instrument_defaults() {
+    fn test_response_to_instrument_rejects_incomplete_definition() {
         let ref_data = ResponseReferenceData {
             template_id: 15,
             user_msg: vec![],
@@ -700,15 +729,106 @@ mod tests {
             single_point_value: None,
         };
 
-        let instrument = response_to_instrument(&ref_data, UnixNanos::default()).unwrap();
+        assert!(response_to_instrument(&ref_data, UnixNanos::default()).is_err());
+    }
 
-        assert_eq!(instrument.id, InstrumentId::from("NQZ4.RITHMIC"));
-        assert_eq!(instrument.asset_class, AssetClass::Index);
-        assert_eq!(instrument.underlying, Ustr::from("NQ"));
-        assert_eq!(instrument.price_increment, Price::new(0.01, 2));
-        assert_eq!(instrument.multiplier, Quantity::from("1"));
-        assert_eq!(instrument.expiration_ns.as_u64(), 0);
-        assert_eq!(instrument.activation_ns.as_u64(), 0);
+    #[rstest]
+    fn test_response_to_instrument_rejects_each_missing_required_field() {
+        let complete = reference_data(Some("ES"), Some("E-mini S&P 500 Mar25"));
+        let incomplete = [
+            {
+                let mut value = complete.clone();
+                value.min_qprice_change = None;
+                value
+            },
+            {
+                let mut value = complete.clone();
+                value.single_point_value = None;
+                value
+            },
+            {
+                let mut value = complete.clone();
+                value.currency = None;
+                value
+            },
+            {
+                let mut value = complete.clone();
+                value.expiration_date = None;
+                value
+            },
+            {
+                let mut value = complete;
+                value.is_tradable = None;
+                value
+            },
+        ];
+
+        for ref_data in incomplete {
+            assert!(response_to_instrument(&ref_data, UnixNanos::default()).is_err());
+        }
+    }
+
+    #[rstest]
+    fn test_response_to_instrument_rejects_malformed_required_fields() {
+        let complete = reference_data(Some("ES"), Some("E-mini S&P 500 Mar25"));
+        let malformed = [
+            {
+                let mut value = complete.clone();
+                value.min_qprice_change = Some(f64::NAN);
+                value
+            },
+            {
+                let mut value = complete.clone();
+                value.single_point_value = Some(f64::INFINITY);
+                value
+            },
+            {
+                let mut value = complete.clone();
+                value.currency = Some("NOT-A-CURRENCY".to_string());
+                value
+            },
+            {
+                let mut value = complete.clone();
+                value.currency = Some("EUR".to_string());
+                value
+            },
+            {
+                let mut value = complete.clone();
+                value.expiration_date = Some("20241399".to_string());
+                value
+            },
+            {
+                let mut value = complete;
+                value.is_tradable = Some("yes".to_string());
+                value
+            },
+        ];
+
+        for ref_data in malformed {
+            assert!(response_to_instrument(&ref_data, UnixNanos::default()).is_err());
+        }
+    }
+
+    #[rstest]
+    #[case("true", true)]
+    #[case("false", false)]
+    #[case("1", true)]
+    #[case("0", false)]
+    fn test_response_to_instrument_accepts_documented_tradable_tokens(
+        #[case] token: &str,
+        #[case] expected: bool,
+    ) {
+        let mut ref_data = reference_data(Some("ES"), Some("E-mini S&P 500 Mar25"));
+        ref_data.is_tradable = Some(token.to_string());
+
+        let instrument = response_to_instrument(&ref_data, UnixNanos::default()).unwrap();
+        assert_eq!(
+            instrument
+                .info
+                .as_ref()
+                .and_then(|info| info.get_bool("is_tradeable")),
+            Some(expected)
+        );
     }
 
     #[rstest]
@@ -761,7 +881,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_search_exchange_candidates_prefers_requested_exchange_then_fallbacks() {
+    fn test_search_exchange_candidates_treats_requested_exchange_as_authoritative() {
         let mym = supported_products()
             .iter()
             .find(|product| product.code == products::MYM)
@@ -770,12 +890,14 @@ mod tests {
 
         assert_eq!(
             search_exchange_candidates(mym, exchanges::CBOT),
-            vec![exchanges::CBOT, exchanges::CME]
+            vec![exchanges::CBOT]
         );
         assert_eq!(
             search_exchange_candidates(mym, exchanges::CME),
-            vec![exchanges::CME, exchanges::CBOT]
+            vec![exchanges::CME]
         );
+        assert!(search_exchange_candidates(mym, exchanges::NYMEX).is_empty());
+        assert!(candidate_exchanges_for_symbol("MYMZ6", Some("NYMEX")).is_empty());
     }
 
     #[rstest]
@@ -806,12 +928,28 @@ mod tests {
             unit_of_measure_qty: None,
         };
 
-        apply_auxiliary_reference_data(&mut instrument, &aux_data);
+        apply_auxiliary_reference_data(&mut instrument, &aux_data).unwrap();
 
         assert_eq!(
             instrument.activation_ns.as_u64(),
             parse_expiration_date("20240616").unwrap()
         );
+    }
+
+    #[rstest]
+    fn test_apply_auxiliary_reference_data_rejects_malformed_activation_date() {
+        let mut instrument = response_to_instrument(
+            &reference_data(Some("ES"), Some("E-mini S&P 500 Mar25")),
+            UnixNanos::default(),
+        )
+        .unwrap();
+        let aux_data = ResponseAuxilliaryReferenceData {
+            first_trading_date: Some("not-a-date".to_string()),
+            ..Default::default()
+        };
+
+        assert!(apply_auxiliary_reference_data(&mut instrument, &aux_data).is_err());
+        assert_eq!(instrument.activation_ns, UnixNanos::default());
     }
 
     #[rstest]

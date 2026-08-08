@@ -383,6 +383,8 @@ pub struct RithmicDataClient {
     /// Tracks additional ticker-plant update surfaces requested per instrument.
     /// Key: "EXCHANGE:SYMBOL" (e.g., "CME:ESZ4")
     extra_subscriptions: DashMap<String, ExtraMarketDataSubscription>,
+    /// Serializes upstream mutations with local intent commits.
+    subscription_update_lock: tokio::sync::Mutex<()>,
 }
 
 impl RithmicDataClient {
@@ -397,6 +399,7 @@ impl RithmicDataClient {
             tick_bar_subscriptions: DashMap::new(),
             book_subscriptions: DashMap::new(),
             extra_subscriptions: DashMap::new(),
+            subscription_update_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -434,39 +437,20 @@ impl RithmicDataClient {
             return Err(RithmicError::Connection("Not connected".to_string()));
         }
 
+        let _update = self.subscription_update_lock.lock().await;
         let key = format!("{exchange}:{symbol}");
+        let mut next = self
+            .subscriptions
+            .get(&key)
+            .map(|entry| entry.clone())
+            .unwrap_or_default();
+        if next.quotes {
+            return Ok(());
+        }
+        let venue_subscribed = next.quotes || next.trades;
+        next.quotes = true;
 
-        // Check if we already have an active subscription for this instrument.
-        // Returns true if we already have ANY subscription (quotes or trades),
-        // meaning we don't need to send another subscribe request to Rithmic.
-        let already_subscribed = {
-            let entry = self.subscriptions.entry(key.clone());
-
-            match entry {
-                dashmap::mapref::entry::Entry::Occupied(mut e) => {
-                    let sub = e.get_mut();
-
-                    if sub.quotes {
-                        return Ok(()); // Already subscribed to quotes
-                    }
-                    sub.quotes = true;
-                    // If we already have trades subscription, we're already subscribed
-                    // to this instrument at the Rithmic level
-                    sub.trades
-                }
-                dashmap::mapref::entry::Entry::Vacant(e) => {
-                    e.insert(InstrumentSubscription {
-                        quotes: true,
-                        trades: false,
-                    });
-                    false // No existing subscription
-                }
-            }
-        };
-
-        // Only send subscription request if we don't already have one for this instrument
-
-        if !already_subscribed {
+        if !venue_subscribed {
             self.gateway
                 .read()
                 .await
@@ -474,6 +458,7 @@ impl RithmicDataClient {
                 .await?;
         }
 
+        self.subscriptions.insert(key, next);
         Ok(())
     }
 
@@ -490,37 +475,20 @@ impl RithmicDataClient {
             return Err(RithmicError::Connection("Not connected".to_string()));
         }
 
+        let _update = self.subscription_update_lock.lock().await;
         let key = format!("{exchange}:{symbol}");
+        let mut next = self
+            .subscriptions
+            .get(&key)
+            .map(|entry| entry.clone())
+            .unwrap_or_default();
+        if next.trades {
+            return Ok(());
+        }
+        let venue_subscribed = next.quotes || next.trades;
+        next.trades = true;
 
-        // Check if we already have an active subscription for this instrument.
-        // Returns true if we already have ANY subscription (quotes or trades).
-        let already_subscribed = {
-            let entry = self.subscriptions.entry(key.clone());
-
-            match entry {
-                dashmap::mapref::entry::Entry::Occupied(mut e) => {
-                    let sub = e.get_mut();
-
-                    if sub.trades {
-                        return Ok(()); // Already subscribed to trades
-                    }
-                    sub.trades = true;
-                    // If we already have quotes subscription, we're already subscribed
-                    sub.quotes
-                }
-                dashmap::mapref::entry::Entry::Vacant(e) => {
-                    e.insert(InstrumentSubscription {
-                        quotes: false,
-                        trades: true,
-                    });
-                    false // No existing subscription
-                }
-            }
-        };
-
-        // Only send subscription request if we don't already have one for this instrument
-
-        if !already_subscribed {
+        if !venue_subscribed {
             self.gateway
                 .read()
                 .await
@@ -528,6 +496,7 @@ impl RithmicDataClient {
                 .await?;
         }
 
+        self.subscriptions.insert(key, next);
         Ok(())
     }
 
@@ -539,31 +508,17 @@ impl RithmicDataClient {
             return Err(RithmicError::Connection("Not connected".to_string()));
         }
 
+        let _update = self.subscription_update_lock.lock().await;
         let key = format!("{exchange}:{symbol}");
-
-        // Check if we already have any subscription for this instrument.
-        let already_subscribed = {
-            let entry = self.subscriptions.entry(key.clone());
-
-            match entry {
-                dashmap::mapref::entry::Entry::Occupied(mut e) => {
-                    let sub = e.get_mut();
-                    let was_subscribed = sub.quotes || sub.trades;
-                    sub.quotes = true;
-                    sub.trades = true;
-                    was_subscribed
-                }
-                dashmap::mapref::entry::Entry::Vacant(e) => {
-                    e.insert(InstrumentSubscription {
-                        quotes: true,
-                        trades: true,
-                    });
-                    false
-                }
-            }
-        };
-
-        if !already_subscribed {
+        let current = self
+            .subscriptions
+            .get(&key)
+            .map(|entry| entry.clone())
+            .unwrap_or_default();
+        if current.quotes && current.trades {
+            return Ok(());
+        }
+        if !current.quotes && !current.trades {
             self.gateway
                 .read()
                 .await
@@ -571,6 +526,13 @@ impl RithmicDataClient {
                 .await?;
         }
 
+        self.subscriptions.insert(
+            key,
+            InstrumentSubscription {
+                quotes: true,
+                trades: true,
+            },
+        );
         Ok(())
     }
 
@@ -586,6 +548,7 @@ impl RithmicDataClient {
             return Err(RithmicError::Connection("Not connected".to_string()));
         }
 
+        let _update = self.subscription_update_lock.lock().await;
         let key = bar_subscription_key(symbol, exchange, bar_type, bar_period);
 
         if self.bar_subscriptions.contains_key(&key) {
@@ -667,20 +630,24 @@ impl RithmicDataClient {
     /// then clears local tracking. Use this on disconnect to prevent the venue
     /// from continuing to push data on reconnect.
     pub async fn unsubscribe_all_async(&self) {
+        let _update = self.subscription_update_lock.lock().await;
         // Market data (quotes + trades): key = "exchange:symbol"
         let market_keys: Vec<String> = self.subscriptions.iter().map(|r| r.key().clone()).collect();
-        self.subscriptions.clear();
 
         for key in &market_keys {
-            if let Some((exchange, symbol)) = key.split_once(':')
-                && let Err(e) = self
+            if let Some((exchange, symbol)) = key.split_once(':') {
+                match self
                     .gateway
                     .read()
                     .await
                     .unsubscribe_market_data(symbol, exchange)
                     .await
-            {
-                log::warn!("Unsubscribe_all_async: market data {key}: {e}");
+                {
+                    Ok(()) => {
+                        self.subscriptions.remove(key);
+                    }
+                    Err(e) => log::warn!("Unsubscribe_all_async: market data {key}: {e}"),
+                }
             }
         }
 
@@ -690,8 +657,6 @@ impl RithmicDataClient {
             .iter()
             .map(|r| r.key().clone())
             .collect();
-        self.bar_subscriptions.clear();
-
         for key in &bar_keys {
             let parts: Vec<&str> = key.splitn(4, ':').collect();
 
@@ -711,15 +676,19 @@ impl RithmicDataClient {
                     }
                 };
 
-                if let (Some(bar_type), Ok(period)) = (bar_type, period_str.parse::<i32>())
-                    && let Err(e) = self
+                if let (Some(bar_type), Ok(period)) = (bar_type, period_str.parse::<i32>()) {
+                    match self
                         .gateway
                         .read()
                         .await
                         .unsubscribe_time_bars(symbol, exchange, bar_type, period)
                         .await
-                {
-                    log::warn!("Unsubscribe_all_async: bar {key}: {e}");
+                    {
+                        Ok(()) => {
+                            self.bar_subscriptions.remove(key);
+                        }
+                        Err(e) => log::warn!("Unsubscribe_all_async: bar {key}: {e}"),
+                    }
                 }
             }
         }
@@ -729,8 +698,6 @@ impl RithmicDataClient {
             .iter()
             .map(|r| r.key().clone())
             .collect();
-        self.tick_bar_subscriptions.clear();
-
         for key in &tick_bar_keys {
             let parts: Vec<&str> = key.splitn(4, ':').collect();
 
@@ -751,7 +718,7 @@ impl RithmicDataClient {
                 continue;
             };
 
-            if let Err(e) = handle
+            match handle
                 .subscribe_tick_bar_updates(
                     symbol,
                     exchange,
@@ -762,7 +729,10 @@ impl RithmicDataClient {
                 )
                 .await
             {
-                log::warn!("Unsubscribe_all_async: tick bar {key}: {e}");
+                Ok(_) => {
+                    self.tick_bar_subscriptions.remove(key);
+                }
+                Err(e) => log::warn!("Unsubscribe_all_async: tick bar {key}: {e}"),
             }
         }
 
@@ -771,18 +741,20 @@ impl RithmicDataClient {
             .iter()
             .map(|r| r.key().clone())
             .collect();
-        self.book_subscriptions.clear();
-
         for key in &book_keys {
-            if let Some((exchange, symbol)) = key.split_once(':')
-                && let Err(e) = self
+            if let Some((exchange, symbol)) = key.split_once(':') {
+                match self
                     .gateway
                     .read()
                     .await
                     .unsubscribe_order_book(symbol, exchange)
                     .await
-            {
-                log::warn!("Unsubscribe_all_async: book {key}: {e}");
+                {
+                    Ok(()) => {
+                        self.book_subscriptions.remove(key);
+                    }
+                    Err(e) => log::warn!("Unsubscribe_all_async: book {key}: {e}"),
+                }
             }
         }
 
@@ -791,21 +763,24 @@ impl RithmicDataClient {
             .iter()
             .map(|entry| (entry.key().clone(), extra_market_data_kinds(entry.value())))
             .collect();
-        self.extra_subscriptions.clear();
-
         for (key, kinds) in &extra_entries {
             if kinds.is_empty() {
                 continue;
             }
 
             if let Some((exchange, symbol)) = key.split_once(':') {
+                let mut succeeded = true;
                 for kind in kinds {
                     if let Err(e) = self
                         .apply_extra_market_data_subscription(symbol, exchange, *kind, false)
                         .await
                     {
                         log::warn!("Unsubscribe_all_async: extra market data {key}: {e}");
+                        succeeded = false;
                     }
+                }
+                if succeeded {
+                    self.extra_subscriptions.remove(key);
                 }
             }
         }
@@ -818,20 +793,25 @@ impl RithmicDataClient {
     /// dedup logic and calls the gateway directly for every tracked instrument
     /// and bar subscription so data resumes without strategies needing to know
     /// a reconnect occurred.
-    pub async fn resubscribe_all(&self) {
+    pub async fn resubscribe_all(&self) -> Result<()> {
+        let _update = self.subscription_update_lock.lock().await;
+        let mut failures = Vec::new();
         // Market data: key = "exchange:symbol"
         let market_keys: Vec<String> = self.subscriptions.iter().map(|r| r.key().clone()).collect();
 
         for key in &market_keys {
-            if let Some((exchange, symbol)) = key.split_once(':')
-                && let Err(e) = self
+            if let Some((exchange, symbol)) = key.split_once(':') {
+                if let Err(e) = self
                     .gateway
                     .read()
                     .await
                     .subscribe_market_data(symbol, exchange)
                     .await
-            {
-                log::warn!("Resubscribe_all: market data {key}: {e}");
+                {
+                    failures.push(format!("market data {key}: {e}"));
+                }
+            } else {
+                failures.push(format!("invalid market-data key {key:?}"));
             }
         }
 
@@ -849,26 +829,33 @@ impl RithmicDataClient {
                 let (exchange, symbol, bar_type_str, period_str) =
                     (parts[0], parts[1], parts[2], parts[3]);
                 let bar_type = match bar_type_str {
-                    "SecondBar" => Some(TimeBarType::SecondBar),
-                    "MinuteBar" => Some(TimeBarType::MinuteBar),
-                    "DailyBar" => Some(TimeBarType::DailyBar),
-                    "WeeklyBar" => Some(TimeBarType::WeeklyBar),
+                    "SecondBar" => TimeBarType::SecondBar,
+                    "MinuteBar" => TimeBarType::MinuteBar,
+                    "DailyBar" => TimeBarType::DailyBar,
+                    "WeeklyBar" => TimeBarType::WeeklyBar,
                     other => {
-                        log::warn!("Resubscribe_all: unknown bar type '{other}' in key '{key}'");
-                        None
+                        failures.push(format!(
+                            "unknown bar type {other:?} in subscription key {key:?}"
+                        ));
+                        continue;
                     }
                 };
 
-                if let (Some(bar_type), Ok(period)) = (bar_type, period_str.parse::<i32>())
-                    && let Err(e) = self
-                        .gateway
-                        .read()
-                        .await
-                        .subscribe_time_bars(symbol, exchange, bar_type, period)
-                        .await
+                let Ok(period) = period_str.parse::<i32>() else {
+                    failures.push(format!("invalid bar period in subscription key {key:?}"));
+                    continue;
+                };
+                if let Err(e) = self
+                    .gateway
+                    .read()
+                    .await
+                    .subscribe_time_bars(symbol, exchange, bar_type, period)
+                    .await
                 {
-                    log::warn!("Resubscribe_all: bar {key}: {e}");
+                    failures.push(format!("bar {key}: {e}"));
                 }
+            } else {
+                failures.push(format!("invalid bar subscription key {key:?}"));
             }
         }
 
@@ -882,10 +869,12 @@ impl RithmicDataClient {
             let parts: Vec<&str> = key.splitn(4, ':').collect();
 
             if parts.len() != 4 {
+                failures.push(format!("invalid tick-bar subscription key {key:?}"));
                 continue;
             }
             let (exchange, symbol, _, period_str) = (parts[0], parts[1], parts[2], parts[3]);
             let Ok(period) = period_str.parse::<u32>() else {
+                failures.push(format!("invalid tick-bar period in key {key:?}"));
                 continue;
             };
 
@@ -894,7 +883,7 @@ impl RithmicDataClient {
                 gateway.history_handle().cloned()
             };
             let Some(handle) = history_handle else {
-                log::warn!("Resubscribe_all: history handle unavailable for {key}");
+                failures.push(format!("history handle unavailable for {key}"));
                 continue;
             };
 
@@ -909,7 +898,7 @@ impl RithmicDataClient {
                 )
                 .await
             {
-                log::warn!("Resubscribe_all: tick bar {key}: {e}");
+                failures.push(format!("tick bar {key}: {e}"));
             }
         }
 
@@ -927,8 +916,10 @@ impl RithmicDataClient {
                     .subscribe_order_book_bootstrapped(symbol, exchange)
                     .await
                 {
-                    log::warn!("Resubscribe_all: book {key}: {e}");
+                    failures.push(format!("book {key}: {e}"));
                 }
+            } else {
+                failures.push(format!("invalid book subscription key {key:?}"));
             }
         }
 
@@ -949,9 +940,11 @@ impl RithmicDataClient {
                         .apply_extra_market_data_subscription(symbol, exchange, *kind, true)
                         .await
                     {
-                        log::warn!("Resubscribe_all: extra market data {key}: {e}");
+                        failures.push(format!("extra market data {key}: {e}"));
                     }
                 }
+            } else {
+                failures.push(format!("invalid extra-data subscription key {key:?}"));
             }
         }
 
@@ -963,6 +956,16 @@ impl RithmicDataClient {
             book_keys.len(),
             extra_entries.len()
         );
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(RithmicError::Connection(format!(
+                "Failed to restore {} Rithmic subscription(s): {}",
+                failures.len(),
+                failures.join("; ")
+            )))
+        }
     }
 
     /// Unsubscribes from market data and notifies the venue.
@@ -971,13 +974,57 @@ impl RithmicDataClient {
     /// unsubscribe request to the Rithmic ticker plant. Use this when
     /// you need to stop receiving data from the venue.
     pub async fn unsubscribe_market_data_async(&self, symbol: &str, exchange: &str) -> Result<()> {
+        let _update = self.subscription_update_lock.lock().await;
         let key = format!("{exchange}:{symbol}");
-        self.subscriptions.remove(&key);
         self.gateway
             .read()
             .await
             .unsubscribe_market_data(symbol, exchange)
+            .await?;
+        self.subscriptions.remove(&key);
+        Ok(())
+    }
+
+    /// Unsubscribes quote intent, notifying the venue only when no trade intent remains.
+    pub async fn unsubscribe_quotes_async(&self, symbol: &str, exchange: &str) -> Result<()> {
+        self.unsubscribe_market_data_kind(symbol, exchange, true)
             .await
+    }
+
+    /// Unsubscribes trade intent, notifying the venue only when no quote intent remains.
+    pub async fn unsubscribe_trades_async(&self, symbol: &str, exchange: &str) -> Result<()> {
+        self.unsubscribe_market_data_kind(symbol, exchange, false)
+            .await
+    }
+
+    async fn unsubscribe_market_data_kind(
+        &self,
+        symbol: &str,
+        exchange: &str,
+        quotes: bool,
+    ) -> Result<()> {
+        let _update = self.subscription_update_lock.lock().await;
+        let key = format!("{exchange}:{symbol}");
+        let Some(current) = self.subscriptions.get(&key).map(|entry| entry.clone()) else {
+            return Ok(());
+        };
+        let mut next = current;
+        if quotes {
+            next.quotes = false;
+        } else {
+            next.trades = false;
+        }
+        if !next.quotes && !next.trades {
+            self.gateway
+                .read()
+                .await
+                .unsubscribe_market_data(symbol, exchange)
+                .await?;
+            self.subscriptions.remove(&key);
+        } else {
+            self.subscriptions.insert(key, next);
+        }
+        Ok(())
     }
 
     /// Unsubscribes from live time bars and notifies the venue.
@@ -988,13 +1035,18 @@ impl RithmicDataClient {
         bar_type: TimeBarType,
         bar_period: i32,
     ) -> Result<()> {
+        let _update = self.subscription_update_lock.lock().await;
         let key = bar_subscription_key(symbol, exchange, bar_type, bar_period);
-        self.bar_subscriptions.remove(&key);
+        if !self.bar_subscriptions.contains_key(&key) {
+            return Ok(());
+        }
         self.gateway
             .read()
             .await
             .unsubscribe_time_bars(symbol, exchange, bar_type, bar_period)
-            .await
+            .await?;
+        self.bar_subscriptions.remove(&key);
+        Ok(())
     }
 
     /// Subscribes to live tick bars for an instrument through the history plant.
@@ -1008,6 +1060,7 @@ impl RithmicDataClient {
             return Err(RithmicError::Connection("Not connected".to_string()));
         }
 
+        let _update = self.subscription_update_lock.lock().await;
         let key = format!("{exchange}:{symbol}:TickBar:{bar_period}");
 
         if self.tick_bar_subscriptions.contains_key(&key) {
@@ -1043,8 +1096,11 @@ impl RithmicDataClient {
         exchange: &str,
         bar_period: u32,
     ) -> Result<()> {
+        let _update = self.subscription_update_lock.lock().await;
         let key = format!("{exchange}:{symbol}:TickBar:{bar_period}");
-        self.tick_bar_subscriptions.remove(&key);
+        if !self.tick_bar_subscriptions.contains_key(&key) {
+            return Ok(());
+        }
 
         let history_handle = {
             let gateway = self.gateway.read().await;
@@ -1064,6 +1120,7 @@ impl RithmicDataClient {
             .await
             .map_err(|e| RithmicError::Api(format!("Tick bar unsubscribe failed: {e}")))?;
 
+        self.tick_bar_subscriptions.remove(&key);
         Ok(())
     }
 
@@ -1073,36 +1130,26 @@ impl RithmicDataClient {
             return Err(RithmicError::Connection("Not connected".to_string()));
         }
 
+        let _update = self.subscription_update_lock.lock().await;
         let key = format!("{exchange}:{symbol}");
-        let already_subscribed = {
-            let entry = self.book_subscriptions.entry(key.clone());
+        let mut next = self
+            .book_subscriptions
+            .get(&key)
+            .map(|entry| entry.clone())
+            .unwrap_or_default();
+        if next.deltas {
+            return Ok(());
+        }
+        let venue_subscribed = next.deltas || next.depth10;
+        next.deltas = true;
 
-            match entry {
-                dashmap::mapref::entry::Entry::Occupied(mut e) => {
-                    let sub = e.get_mut();
-
-                    if sub.deltas {
-                        return Ok(());
-                    }
-                    sub.deltas = true;
-                    sub.depth10
-                }
-                dashmap::mapref::entry::Entry::Vacant(e) => {
-                    e.insert(BookSubscription {
-                        deltas: true,
-                        depth10: false,
-                    });
-                    false
-                }
-            }
-        };
-
-        if !already_subscribed {
+        if !venue_subscribed {
             let gateway = self.gateway.read().await;
             gateway
                 .subscribe_order_book_bootstrapped(symbol, exchange)
                 .await?;
         }
+        self.book_subscriptions.insert(key, next);
         Ok(())
     }
 
@@ -1112,87 +1159,73 @@ impl RithmicDataClient {
             return Err(RithmicError::Connection("Not connected".to_string()));
         }
 
+        let _update = self.subscription_update_lock.lock().await;
         let key = format!("{exchange}:{symbol}");
-        let already_subscribed = {
-            let entry = self.book_subscriptions.entry(key.clone());
+        let mut next = self
+            .book_subscriptions
+            .get(&key)
+            .map(|entry| entry.clone())
+            .unwrap_or_default();
+        if next.depth10 {
+            return Ok(());
+        }
+        let venue_subscribed = next.deltas || next.depth10;
+        next.depth10 = true;
 
-            match entry {
-                dashmap::mapref::entry::Entry::Occupied(mut e) => {
-                    let sub = e.get_mut();
-
-                    if sub.depth10 {
-                        return Ok(());
-                    }
-                    sub.depth10 = true;
-                    sub.deltas
-                }
-                dashmap::mapref::entry::Entry::Vacant(e) => {
-                    e.insert(BookSubscription {
-                        deltas: false,
-                        depth10: true,
-                    });
-                    false
-                }
-            }
-        };
-
-        if !already_subscribed {
+        if !venue_subscribed {
             let gateway = self.gateway.read().await;
             gateway
                 .subscribe_order_book_bootstrapped(symbol, exchange)
                 .await?;
         }
+        self.book_subscriptions.insert(key, next);
         Ok(())
     }
 
     /// Unsubscribes from order-book deltas and notifies the venue.
     pub async fn unsubscribe_book_deltas(&self, symbol: &str, exchange: &str) -> Result<()> {
+        let _update = self.subscription_update_lock.lock().await;
         let key = format!("{exchange}:{symbol}");
-        let should_unsubscribe = if let Some(mut sub) = self.book_subscriptions.get_mut(&key) {
-            sub.deltas = false;
-            let remaining = sub.deltas || sub.depth10;
-            drop(sub);
-
-            if !remaining {
-                self.book_subscriptions.remove(&key);
-            }
-            !remaining
-        } else {
-            false
+        let Some(mut next) = self.book_subscriptions.get(&key).map(|entry| entry.clone()) else {
+            return Ok(());
         };
-
-        if should_unsubscribe {
+        if !next.deltas {
+            return Ok(());
+        }
+        next.deltas = false;
+        if next.depth10 {
+            self.book_subscriptions.insert(key, next);
+        } else {
             self.gateway
                 .read()
                 .await
                 .unsubscribe_order_book(symbol, exchange)
                 .await?;
+            self.book_subscriptions.remove(&key);
         }
         Ok(())
     }
 
     /// Unsubscribes from top-10 order book depth and notifies the venue when unused.
     pub async fn unsubscribe_book_depth10(&self, symbol: &str, exchange: &str) -> Result<()> {
+        let _update = self.subscription_update_lock.lock().await;
         let key = format!("{exchange}:{symbol}");
-        let should_unsubscribe = if let Some(mut sub) = self.book_subscriptions.get_mut(&key) {
-            sub.depth10 = false;
-            let remaining = sub.deltas || sub.depth10;
-            drop(sub);
-
-            if !remaining {
-                self.book_subscriptions.remove(&key);
-            }
-            !remaining
-        } else {
-            false
+        let Some(mut next) = self.book_subscriptions.get(&key).map(|entry| entry.clone()) else {
+            return Ok(());
         };
-
-        if should_unsubscribe {
+        if !next.depth10 {
+            return Ok(());
+        }
+        next.depth10 = false;
+        if next.deltas {
+            self.book_subscriptions.insert(key, next);
+        } else {
             self.gateway
                 .read()
                 .await
                 .unsubscribe_order_book(symbol, exchange)
                 .await?;
+            self.book_subscriptions.remove(&key);
         }
         Ok(())
     }
@@ -1208,40 +1241,27 @@ impl RithmicDataClient {
             return Err(RithmicError::Connection("Not connected".to_string()));
         }
 
+        let _update = self.subscription_update_lock.lock().await;
         let key = format!("{exchange}:{symbol}");
-        {
-            let entry = self.extra_subscriptions.entry(key.clone());
-
-            match entry {
-                dashmap::mapref::entry::Entry::Occupied(mut e) => {
-                    let subscription = e.get_mut();
-                    let was_enabled = get_extra_market_data_flag(subscription, kind);
-
-                    if was_enabled == enabled {
-                        return Ok(());
-                    }
-
-                    set_extra_market_data_flag(subscription, kind, enabled);
-
-                    if extra_market_data_kinds(subscription).is_empty() {
-                        drop(e);
-                        self.extra_subscriptions.remove(&key);
-                    }
-                }
-                dashmap::mapref::entry::Entry::Vacant(e) => {
-                    if !enabled {
-                        return Ok(());
-                    }
-
-                    let mut subscription = ExtraMarketDataSubscription::default();
-                    set_extra_market_data_flag(&mut subscription, kind, true);
-                    e.insert(subscription);
-                }
-            }
+        let mut next = self
+            .extra_subscriptions
+            .get(&key)
+            .map(|entry| entry.clone())
+            .unwrap_or_default();
+        if get_extra_market_data_flag(&next, kind) == enabled {
+            return Ok(());
         }
+        set_extra_market_data_flag(&mut next, kind, enabled);
 
         self.apply_extra_market_data_subscription(symbol, exchange, kind, enabled)
-            .await
+            .await?;
+
+        if extra_market_data_kinds(&next).is_empty() {
+            self.extra_subscriptions.remove(&key);
+        } else {
+            self.extra_subscriptions.insert(key, next);
+        }
+        Ok(())
     }
 
     async fn apply_extra_market_data_subscription(
@@ -1481,11 +1501,37 @@ mod tests {
             "user",
             "pass",
             "system",
+            "TestApp",
             "fcm",
             "ib",
             "account",
-        );
+        )
+        .unwrap();
         Arc::new(tokio::sync::RwLock::new(RithmicGateway::new(config)))
+    }
+
+    async fn create_connected_gateway_without_plants() -> Arc<tokio::sync::RwLock<RithmicGateway>> {
+        let config = GatewayConfig::new(
+            RithmicEnv::Demo,
+            "user",
+            "pass",
+            "system",
+            "TestApp",
+            "fcm",
+            "ib",
+            "account",
+        )
+        .unwrap()
+        .with_ticker(false)
+        .with_order(false)
+        .with_pnl(false)
+        .with_history(false);
+        let mut gateway = RithmicGateway::new(config);
+        gateway
+            .connect()
+            .await
+            .expect("empty gateway should connect");
+        Arc::new(tokio::sync::RwLock::new(gateway))
     }
 
     #[rstest::rstest]
@@ -1531,6 +1577,61 @@ mod tests {
         // Unsubscribe from trades - should remove entry
         client.unsubscribe_trades("ESZ4", "CME");
         assert_eq!(client.subscription_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_subscribe_does_not_commit_local_intent() {
+        let gateway = create_connected_gateway_without_plants().await;
+        let client = RithmicDataClient::new(gateway);
+
+        assert!(client.subscribe_quotes("ESM6", "CME").await.is_err());
+        assert!(!client.is_subscribed_quotes("ESM6", "CME"));
+        assert_eq!(client.subscription_count(), 0);
+
+        assert!(client.subscribe_book_deltas("ESM6", "CME").await.is_err());
+        assert!(!client.is_subscribed_book_deltas("ESM6", "CME"));
+        assert_eq!(client.book_subscription_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_unsubscribe_retains_local_intent() {
+        let gateway = create_connected_gateway_without_plants().await;
+        let client = RithmicDataClient::new(gateway);
+        client.subscriptions.insert(
+            "CME:ESM6".to_string(),
+            InstrumentSubscription {
+                quotes: true,
+                trades: false,
+            },
+        );
+
+        assert!(
+            client
+                .unsubscribe_quotes_async("ESM6", "CME")
+                .await
+                .is_err()
+        );
+        assert!(client.is_subscribed_quotes("ESM6", "CME"));
+    }
+
+    #[tokio::test]
+    async fn failed_resubscribe_is_reported_to_readiness_owner() {
+        let gateway = create_connected_gateway_without_plants().await;
+        let client = RithmicDataClient::new(gateway);
+        client.subscriptions.insert(
+            "CME:ESM6".to_string(),
+            InstrumentSubscription {
+                quotes: true,
+                trades: false,
+            },
+        );
+
+        let e = client
+            .resubscribe_all()
+            .await
+            .expect_err("missing ticker plant must fail subscription recovery");
+        assert!(e.to_string().contains("Failed to restore"));
+        assert!(client.is_subscribed_quotes("ESM6", "CME"));
     }
 
     #[rstest::rstest]

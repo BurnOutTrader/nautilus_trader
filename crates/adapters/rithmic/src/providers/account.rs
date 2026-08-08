@@ -14,20 +14,16 @@
 
 //! Account state provider for Rithmic.
 //!
-//! The `RithmicAccountProvider` receives account balance updates from the
-//! PnL plant via the `RithmicGateway`. It maintains current account state
-//! and provides event notifications for balance changes.
+//! The `RithmicAccountProvider` is an explicit state container for account
+//! events routed by the owner of a gateway PnL subscription.
 
 use std::{fmt::Debug, sync::Arc};
 
-use dashmap::DashMap;
-use tokio::task::JoinHandle;
-
 use crate::{
     common::types::{RithmicAccountId, UnixNanos},
-    error::Result,
     gateway::{PnlEvent, RithmicGateway},
 };
+use dashmap::DashMap;
 
 /// Account balance information.
 #[derive(Debug, Clone)]
@@ -65,15 +61,13 @@ pub enum AccountEvent {
 
 /// Provides account state from Rithmic.
 ///
-/// The provider receives account balance updates from the gateway's PnL plant
-/// and maintains the current account state. Use `event_receiver()` to get a
-/// channel for real-time balance change notifications.
+/// Call [`Self::process_pnl_event`] with events from the owning gateway PnL
+/// subscription. Use [`Self::event_receiver`] for local change notifications.
 pub struct RithmicAccountProvider {
     gateway: Arc<RithmicGateway>,
     account_id: String,
     balances: Arc<DashMap<String, AccountBalance>>,
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<AccountEvent>>,
-    task_handle: Option<JoinHandle<()>>,
 }
 
 impl RithmicAccountProvider {
@@ -88,7 +82,6 @@ impl RithmicAccountProvider {
             account_id: account_id.into(),
             balances: Arc::new(DashMap::new()),
             event_tx: None,
-            task_handle: None,
         }
     }
 
@@ -100,37 +93,6 @@ impl RithmicAccountProvider {
     /// Returns a reference to the gateway.
     pub fn gateway(&self) -> &Arc<RithmicGateway> {
         &self.gateway
-    }
-
-    /// Starts receiving account updates from the gateway.
-    ///
-    /// This spawns a background task that processes PnL events from the gateway
-    /// and updates the local balance state. Call this after the gateway is connected.
-    pub async fn start(&mut self) -> Result<()> {
-        if self.task_handle.is_some() {
-            tracing::warn!("Account provider already started");
-            return Ok(());
-        }
-
-        // Note: The gateway already subscribes to PnL updates during connect().
-        // We just need to process the events from the gateway's PnL channel.
-        // The gateway now supports multiple downstream PnL subscriptions.
-        // This provider still acts as a state container until it owns its own
-        // subscription task and account filtering.
-        //
-        // For now, the provider acts as a state container that gets updated
-        // by the caller who has access to the gateway's PnL events.
-        tracing::debug!("Account provider started for account {}", self.account_id);
-        Ok(())
-    }
-
-    /// Stops receiving account updates.
-    pub async fn stop(&mut self) -> Result<()> {
-        if let Some(handle) = self.task_handle.take() {
-            handle.abort();
-        }
-        tracing::debug!("Account provider stopped");
-        Ok(())
     }
 
     /// Returns the current account balance.
@@ -190,6 +152,9 @@ impl RithmicAccountProvider {
                     account_id,
                     message,
                 } => {
+                    if account_id != &self.account_id {
+                        return;
+                    }
                     if let Some(tx) = &self.event_tx {
                         let _ = tx.send(AccountEvent::MarginWarning {
                             account_id: account_id.clone(),
@@ -210,6 +175,9 @@ impl RithmicAccountProvider {
 
     /// Updates account balance (internal use).
     pub(crate) fn update_balance(&self, balance: AccountBalance) {
+        if balance.account_id != self.account_id {
+            return;
+        }
         let account_id = balance.account_id.clone();
 
         if let Some(tx) = &self.event_tx {
@@ -247,10 +215,12 @@ mod tests {
             "user",
             "pass",
             "system",
+            "TestApp",
             "fcm",
             "ib",
             "ACCOUNT123",
-        );
+        )
+        .unwrap();
         Arc::new(RithmicGateway::new(config))
     }
 
@@ -314,7 +284,7 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn test_balance_for_different_account() {
+    fn test_balance_for_different_account_is_ignored() {
         let gateway = create_test_gateway();
         let provider = RithmicAccountProvider::new(gateway, "ACCOUNT123");
 
@@ -336,8 +306,6 @@ mod tests {
         // Primary account should still be None
         assert!(provider.balance().is_none());
 
-        // But we can retrieve the other account's balance
-        let retrieved = provider.balance_for_account("OTHER_ACCOUNT").unwrap();
-        assert_eq!(retrieved.total, 50000.0);
+        assert!(provider.balance_for_account("OTHER_ACCOUNT").is_none());
     }
 }

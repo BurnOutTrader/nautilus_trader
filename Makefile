@@ -236,7 +236,7 @@ ADAPTER_CRATES := nautilus-architect-ax nautilus-betfair nautilus-binance \
     nautilus-coinbase nautilus-databento nautilus-deribit nautilus-derive \
     nautilus-dydx nautilus-hyperliquid nautilus-interactive-brokers \
     nautilus-kraken nautilus-lighter nautilus-okx nautilus-polymarket \
-    nautilus-sandbox nautilus-tardis
+    rithmic-nt nautilus-sandbox nautilus-tardis
 
 # Workspace members without Rust test functions:
 # nautilus-trader is the container library, nautilus-pyo3 owns generated bindings,
@@ -944,6 +944,12 @@ cargo-test-crate-%: export RUST_BACKTRACE=1
 cargo-test-crate-%: check-nextest-installed
 cargo-test-crate-%:  #-- Run Rust tests for a specific crate (usage: make cargo-test-crate-<crate_name>)
 	cargo nextest run --lib $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) -p $* --features "$$(./scripts/crate-test-features.sh $*)" $(NEXTEST_OUTPUT_ARGS)
+
+.PHONY: cargo-test-crate-rithmic-nt-all-targets
+cargo-test-crate-rithmic-nt-all-targets: export RUST_BACKTRACE=1
+cargo-test-crate-rithmic-nt-all-targets: check-nextest-installed
+cargo-test-crate-rithmic-nt-all-targets:  #-- Run Rithmic library and integration tests
+	cargo nextest run --lib --tests $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) -p rithmic-nt --features "$$(./scripts/crate-test-features.sh rithmic-nt)" $(NEXTEST_OUTPUT_ARGS)
 
 .PHONY: cargo-test-coverage-crate-%
 cargo-test-coverage-crate-%: export RUST_BACKTRACE=1

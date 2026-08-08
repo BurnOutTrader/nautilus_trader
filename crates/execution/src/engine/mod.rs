@@ -117,6 +117,7 @@ pub struct ExecutionEngine {
     clients: IndexMap<ClientId, ExecutionClientAdapter>,
     default_client_id: Option<ClientId>,
     routing_map: HashMap<Venue, ClientId>,
+    account_routing_map: HashMap<AccountId, ClientId>,
     oms_overrides: HashMap<StrategyId, OmsType>,
     external_order_claims: HashMap<InstrumentId, StrategyId>,
     external_clients: HashSet<ClientId>,
@@ -151,6 +152,7 @@ impl ExecutionEngine {
             clients: IndexMap::new(),
             default_client_id: None,
             routing_map: HashMap::new(),
+            account_routing_map: HashMap::new(),
             oms_overrides: HashMap::new(),
             external_order_claims: HashMap::new(),
             external_clients: config
@@ -247,7 +249,7 @@ impl ExecutionEngine {
     /// Subscribes to instrument updates for a venue via the message bus.
     ///
     /// When instruments are published by the `DataEngine`, the handler routes
-    /// them to the execution client registered for that venue.
+    /// them to every execution client registered for that venue.
     pub fn subscribe_venue_instruments(engine: &Rc<RefCell<Self>>, venue: Venue) {
         let weak = WeakCell::from(Rc::downgrade(engine));
         let pattern = switchboard::get_instruments_pattern(venue);
@@ -255,9 +257,17 @@ impl ExecutionEngine {
         let handler = TypedHandler::from(move |instrument: &InstrumentAny| {
             if let Some(rc) = weak.upgrade() {
                 let venue = instrument.id().venue;
-                let client_id = rc.borrow().routing_map.get(&venue).copied();
-                if let Some(client_id) = client_id {
-                    let mut engine = rc.borrow_mut();
+                let client_ids = rc
+                    .borrow()
+                    .clients
+                    .iter()
+                    .filter_map(|(client_id, adapter)| {
+                        (adapter.venue == venue).then_some(*client_id)
+                    })
+                    .collect::<Vec<_>>();
+                let mut engine = rc.borrow_mut();
+
+                for client_id in client_ids {
                     if let Some(adapter) = engine.get_client_adapter_mut(&client_id) {
                         adapter.on_instrument(instrument.clone());
                     }
@@ -362,25 +372,34 @@ impl ExecutionEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error if a client with the same ID is already registered.
+    /// Returns an error if a client with the same ID or account is already registered.
     pub fn register_client(&mut self, client: Box<dyn ExecutionClient>) -> anyhow::Result<()> {
         let client_id = client.client_id();
         let venue = client.venue();
+        let account_id = client.account_id();
 
         if self.clients.contains_key(&client_id) {
             anyhow::bail!("Client already registered with ID {client_id}");
         }
 
-        let adapter = ExecutionClientAdapter::new(client);
-
-        if let Some(existing_client_id) = self.routing_map.get(&venue) {
+        if let Some(existing_client_id) = self.account_routing_map.get(&account_id) {
             anyhow::bail!(
-                "Venue {venue} already routed to {existing_client_id}, \
-                 cannot register {client_id} for the same venue"
+                "Account {account_id} already routed to {existing_client_id}, \
+                 cannot register {client_id} for the same account"
             );
         }
 
-        self.routing_map.insert(venue, client_id);
+        let adapter = ExecutionClientAdapter::new(client);
+
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.routing_map.entry(venue) {
+            entry.insert(client_id);
+        } else {
+            log::info!(
+                "Registered additional client {client_id} for {venue}; \
+                 venue-default routing remains unchanged"
+            );
+        }
+        self.account_routing_map.insert(account_id, client_id);
         log::debug!("Registered client {client_id}");
         self.clients.insert(client_id, adapter);
         Ok(())
@@ -475,6 +494,33 @@ impl ExecutionEngine {
                 instrument_id,
                 strategy_id,
                 ts_init,
+            );
+        }
+    }
+
+    /// Registers an external order with a specific execution client.
+    ///
+    /// This preserves the originating client when several clients serve the same venue.
+    pub fn register_external_order_for_client(
+        &self,
+        client_id: ClientId,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        instrument_id: InstrumentId,
+        strategy_id: StrategyId,
+        ts_init: UnixNanos,
+    ) {
+        if let Some(client) = self.clients.get(&client_id) {
+            client.register_external_order(
+                client_order_id,
+                venue_order_id,
+                instrument_id,
+                strategy_id,
+                ts_init,
+            );
+        } else {
+            log::warn!(
+                "Cannot register external order {client_order_id}: client {client_id} not found"
             );
         }
     }
@@ -655,13 +701,23 @@ impl ExecutionEngine {
     ///
     /// Returns an error if no client is registered with the given ID.
     pub fn deregister_client(&mut self, client_id: ClientId) -> anyhow::Result<()> {
-        if self.clients.shift_remove(&client_id).is_some() {
+        if let Some(removed) = self.clients.shift_remove(&client_id) {
             if self.default_client_id == Some(client_id) {
                 self.default_client_id = None;
             }
 
-            // Remove from routing map if present
+            let was_venue_route = self.routing_map.get(&removed.venue) == Some(&client_id);
             self.routing_map
+                .retain(|_, mapped_id| mapped_id != &client_id);
+            if was_venue_route
+                && let Some(replacement) = self
+                    .clients
+                    .iter()
+                    .find_map(|(id, adapter)| (adapter.venue == removed.venue).then_some(*id))
+            {
+                self.routing_map.insert(removed.venue, replacement);
+            }
+            self.account_routing_map
                 .retain(|_, mapped_id| mapped_id != &client_id);
             log::info!("Deregistered client {client_id}");
             Ok(())
@@ -1986,6 +2042,12 @@ impl ExecutionEngine {
         }
 
         if let Some(account_id) = self.account_id_for_command(command) {
+            if let Some(client_id) = self.account_routing_map.get(&account_id)
+                && let Some(adapter) = self.clients.get(client_id)
+            {
+                return Some(adapter);
+            }
+
             let issuer = account_id.get_issuer();
             let issuer_client_id = ClientId::from(issuer.as_str());
 

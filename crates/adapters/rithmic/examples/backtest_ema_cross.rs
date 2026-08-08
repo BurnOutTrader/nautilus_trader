@@ -59,8 +59,11 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn env_quantity(key: &str, default: &str) -> Quantity {
-    Quantity::from(env_string(key, default).as_str())
+fn env_quantity(key: &str, default: &str) -> anyhow::Result<Quantity> {
+    let value = env_string(key, default);
+    value
+        .parse::<Quantity>()
+        .map_err(|e| anyhow::anyhow!("Invalid quantity in {key}={value:?}: {e}"))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -75,7 +78,7 @@ fn main() -> anyhow::Result<()> {
     let bar_spec = env_string("RITHMIC_BAR_SPEC", "1-MINUTE-LAST");
     let fast_ema = env_usize("RITHMIC_FAST_EMA", 10);
     let slow_ema = env_usize("RITHMIC_SLOW_EMA", 20);
-    let trade_size = env_quantity("RITHMIC_TRADE_SIZE", "1");
+    let trade_size = env_quantity("RITHMIC_TRADE_SIZE", "1")?;
 
     let mut catalog = ParquetDataCatalog::new(&catalog_path, None, None, None, None);
     let instrument_id = resolve_catalog_instrument_id(&catalog)?;

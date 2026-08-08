@@ -40,6 +40,7 @@ Operator note:
       conformance flow.
     - It supplies the adapter-required non-user fields internally so the user
       does not need to provide them for this test-connect workflow.
+    - Export the required variables in the process before running this script.
 
 Notes:
     - In NautilusTrader, the vendor "test URL" maps to
@@ -60,16 +61,11 @@ import contextlib
 import os
 import signal
 
-from nautilus_trader.adapters.rithmic import RithmicEnv
-from nautilus_trader.adapters.rithmic import RithmicGateway
-from nautilus_trader.adapters.rithmic import load_rithmic_env_file
-
+from nautilus_trader.adapters.rithmic import RithmicEnv, RithmicGateway
 
 DEFAULT_APP_NAME = "NautilusRithmicConformance"
 DEFAULT_APP_VERSION = "1.0"
 POLL_INTERVAL_SECONDS = 5.0
-
-load_rithmic_env_file()
 
 
 def required_env(key: str) -> str:

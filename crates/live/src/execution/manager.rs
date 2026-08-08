@@ -146,6 +146,7 @@ pub(crate) enum ReportClientCoverage {
 /// Metadata for an external order that needs to be registered with the execution client.
 #[derive(Debug, Clone)]
 pub struct ExternalOrderMetadata {
+    pub client_id: Option<ClientId>,
     pub client_order_id: ClientOrderId,
     pub venue_order_id: VenueOrderId,
     pub instrument_id: InstrumentId,
@@ -222,10 +223,39 @@ struct RetainedFillState {
     netting_lifecycle_starts: IndexMap<(AccountId, InstrumentId, StrategyId), UnixNanos>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ReconciliationFillQueue {
     pending_fill_keys: IndexSet<FillKey>,
     event_fill_keys: IndexMap<UUID4, FillKey>,
+}
+
+#[derive(Debug)]
+struct ExternalOrderContext<'a> {
+    is_synthetic: bool,
+    client_id: Option<ClientId>,
+    fill_queue: Option<&'a mut ReconciliationFillQueue>,
+}
+
+impl<'a> ExternalOrderContext<'a> {
+    const fn reported(
+        is_synthetic: bool,
+        client_id: ClientId,
+        fill_queue: &'a mut ReconciliationFillQueue,
+    ) -> Self {
+        Self {
+            is_synthetic,
+            client_id: Some(client_id),
+            fill_queue: Some(fill_queue),
+        }
+    }
+
+    const fn synthetic() -> Self {
+        Self {
+            is_synthetic: true,
+            client_id: None,
+            fill_queue: None,
+        }
+    }
 }
 
 impl ReconciliationFillQueue {
@@ -709,8 +739,11 @@ impl ExecutionManager {
                             mass_status.account_id,
                             &instrument,
                             &order_fills,
-                            false, // Not synthetic (venue order)
-                            Some(&mut fill_queue),
+                            ExternalOrderContext::reported(
+                                false,
+                                mass_status.client_id,
+                                &mut fill_queue,
+                            ),
                         );
 
                         if !external_events.is_empty() {
@@ -788,8 +821,11 @@ impl ExecutionManager {
                     mass_status.account_id,
                     &instrument,
                     &order_fills,
-                    is_synthetic,
-                    Some(&mut fill_queue),
+                    ExternalOrderContext::reported(
+                        is_synthetic,
+                        mass_status.client_id,
+                        &mut fill_queue,
+                    ),
                 );
 
                 if !external_events.is_empty() {
@@ -2783,8 +2819,7 @@ impl ExecutionManager {
                                 account_id,
                                 &instrument,
                                 &[],
-                                true,
-                                None,
+                                ExternalOrderContext::synthetic(),
                             );
                             events
                         })
@@ -2918,8 +2953,13 @@ impl ExecutionManager {
             "Generating close fill for cross-zero {instrument_id}: side={close_side:?}, qty={close_qty}, px={close_px}",
         );
 
-        let (close_events, _) =
-            self.handle_external_order(&close_report, account_id, instrument, &[], true, None);
+        let (close_events, _) = self.handle_external_order(
+            &close_report,
+            account_id,
+            instrument,
+            &[],
+            ExternalOrderContext::synthetic(),
+        );
         let mut all_events = close_events;
 
         if let Some((open_report, open_px)) = open_report {
@@ -2928,8 +2968,13 @@ impl ExecutionManager {
                 "Generating open fill for cross-zero {instrument_id}: side={open_side:?}, qty={open_qty}, px={open_px}",
             );
 
-            let (open_events, _) =
-                self.handle_external_order(&open_report, account_id, instrument, &[], true, None);
+            let (open_events, _) = self.handle_external_order(
+                &open_report,
+                account_id,
+                instrument,
+                &[],
+                ExternalOrderContext::synthetic(),
+            );
             all_events.extend(open_events);
         } else {
             log::warn!("Cannot open new position for {instrument_id}: no venue average price");
@@ -3007,8 +3052,13 @@ impl ExecutionManager {
             "Creating position from venue report for {instrument_id}: side={order_side:?}, qty={qty_abs}, avg_px={venue_avg_px}",
         );
 
-        let (events, _) =
-            self.handle_external_order(&order_report, account_id, instrument, &[], true, None);
+        let (events, _) = self.handle_external_order(
+            &order_report,
+            account_id,
+            instrument,
+            &[],
+            ExternalOrderContext::synthetic(),
+        );
         Some(events)
     }
 
@@ -3375,8 +3425,13 @@ impl ExecutionManager {
             "Generating reconciliation order for {instrument_id}: side={order_side:?}, qty={diff_qty}, px={fill_px}",
         );
 
-        let (events, _) =
-            self.handle_external_order(&order_report, account_id, instrument, &[], true, None);
+        let (events, _) = self.handle_external_order(
+            &order_report,
+            account_id,
+            instrument,
+            &[],
+            ExternalOrderContext::synthetic(),
+        );
         Some(events)
     }
 
@@ -3487,9 +3542,23 @@ impl ExecutionManager {
         account_id: AccountId,
         instrument: &InstrumentAny,
         fills: &[&FillReport],
-        is_synthetic: bool,
-        mut fill_queue: Option<&mut ReconciliationFillQueue>,
+        context: ExternalOrderContext<'_>,
     ) -> (Vec<OrderEventAny>, Option<ExternalOrderMetadata>) {
+        let ExternalOrderContext {
+            is_synthetic,
+            client_id,
+            mut fill_queue,
+        } = context;
+
+        if !fills.is_empty() && fill_queue.is_none() {
+            log::error!(
+                "Skipping external order {} for {}: reported fills require reconciliation queue state",
+                report.venue_order_id,
+                report.instrument_id,
+            );
+            return (Vec::new(), None);
+        }
+
         let (strategy_id, tags) =
             if let Some(claimed_strategy) = self.external_order_claims.get(&report.instrument_id) {
                 let order_id = report
@@ -3589,7 +3658,7 @@ impl ExecutionManager {
 
         {
             let mut cache = self.cache.borrow_mut();
-            if let Err(e) = cache.add_order(order.clone(), None, None, false) {
+            if let Err(e) = cache.add_order(order.clone(), None, client_id, false) {
                 // Deterministic synthetic reconciliation IDs hash the same logical event
                 // to the same client_order_id, so a restart replay can legitimately collide
                 // with a cached order. Differentiate expected dedup from stuck state.
@@ -3673,9 +3742,13 @@ impl ExecutionManager {
                     let mut real_fill_total = Decimal::ZERO;
 
                     for fill in &sorted_fills {
-                        let fill_queue = fill_queue
-                            .as_deref_mut()
-                            .expect("real report fills require reconciliation queue state");
+                        let Some(fill_queue) = fill_queue.as_deref_mut() else {
+                            log::error!(
+                                "Stopped external fill processing for {}: reconciliation queue state was lost",
+                                report.venue_order_id,
+                            );
+                            break;
+                        };
 
                         if let Some((fill_event, fill_key)) = self.create_order_fill(
                             &cached_order,
@@ -3717,6 +3790,7 @@ impl ExecutionManager {
         }
 
         let metadata = ExternalOrderMetadata {
+            client_id,
             client_order_id,
             venue_order_id: report.venue_order_id,
             instrument_id: report.instrument_id,

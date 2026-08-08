@@ -17,22 +17,16 @@
 //! This module exposes Rust functionality to Python via PyO3,
 //! enabling integration with NautilusTrader's Python layer.
 //!
-//! # Architecture
-//!
-//! The Python bindings follow a gateway-centric architecture:
-//!
-//! 1. `RithmicGateway` - Central connection manager for all Rithmic plants
-//! 2. `RithmicDataClient` - Market data subscriptions (requires connected gateway)
-//! 3. `RithmicExecutionClient` - Order management (requires connected gateway)
-//!
-//! For NautilusTrader integration, use the high-level Python classes:
-//! - `RithmicLiveDataClient` - from `nautilus_trader.adapters.rithmic.data`
-//! - `RithmicLiveExecutionClient` - from `nautilus_trader.adapters.rithmic.execution`
-//!
-//! These classes handle gateway lifecycle and async operations internally.
+//! The NautilusTrader v2 integration is Rust-owned: Python supplies typed configuration and
+//! factories, while [`crate::data::live::RithmicLiveDataClient`] and
+//! [`crate::execution::live::RithmicLiveExecClient`] own runtime behavior. The low-level gateway,
+//! data, execution, and venue-event bindings remain available for backwards compatibility and
+//! diagnostics, but are not a second high-level Nautilus client implementation.
 
 #[cfg(feature = "python")]
 mod config;
+#[cfg(feature = "python")]
+mod custom;
 #[cfg(feature = "python")]
 mod data;
 #[cfg(feature = "python")]
@@ -117,7 +111,7 @@ fn extract_rithmic_exec_config(
 #[cfg(feature = "python")]
 #[pymodule]
 pub fn rithmic(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Register existing PyO3 classes (v1 path)
+    // Register low-level compatibility and diagnostic bindings.
     config::register(m)?;
     enums::register(m)?;
     events::register(m)?;
@@ -126,6 +120,17 @@ pub fn rithmic(m: &Bound<'_, PyModule>) -> PyResult<()> {
     execution::register(m)?;
     instruments::register(m)?;
     symbols::register(m)?;
+
+    // Register every Rust custom-data payload which can cross into Python.
+    m.add_class::<crate::data::RithmicTradeStatistics>()?;
+    m.add_class::<crate::data::RithmicQuoteStatistics>()?;
+    m.add_class::<crate::data::RithmicIndicatorPrices>()?;
+    m.add_class::<crate::data::RithmicOpenInterest>()?;
+    m.add_class::<crate::data::RithmicEndOfDayPrices>()?;
+    m.add_class::<crate::data::RithmicOrderPriceLimits>()?;
+    m.add_class::<crate::data::RithmicSymbolMarginRate>()?;
+    m.add_class::<crate::data::RithmicVolumeAtPrice>()?;
+    m.add_class::<crate::data::RithmicMinuteVolumeProfileBar>()?;
 
     // Register v2 factory classes
     m.add_class::<crate::factories::RithmicDataClientFactory>()?;

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # mypy: disable-error-code="arg-type,attr-defined,index"
-# ruff: noqa: E402
 # -------------------------------------------------------------------------------------------------
 #  Copyright (C) 2026 Kevin Monaghan. All rights reserved.
 #
@@ -23,32 +22,35 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from examples.live.live_node_run_helpers import interrupt_live_node_run
-from examples.live.live_node_run_helpers import sleep_or_cancel
-from examples.live.live_node_run_helpers import start_live_node_monitor
-from examples.live.live_node_run_helpers import wait_for_event_or_cancel
-
-from examples.live.rithmic.rithmic_data_probe import clear_probe_state
-from examples.live.rithmic.rithmic_data_probe import register_probe_state
-from examples.live.rithmic.rithmic_data_probe import snapshot_probe_state
-from examples.live.rithmic.rithmic_data_probe import wait_for_probe_data
-from examples.live.rithmic.rithmic_data_probe import wait_for_probe_stop
-from examples.live.rithmic.rithmic_live_node_helpers import TRADER_ID
-from examples.live.rithmic.rithmic_live_node_helpers import RithmicDataClientFactory
-from examples.live.rithmic.rithmic_live_node_helpers import build_data_client_config
-from examples.live.rithmic.rithmic_live_node_helpers import build_data_client_id
-from examples.live.rithmic.rithmic_live_node_helpers import load_rithmic_env_file
 from nautilus_trader._libnautilus.common import Environment
 from nautilus_trader.live import LiveNode
-from nautilus_trader.model import BarType
-from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import BarType, InstrumentId
 
+from examples.live.live_node_run_helpers import (
+    interrupt_live_node_run,
+    sleep_or_cancel,
+    start_live_node_monitor,
+    wait_for_event_or_cancel,
+)
+from examples.live.rithmic.rithmic_data_probe import (
+    clear_probe_state,
+    register_probe_state,
+    snapshot_probe_state,
+    wait_for_probe_data,
+    wait_for_probe_stop,
+)
+from examples.live.rithmic.rithmic_live_node_helpers import (
+    TRADER_ID,
+    RithmicDataClientFactory,
+    build_data_client_config,
+    build_data_client_id,
+    load_rithmic_env_file,
+)
 
 if TYPE_CHECKING:
     from nautilus_trader.config import ImportableStrategyConfig
@@ -65,7 +67,7 @@ else:
 load_rithmic_env_file()
 
 PROFILE = None
-INSTRUMENT_ID = InstrumentId.from_str("MNQM6.RITHMIC")
+INSTRUMENT_ID = InstrumentId.from_str("MNQM6.CME.RITHMIC")
 BAR_SPEC = "1-MINUTE-LAST-EXTERNAL"
 CAPTURE_SECONDS = 30.0
 READY_TIMEOUT_SECONDS = 60.0
@@ -124,7 +126,7 @@ def _print_probe_summary(summary: dict[str, object]) -> None:
         print(f"Errors: {summary['errors']}")
 
 
-def run_probe(  # noqa: C901
+def run_probe(
     *,
     profile: str | None,
     instrument_id: InstrumentId,
@@ -157,7 +159,7 @@ def run_probe(  # noqa: C901
         .with_timeout_disconnection_secs(10)
         .with_delay_post_stop_secs(5)
         .add_data_client(
-            None,
+            data_client_id,
             RithmicDataClientFactory(),
             build_data_client_config(
                 profile,
@@ -226,9 +228,7 @@ def run_probe(  # noqa: C901
             return
 
         if not ready_snapshot["instrument_ready"] and ready_snapshot["data_seen"]:
-            initial_wait_warning = (
-                "Received Rithmic data before the instrument response; continuing probe."
-            )
+            initial_wait_warning = "Received Rithmic data before the instrument response; continuing probe."
 
         capture_deadline = time.monotonic() + capture_seconds
         initial_wait = min(first_data_wait_seconds, max(capture_seconds, 0.0))

@@ -22,6 +22,7 @@ mod handler;
 pub mod live;
 mod parse;
 
+pub(crate) use client::validate_command_price;
 pub use client::{
     ExecutionEvent, OrderAccepted, OrderCancelled, OrderContext, OrderFilled, OrderModified,
     OrderRejected, OrderRequest, OrderState, OrderSubmitted, RithmicExecutionClient,

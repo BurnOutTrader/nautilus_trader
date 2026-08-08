@@ -53,11 +53,10 @@ depending on the use case.
 - `RithmicInstrumentProvider`: Instrument parsing and loading functionality.
 - `RithmicDataClient`: Low-level Rust market-data client.
 - `RithmicExecutionClient`: Low-level Rust execution client.
-- `RithmicLiveDataClient`: Nautilus `LiveMarketDataClient` implementation.
-- `RithmicLiveExecClient`: Nautilus `LiveExecutionClient` implementation.
-- `RithmicDataClientFactory` / `RithmicExecClientFactory`: Rust v2 `LiveNode` factories.
-- `RithmicLiveDataClientFactory` / `RithmicLiveExecClientFactory`: thin Python `TradingNode`
-  compatibility wrappers over the same Rust live clients.
+- `RithmicLiveDataClient`: Rust Nautilus live data-client implementation.
+- `RithmicLiveExecClient`: Rust Nautilus live execution-client implementation.
+- `RithmicDataClientFactory` / `RithmicExecClientFactory`: Rust factories projected to Python
+  through a thin PyO3 layer for `LiveNode`.
 
 > [!NOTE]
 >
@@ -66,7 +65,7 @@ depending on the use case.
 
 ### Runtime paths
 
-The adapter currently exposes four related paths:
+The adapter exposes three related paths:
 
 - Pure Rust v2 `LiveNode` path:
   - `rithmic_nt::RithmicDataClientFactory`
@@ -74,53 +73,44 @@ The adapter currently exposes four related paths:
   - `rithmic_nt::get_rithmic_data_client_id(...)`
   - `rithmic_nt::get_rithmic_exec_client_id(...)`
   - `rithmic_nt::get_rithmic_adapter_account_id(...)`
-- Python v2 `LiveNode` / registry path:
-  - `nautilus_trader.adapters.rithmic.bindings.RithmicDataClientFactory`
-  - `nautilus_trader.adapters.rithmic.bindings.RithmicExecClientFactory`
+- Python v2 `LiveNode` path:
+  - `nautilus_trader.adapters.rithmic.RithmicDataClientFactory`
+  - `nautilus_trader.adapters.rithmic.RithmicExecClientFactory`
   - Rust `RithmicLiveDataClient` / `RithmicLiveExecClient` implementations behind the PyO3 factories
-
-- Python `TradingNode` path:
-  - `nautilus_trader.adapters.rithmic.RithmicLiveDataClientFactory`
-  - `nautilus_trader.adapters.rithmic.RithmicLiveExecClientFactory`
-  - thin Python compatibility wrappers used only to satisfy Nautilus `TradingNode` interfaces
 - Raw binding path:
-  - `nautilus_trader.adapters.rithmic.bindings.RithmicGateway`
-  - `nautilus_trader.adapters.rithmic.bindings.RithmicDataClient`
-  - `nautilus_trader.adapters.rithmic.bindings.RithmicExecutionClient`
+  - `nautilus_trader.adapters.rithmic.RithmicGateway`
+  - `nautilus_trader.adapters.rithmic.RithmicDataClient`
+  - `nautilus_trader.adapters.rithmic.RithmicExecutionClient`
   - explicit low-level helper flows such as the native bracket / OCO examples
 
-Most venue-specific behavior still lives in Rust. The Python `TradingNode` layer is intentionally
-thin, but it now follows the same reconnect, reconciliation, market-data, and report-generation
-contract as the Rust v2 live-client path rather than acting as a separate adapter. The pure Rust
-`LiveNode` path and the PyO3 `LiveNode` registry path use the same Rust live-client implementations
-and therefore share the same venue capability surface.
+Venue-specific transport, state, reconnect, reconciliation, market-data, and report-generation
+behavior lives in Rust. The pure Rust and PyO3 `LiveNode` paths use the same Rust live-client
+implementations and therefore share the same capability surface. Python contains configuration,
+backtest, and example orchestration helpers rather than a second adapter implementation.
 
 The current runnable Python examples in `examples/live/rithmic/` primarily use the PyO3
-`LiveNode` registry path. The `TradingNode` wrappers remain available as a compatibility surface
-and are shown later in this guide.
+`LiveNode` path.
 
 > [!NOTE]
 >
 > `nautilus_trader.adapters.rithmic.RithmicDataClientFactory` and
-> `nautilus_trader.adapters.rithmic.RithmicExecClientFactory` are only exported
-> when the compiled bindings include the v2 factory types. If those bindings are
-> unavailable, the adapter keeps only the explicit `RithmicLive*` compatibility
-> factories rather than silently aliasing the v2 names to the wrapper path.
+> `nautilus_trader.adapters.rithmic.RithmicExecClientFactory` require a build whose compiled PyO3
+> module includes the Rithmic adapter.
 
 ### Runtime-path capability summary
 
-| Capability | Raw binding path | Rust v2 `LiveNode` path (pure Rust or PyO3) | Python `TradingNode` path |
-|------------|------------------|--------------------------------------------|---------------------------|
-| Quotes / trades | ✓ | ✓ | ✓ |
-| Live external bars | ✓ | ✓ | ✓ |
-| Historical time bars | ✓ | ✓ | ✓ |
-| Historical `N‑TICK` bars | ✓ | ✓ | ✓ |
-| Order book deltas | ✓ | ✓ | ✓ |
-| Order book snapshots / depth ladders | ✓ | ✓ | ✓ |
-| Single‑order execution | ✓ | ✓ | ✓ |
-| Auto reconnect and execution re‑bootstrap | manual / low‑level | ✓ | ✓ |
-| General Nautilus `SubmitOrderList` | - | Limited | Limited |
-| Explicit native bracket / OCO helpers | ✓ | - | - |
+| Capability | Raw binding path | Rust v2 `LiveNode` path (pure Rust or PyO3) |
+|------------|------------------|--------------------------------------------|
+| Quotes / trades | ✓ | ✓ |
+| Live external bars | ✓ | ✓ |
+| Historical time bars | ✓ | ✓ |
+| Historical `N‑TICK` bars | ✓ | ✓ |
+| Order book deltas | ✓ | ✓ |
+| Order book snapshots / depth ladders | ✓ | ✓ |
+| Single‑order execution | ✓ | ✓ |
+| Auto reconnect and execution re‑bootstrap | manual / low‑level | ✓ |
+| General Nautilus `SubmitOrderList` | - | Limited |
+| Explicit native bracket / OCO helpers | ✓ | - |
 
 `Limited` order-list support means adapter-local translation for:
 
@@ -129,14 +119,14 @@ and are shown later in this guide.
   reduce-only child, and one `LIMIT` reduce-only child
 
 Market-entry brackets and other list shapes still reject explicitly on the
-Rust v2 and Python wrapper paths.
+Rust v2 path.
 `native_bracket_state_path` is currently reserved for future persisted native
 bracket-state support and is rejected explicitly on the current PyO3 execution
 paths if it is configured.
 
 ## Examples
 
-Live example scripts are available [here](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/rithmic/).
+Live example scripts are available in [`examples/live/rithmic/`](../../examples/live/rithmic/).
 
 ### Rust Examples
 
@@ -158,7 +148,7 @@ Live example scripts are available [here](https://github.com/nautechsystems/naut
 - `rithmic_ema_cross.py` for a full live `LiveNode` / PyO3 EMA-cross strategy on a configured futures contract with native 15-second external bars and bounded historical warmup by default.
 - `rithmic_ema_cross_two_accounts.py` for live copy-trading into two accounts under the same Rithmic login/system from one `LiveNode`.
 - `rithmic_ema_cross_two_systems.py` for live copy-trading into two different Rithmic profiles, systems, or logins from one `LiveNode`.
-- [`notebooks/rithmic_contracts_fetch_to_parquet.ipynb`](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/rithmic/notebooks/rithmic_contracts_fetch_to_parquet.ipynb) for the optional advanced workflow: explicit symbol probing, manual day-partitioned parquet export, synthetic-root continuous-history export, and a simple continuous-data EMA backtest. Use this notebook when you need continuous-root preprocessing or custom parquet layout rather than the standard catalog examples.
+- [`notebooks/rithmic_contracts_fetch_to_parquet.ipynb`](../../examples/live/rithmic/notebooks/rithmic_contracts_fetch_to_parquet.ipynb) for the optional advanced workflow: explicit symbol probing, manual day-partitioned parquet export, synthetic-root continuous-history export, and a simple continuous-data EMA backtest. Use this notebook when you need continuous-root preprocessing or custom parquet layout rather than the standard catalog examples.
 
 ### Python Helpers
 
@@ -175,9 +165,7 @@ examples cover the catalog-backed pure Rust historical and backtest path. The Ru
 `LiveNode` path directly. The conformance
 keepalive, order, bracket, and OCO examples use the raw binding path directly. The current Python
 data tester, order-book probe, live capture, execution tester, and EMA-cross examples use the
-PyO3 `LiveNode` registry path so they exercise the same Rust live clients used by the Rust v2
-runtime. The `TradingNode` wrapper factories remain available as a compatibility surface rather
-than the primary example path.
+PyO3 `LiveNode` path so they exercise the same Rust live clients used by the Rust v2 runtime.
 
 Companion workflow guide:
 
@@ -209,7 +197,7 @@ The current adapter is futures-focused.
 | Product Type | Supported | Notes |
 |--------------|-----------|-------|
 | Futures market data | ✓ | Live quote ticks, live trade ticks, instrument definitions, historical bars, and historical trade ticks synthesized from 1-tick replay bars. |
-| Futures execution | ✓ | Standard live order submission and reconciliation are available through both the Rust v2 `LiveNode` path and the Python `TradingNode` wrapper path. High‑level `SubmitOrderList` now supports native two‑leg OCO lists and three‑order limit‑entry brackets. Market‑entry brackets and other list shapes remain unsupported on those high‑level paths. |
+| Futures execution | ✓ | Standard live order submission and reconciliation are available through the Rust v2 `LiveNode` path in Rust and Python. High‑level `SubmitOrderList` supports native two‑leg OCO lists and three‑order limit‑entry brackets. Market‑entry brackets and other list shapes remain unsupported. |
 | Spot / cash products | - | Not exposed through the current adapter surface. |
 | Options workflows | Limited | The adapter does not currently provide a complete options‑specific operator guide or examples. |
 
@@ -238,34 +226,36 @@ The adapter supports the following Rithmic environments:
 | Live | `RithmicEnv.LIVE` | Production trading plants. |
 | Test | `RithmicEnv.TEST` | Alternate test routing when provided by your setup. |
 
-The public adapter boundary is now v2 PyO3-first:
+The public adapter boundary is v2 PyO3-first:
 
 - `RithmicDataClientConfig` and `RithmicExecClientConfig` are the raw PyO3 config classes used by
   `LiveNode`
-- `RithmicLiveDataClientConfig` and `RithmicLiveExecClientConfig` are explicit Python
-  compatibility configs for the `TradingNode` wrapper path only
+- `RithmicDataClientFactory` and `RithmicExecClientFactory` construct the Rust live clients; Python
+  does not maintain a separate live-client implementation
 
 ## Symbology
 
 ### Contract symbology
 
-Use the exact futures contract symbol together with the Rithmic venue.
+Use the exact futures contract symbol and exchange together with the Rithmic venue.
 
 ```python
 from nautilus_trader.model.identifiers import InstrumentId
 
-instrument_id = InstrumentId.from_str("MNQM6.RITHMIC")
+instrument_id = InstrumentId.from_str("MNQM6.CME.RITHMIC")
 ```
 
-This is still a standard Nautilus `{symbol.venue}` identifier:
+Rithmic uses the canonical `{contract}.{exchange}.RITHMIC` form:
 
-- symbol: `MNQM6`
+- contract: `MNQM6`
+- exchange: `CME`
 - venue: `RITHMIC`
 
-The exchange is no longer encoded into the `InstrumentId`. The adapter stores the exchange on the
-loaded `FuturesContract` and resolves it internally for live data, historical requests, and order
-submission. The venue-native contract code is preserved as the instrument `raw_symbol`
-(`MNQM6` in this example).
+The exchange component prevents collisions when the same contract code is listed on more than one
+Rithmic exchange. The venue-native contract code is preserved as the instrument `raw_symbol`
+(`MNQM6` in this example). The legacy `{contract}.RITHMIC` form is accepted as an input alias only
+when the cached contract resolves to exactly one exchange; emitted instruments and events always
+use the canonical exchange-qualified ID.
 
 ### Cross-feed symbol helpers
 
@@ -295,14 +285,14 @@ Notes:
 
 ### Live front-month workflow
 
-The adapter does **not** treat a root alias such as `MNQ.RITHMIC` as a live tradable contract ID.
-Live requests and orders should use an exact contract such as `MNQM6.RITHMIC`.
+The adapter does **not** treat a root alias such as `MNQ.CME.RITHMIC` as a live tradable contract
+ID. Live requests and orders should use an exact contract such as `MNQM6.CME.RITHMIC`.
 
 The supported live workflow today is:
 
 1. Start with a product root and exchange, such as `MNQ` and `CME`.
 2. Resolve the active contract through `load_front_month_async(...)`.
-3. Build the actual live `InstrumentId`, such as `MNQM6.RITHMIC`.
+3. Use the returned live `InstrumentId`, such as `MNQM6.CME.RITHMIC`.
 4. Use that resolved contract ID for live subscriptions, bar requests, and order submission.
 
 `FuturesContract.activation_ns` is populated from Rithmic auxiliary reference data when
@@ -318,7 +308,6 @@ ID for the current session.
 The notebook helpers under `examples/live/rithmic/notebooks/` follow this pattern.
 
 ```python
-from nautilus_trader.adapters.rithmic import RITHMIC
 from nautilus_trader.adapters.rithmic import RithmicInstrumentProvider
 from nautilus_trader.adapters.rithmic.config import RithmicDataClientConfig
 from nautilus_trader.model.identifiers import InstrumentId
@@ -332,7 +321,7 @@ async def resolve_front_month_instrument_id(
     config = RithmicDataClientConfig.from_env(profile)
     provider = RithmicInstrumentProvider(config)
     contract = await provider.load_front_month_async(product, exchange)
-    return InstrumentId.from_str(f"{contract.symbol}.{RITHMIC}")
+    return contract.id
 ```
 
 If you want to start from a root such as `MNQ`, resolve the front month first, then pass the
@@ -385,13 +374,9 @@ The adapter no longer relies on venue-wide `get_product_codes(...)` enumeration,
 exchange snapshots, or the older search-and-fan-out discovery path for the production catalog and
 live instrument-request flow. The same supported-root front-month bootstrap is also used when the
 live data client handles `request_instruments()`.
-On the Python `TradingNode` path, `request_instruments()` and `subscribe_instruments()` now trigger
-an on-demand provider load with the configured `instrument_provider.filters` merged with any
-request-time filters. Those live fast front-month requests now default to
-`front_month_only=True`, so they return one current `FuturesContract` per supported hard-coded root
-by default. Setting `front_month_only=False` currently routes through the provider-backed catalog
-load path, which still returns the supported-root current-contract set rather than a full-chain
-scan.
+On the `LiveNode` path, `request_instruments()` triggers an on-demand provider load. The live
+front-month request returns one current `FuturesContract` per supported hard-coded root rather than
+a full historical contract-chain scan.
 
 ### High-level backtest helper flow
 
@@ -481,26 +466,25 @@ supported exchanges:
 | Volume profile bars | ✓ | Historical‑only. Returned as `RithmicMinuteVolumeProfileBar` custom data via `request_data`. Requires `enable_history=True`. |
 | Live external bar subscriptions | ✓ | Time bars and tick bars via the history plant when `enable_history=True`. |
 | Internal bars | ✓ | Still the simplest live strategy pattern: subscribe to ticks and consolidate inside Nautilus. |
-| Order book deltas / depth | ✓ | Incremental order‑book deltas are supported on the raw binding path, Rust v2 live‑client path, and Python `TradingNode` wrapper path. Depth snapshots and `OrderBookDepth10` subscriptions are also available across those paths. |
-| Instrument status / close updates | Limited | `MarketMode` is mapped to Nautilus `InstrumentStatus` on the raw binding, Rust v2, and Python wrapper paths. Exchange close updates are still not exposed as a separate venue feed. |
-| Rithmic statistics / indicator custom data | Limited | Rust v2 live clients can explicitly subscribe to `TradeStatistics`, `QuoteStatistics`, `IndicatorPrices`, `OpenInterest`, `EndOfDayPrices`, `OrderPriceLimits`, and `SymbolMarginRate` as Nautilus custom data. The Python wrapper still does not surface those live custom‑data subscriptions. |
+| Order book deltas / depth | ✓ | Incremental order‑book deltas, bootstrapped snapshots, and `OrderBookDepth10` subscriptions are supported on the raw binding and Rust v2 live-client paths. |
+| Instrument status / close updates | Limited | `MarketMode` is mapped to Nautilus `InstrumentStatus`. Exchange close updates are not exposed as a separate venue feed. |
+| Rithmic statistics / indicator custom data | Limited | Rust v2 live clients can explicitly subscribe to `TradeStatistics`, `QuoteStatistics`, `IndicatorPrices`, `OpenInterest`, `EndOfDayPrices`, `OrderPriceLimits`, and `SymbolMarginRate` as Nautilus custom data. |
 | Funding, mark price, index price feeds | - | Not provided by the current adapter. |
 
-### Python `TradingNode` wrapper limitations
+### LiveNode limitations
 
-The current thin Python wrapper path intentionally does not expose every low-level feature.
+The high-level Rust live-client path intentionally does not expose every low-level feature.
 
 - Market data:
   - no historical quote-tick requests
   - historical trade-tick requests are synthesized from 1-tick bar replay, so aggressor side is
     always `NO_AGGRESSOR`
-  - live Rithmic-specific custom market-data subscriptions are still centered on the Rust v2
-    engine path rather than the Python wrapper path
+  - Rithmic-specific custom market-data subscriptions use Nautilus `DataType` requests
 - Execution:
   - standard single-order submit / modify / cancel is supported
   - automatic forced-logout / reconnect recovery replays account snapshot, open-order query, and bounded execution history on reconnect
-  - locally submitted orders are enriched from Rust-side tracked order metadata before the Python
-    wrapper builds reports, which hardens sparse immediate Rithmic submit notifications
+  - locally submitted orders are enriched from Rust-side tracked order metadata before reports are
+    built, which hardens sparse immediate Rithmic submit notifications
   - `SubmitOrderList` supports only:
     - two-leg OCO lists
     - three-order limit-entry brackets with `OTO` parent plus `STOP_MARKET` / `LIMIT`
@@ -652,7 +636,7 @@ Each bar carries standard OHLCV fields plus a full per-price-level volume breakd
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `instrument_id` | `InstrumentId` | e.g. `ESM5.RITHMIC` |
+| `instrument_id` | `InstrumentId` | e.g. `ESM5.CME.RITHMIC` |
 | `open_price` / `high_price` / `low_price` / `close_price` | `f64` | Standard OHLC |
 | `volume` | `u64` | Total volume for the bar |
 | `bid_volume` / `ask_volume` | `u64` | Bid‑side and ask‑side volume |
@@ -678,7 +662,7 @@ use nautilus_model::data::DataType;
 let data_type = DataType::new(
     "RithmicMinuteVolumeProfileBar",
     None,                                    // optional metadata — see below
-    Some("ESM5.RITHMIC".to_string()),    // instrument_id as identifier
+    Some("ESM5.CME.RITHMIC".to_string()), // instrument_id as identifier
 );
 actor.request_data(client_id, data_type, Some(start), Some(end), None, None);
 ```
@@ -706,7 +690,7 @@ let metadata: Params = serde_json::from_value(json!({"period": 5})).unwrap();
 let data_type = DataType::new(
     "RithmicMinuteVolumeProfileBar",
     Some(metadata),
-    Some("ESM5.RITHMIC".to_string()),
+    Some("ESM5.CME.RITHMIC".to_string()),
 );
 ```
 
@@ -777,7 +761,7 @@ Example:
 from nautilus_trader.model.data import BarType
 
 
-bar_type = BarType.from_str("MNQM6.RITHMIC-1-MINUTE-LAST-EXTERNAL")
+bar_type = BarType.from_str("MNQM6.CME.RITHMIC-1-MINUTE-LAST-EXTERNAL")
 strategy.subscribe_bars(bar_type, params={"exchange": "CME"})
 ```
 
@@ -787,7 +771,7 @@ Tick-bar example:
 from nautilus_trader.model.data import BarType
 
 
-bar_type = BarType.from_str("MNQM6.RITHMIC-233-TICK-LAST-EXTERNAL")
+bar_type = BarType.from_str("MNQM6.CME.RITHMIC-233-TICK-LAST-EXTERNAL")
 strategy.subscribe_bars(bar_type, params={"exchange": "CME"})
 ```
 
@@ -834,7 +818,7 @@ This is the pattern used by the current `rithmic_ema_cross.py` and related live-
 
 | Capability | Status | Notes |
 |------------|--------|-------|
-| Submit order | ✓ | Single‑order submission through the Rust v2 and Python wrapper execution clients. |
+| Submit order | ✓ | Single-order submission through the Rust v2 execution client in Rust or Python. |
 | Modify order | ✓ | Venue order ID required once the order is working. |
 | Cancel order | ✓ | Venue order ID required once the order is working. |
 | Cancel all orders | ✓ | Cancels all open orders for the configured account connection. |
@@ -843,14 +827,13 @@ This is the pattern used by the current `rithmic_ema_cross.py` and related live-
 | Open‑order snapshot recovery | ✓ | Reconcile active working orders on connect. |
 | Filled‑order snapshot recovery | ✓ | When Rithmic omits cumulative average fill price on reconnect snapshots, the adapter backfills `avg_px` from observed fill reports so reconciliation can still rebuild fills. |
 | Account / PnL snapshots | ✓ | Primary account balances and positions are rebuilt from the PnL plant. |
-| Forced logout / reconnect recovery | ✓ | Rust v2 and Python wrapper execution clients automatically reconnect and rerun their bootstrap after forced logout, channel close, or heartbeat‑driven reconnect. |
-| Shared multi‑account fan‑out | - | Current adapter remains one execution client per configured Rithmic account. |
+| Forced logout / reconnect recovery | ✓ | The Rust v2 execution client automatically reconnects and reruns its bootstrap after forced logout, channel close, or heartbeat-driven reconnect. |
+| Shared multi-account fan-out | ✓ | Configure one execution client per Rithmic account and route by explicit client ID or exact account ID. |
 
 ### Native `SubmitOrderList` routing
 
-The adapter now implements a **limited** adapter-local `SubmitOrderList`
-bridge on both the Rust v2 execution client and the Python `TradingNode`
-wrapper execution client.
+The adapter implements a **limited** adapter-local `SubmitOrderList` bridge in the Rust v2
+execution client, exposed identically through PyO3.
 
 Supported high-level list shapes today:
 
@@ -913,8 +896,10 @@ so users do not need to manually `export` each variable every run.
 
 Behavior:
 
-- Only keys starting with `RITHMIC_` are imported.
-- Existing environment variables are not overwritten.
+- Only keys starting with `RITHMIC_` are loaded into an adapter-owned cache; the helper does not
+  mutate the process environment.
+- Existing process environment variables are not overwritten and take precedence over cached
+  dotenv values.
 - Default call with no `path` loads `.env` in the current working directory.
 - Profile-scoped keys such as `RITHMIC_APEX_USERNAME` are supported naturally because they are still
   `RITHMIC_*` keys.
@@ -972,8 +957,6 @@ beyond the core adapter configuration:
 | Env key | Used by example(s) | Purpose |
 |---------|--------------------|---------|
 | `RITHMIC_PROFILE` | multiple examples | Selects which profile name to pass into helper config builders. |
-| `RITHMIC_ACCOUNT_ID_2` | `rithmic_ema_cross_two_accounts.py` | Secondary execution account in the two‑account EMA example. |
-| `RITHMIC_{PROFILE}_ACCOUNT_ID_2` | `rithmic_ema_cross_two_accounts.py` | Profile‑scoped secondary account override. |
 | `NAUTILUS_PATH` | `rithmic_download_bars.py`, `rithmic_backtest_high_level.py`, `rithmic_live_data_capture.py` | Parent workspace used to place or read `<NAUTILUS_PATH>/catalog`. |
 
 The current `rithmic_data_tester.py`, `rithmic_exec_tester.py`, `rithmic_ema_cross.py`,
@@ -1119,27 +1102,28 @@ Regular operator setups should use named `server` / `alt_server` selection.
 
 ### Multiple accounts on the same `RITHMIC` venue
 
-The adapter supports multiple Rithmic execution clients in one node without changing Nautilus core
-only when you route explicitly by `client_id`.
+The adapter supports multiple Rithmic execution clients on the same venue in one node. Nautilus
+routes by an explicit `client_id` first, then by an exact account when the command or cached order
+provides one, and finally by the venue-default client.
 
 This is a **live-only operational feature** intended for explicit multi-account routing and
-copy-trading style setups under one Rithmic login/system. It is **not** a backtest feature, and it
-does not change Nautilus core venue-routing semantics.
+copy-trading style setups under one Rithmic login/system. It is **not** a backtest feature.
+Nautilus routes an explicit `client_id` or exact account match before using the venue-default
+client, so venue-only commands remain intentionally unambiguous.
 
 Supported contract:
 
 - the venue remains `RITHMIC` for all Rithmic clients
 - each execution account gets a distinct adapter `client_id` derived from `system_name` plus
   `account_id`
-- strategies or actors must pass that `client_id` explicitly on order and execution commands for
-  every non-default Rithmic account
-- the Python `TradingNode` path should use distinct client config keys without hyphens, for example
-  `RITHMIC_APEX_DATA`, `RITHMIC_APEX_EXEC_1`, and `RITHMIC_APEX_EXEC_2`
+- strategies or actors should pass that `client_id` explicitly on order and execution commands for
+  every non-default Rithmic account; exact account routing is also supported
+- each PyO3 `LiveNode.add_exec_client(...)` call must use its distinct derived client ID
 
-Not supported by this adapter-only path:
+Not supported:
 
 - automatic venue-only inference between multiple Rithmic execution clients on the same venue
-- implicit multi-account routing without an explicit `client_id`
+- implicit selection of a non-default account when neither `client_id` nor `account_id` is supplied
 
 Example derived identities for `system_name="Apex"`:
 
@@ -1147,8 +1131,8 @@ Example derived identities for `system_name="Apex"`:
 - execution client ID for `PA-123456`: `APEX_PA_123456`
 - execution client ID for `PA-654321`: `APEX_PA_654321`
 - adapter account IDs:
-  - `APEX_PA_123456-PA-123456`
-  - `APEX_PA_654321-PA-654321`
+  - `RITHMIC-APEX_PA_123456-PA-123456`
+  - `RITHMIC-APEX_PA_654321-PA-654321`
 
 Use the helper functions from `nautilus_trader.adapters.rithmic.config` to derive the routing IDs
 the same way as the adapter:
@@ -1164,7 +1148,10 @@ strategy.submit_order(order, client_id=client_id)
 The complete adapter-only example is
 `examples/live/rithmic/rithmic_ema_cross_two_accounts.py`, which runs one shared data client and
 two execution clients under the same Rithmic login/system while routing orders explicitly by
-`client_id`.
+`client_id`. It uses the default profile for the primary account and a `SECONDARY` profile for the
+second account. Configure both profiles with identical login, system, server, and application
+values but distinct `ACCOUNT_ID` values; the matching session identity makes the clients reuse one
+upstream gateway without relying on Python process-environment mutation.
 
 ### Multiple Rithmic systems/logins in one node
 
@@ -1216,16 +1203,17 @@ profile and copies the same orders into two different Rithmic systems/logins fro
 
 ## Live node example
 
-The current Python examples in this repository use the PyO3 `LiveNode` path rather than the
-`TradingNode` compatibility wrappers. The snippet below mirrors the helper flow used by the
-repository's `rithmic_data_tester.py` and `rithmic_ema_cross.py` examples.
+The current Python examples use the PyO3 `LiveNode` path. The snippet below mirrors the helper flow
+used by the repository's `rithmic_data_tester.py` and `rithmic_ema_cross.py` examples.
 
 ```python
 from examples.live.rithmic.rithmic_live_node_helpers import TRADER_ID
 from examples.live.rithmic.rithmic_live_node_helpers import RithmicDataClientFactory
 from examples.live.rithmic.rithmic_live_node_helpers import RithmicExecClientFactory
 from examples.live.rithmic.rithmic_live_node_helpers import build_data_client_config
+from examples.live.rithmic.rithmic_live_node_helpers import build_data_client_id
 from examples.live.rithmic.rithmic_live_node_helpers import build_exec_client_config
+from examples.live.rithmic.rithmic_live_node_helpers import build_exec_client_id
 from examples.live.rithmic.rithmic_live_node_helpers import load_rithmic_env_file
 from nautilus_trader.core.nautilus_pyo3.common import Environment
 from nautilus_trader.live import LiveNode
@@ -1234,12 +1222,14 @@ from nautilus_trader.model.identifiers import InstrumentId
 load_rithmic_env_file()
 
 profile = None
-instrument_id = InstrumentId.from_str("MNQM6.RITHMIC")
+instrument_id = InstrumentId.from_str("MNQM6.CME.RITHMIC")
+data_client_id = build_data_client_id(profile)
+exec_client_id = build_exec_client_id(profile)
 
 node = (
     LiveNode.builder("TRADER-001", TRADER_ID, Environment.LIVE)
     .add_data_client(
-        None,
+        data_client_id,
         RithmicDataClientFactory(),
         build_data_client_config(
             profile,
@@ -1247,83 +1237,12 @@ node = (
         ),
     )
     .add_exec_client(
-        None,
+        exec_client_id,
         RithmicExecClientFactory(),
         build_exec_client_config(profile),
     )
     .build()
 )
-```
-
-## TradingNode compatibility example
-
-The `TradingNode` wrappers remain supported when you need that interface shape, but they are no
-longer the primary path used by the current runnable Python examples.
-
-```python
-import os
-
-from nautilus_trader.adapters.rithmic import RITHMIC
-from nautilus_trader.adapters.rithmic import RithmicLiveDataClientConfig
-from nautilus_trader.adapters.rithmic import RithmicLiveExecClientConfig
-from nautilus_trader.adapters.rithmic import RithmicLiveDataClientFactory
-from nautilus_trader.adapters.rithmic import RithmicLiveExecClientFactory
-from nautilus_trader.adapters.rithmic import load_rithmic_env_file
-from nautilus_trader.config import InstrumentProviderConfig
-from nautilus_trader.config import LoggingConfig
-from nautilus_trader.config import TradingNodeConfig
-from nautilus_trader.live.node import TradingNode
-
-load_rithmic_env_file()  # Loads RITHMIC_* keys from .env if present
-
-profile = os.environ.get("RITHMIC_PROFILE")
-provider = InstrumentProviderConfig(
-    load_all=False,
-    filters={"exchange": "CME", "tradeable_only": True, "front_month_only": True},
-)
-
-base_data = RithmicLiveDataClientConfig.from_env(profile)
-base_exec = RithmicLiveExecClientConfig.from_env(profile)
-
-data_config = RithmicLiveDataClientConfig(
-    environment=base_data.environment,
-    username=base_data.username,
-    password=base_data.password,
-    system_name=base_data.system_name,
-    app_name=base_data.app_name,
-    app_version=base_data.app_version,
-    fcm_id=base_data.fcm_id,
-    ib_id=base_data.ib_id,
-    server=base_data.server,
-    alt_server=base_data.alt_server,
-    instrument_provider=provider,
-)
-exec_config = RithmicLiveExecClientConfig(
-    environment=base_exec.environment,
-    username=base_exec.username,
-    password=base_exec.password,
-    system_name=base_exec.system_name,
-    account_id=base_exec.account_id,
-    app_name=base_exec.app_name,
-    app_version=base_exec.app_version,
-    fcm_id=base_exec.fcm_id,
-    ib_id=base_exec.ib_id,
-    server=base_exec.server,
-    alt_server=base_exec.alt_server,
-    execution_replay_lookback_secs=base_exec.execution_replay_lookback_secs,
-    instrument_provider=provider,
-)
-
-node = TradingNode(
-    config=TradingNodeConfig(
-        logging=LoggingConfig(log_level="INFO", use_pyo3=True),
-        data_clients={RITHMIC: data_config},
-        exec_clients={RITHMIC: exec_config},
-    ),
-)
-node.add_data_client_factory(RITHMIC, RithmicLiveDataClientFactory)
-node.add_exec_client_factory(RITHMIC, RithmicLiveExecClientFactory)
-node.build()
 ```
 
 See the `examples/live/rithmic/` scripts for complete runnable node and low-level smoke examples.

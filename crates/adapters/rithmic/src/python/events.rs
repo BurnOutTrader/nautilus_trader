@@ -129,7 +129,8 @@ impl PyQuoteTick {
     /// Parameters
     /// ----------
     /// instrument_id : str
-    ///     The NautilusTrader instrument ID string (e.g. ``"ESH5.RITHMIC"``).
+    ///     The exchange-qualified NautilusTrader instrument ID string
+    ///     (e.g. ``"ESH5.CME.RITHMIC"``).
     /// price_precision : int, optional
     ///     Number of decimal places for prices. If not provided, uses stored value.
     /// size_precision : int, optional
@@ -146,15 +147,25 @@ impl PyQuoteTick {
         price_precision: Option<u8>,
         size_precision: Option<u8>,
     ) -> PyResult<NautilusQuoteTick> {
-        let instrument_id = NautilusInstrumentId::from(instrument_id);
+        let instrument_id = instrument_id
+            .parse::<NautilusInstrumentId>()
+            .map_err(to_pyvalue_err)?;
         let price_prec = price_precision.unwrap_or(self.inner.price_precision);
         let size_prec = size_precision.unwrap_or(self.inner.size_precision);
+        let bid_price =
+            Price::new_checked(self.inner.bid_price, price_prec).map_err(to_pyvalue_err)?;
+        let ask_price =
+            Price::new_checked(self.inner.ask_price, price_prec).map_err(to_pyvalue_err)?;
+        let bid_size =
+            Quantity::new_checked(self.inner.bid_size, size_prec).map_err(to_pyvalue_err)?;
+        let ask_size =
+            Quantity::new_checked(self.inner.ask_size, size_prec).map_err(to_pyvalue_err)?;
         NautilusQuoteTick::new_checked(
             instrument_id,
-            Price::new(self.inner.bid_price, price_prec),
-            Price::new(self.inner.ask_price, price_prec),
-            Quantity::new(self.inner.bid_size, size_prec),
-            Quantity::new(self.inner.ask_size, size_prec),
+            bid_price,
+            ask_price,
+            bid_size,
+            ask_size,
             self.inner.ts_event.into(),
             self.inner.ts_init.into(),
         )
@@ -259,7 +270,8 @@ impl PyTradeTick {
     /// Parameters
     /// ----------
     /// instrument_id : str
-    ///     The NautilusTrader instrument ID string (e.g. ``"ESH5.RITHMIC"``).
+    ///     The exchange-qualified NautilusTrader instrument ID string
+    ///     (e.g. ``"ESH5.CME.RITHMIC"``).
     /// price_precision : int, optional
     ///     Number of decimal places for prices. If not provided, uses stored value.
     /// size_precision : int, optional
@@ -275,9 +287,11 @@ impl PyTradeTick {
         instrument_id: &str,
         price_precision: Option<u8>,
         size_precision: Option<u8>,
-    ) -> NautilusTradeTick {
-        let instrument_id = NautilusInstrumentId::from(instrument_id);
-        let trade_id = TradeId::new(&self.inner.trade_id);
+    ) -> PyResult<NautilusTradeTick> {
+        let instrument_id = instrument_id
+            .parse::<NautilusInstrumentId>()
+            .map_err(to_pyvalue_err)?;
+        let trade_id = TradeId::new_checked(&self.inner.trade_id).map_err(to_pyvalue_err)?;
         let aggressor_side = match self.inner.aggressor_side.as_str() {
             "BUY" => AggressorSide::Buyer,
             "SELL" => AggressorSide::Seller,
@@ -285,15 +299,17 @@ impl PyTradeTick {
         };
         let price_prec = price_precision.unwrap_or(self.inner.price_precision);
         let size_prec = size_precision.unwrap_or(self.inner.size_precision);
-        NautilusTradeTick {
+        let price = Price::new_checked(self.inner.price, price_prec).map_err(to_pyvalue_err)?;
+        let size = Quantity::new_checked(self.inner.size, size_prec).map_err(to_pyvalue_err)?;
+        Ok(NautilusTradeTick {
             instrument_id,
-            price: Price::new(self.inner.price, price_prec),
-            size: Quantity::new(self.inner.size, size_prec),
+            price,
+            size,
             aggressor_side,
             trade_id,
             ts_event: self.inner.ts_event.into(),
             ts_init: self.inner.ts_init.into(),
-        }
+        })
     }
 
     #[pyo3(name = "__repr__")]
@@ -325,23 +341,26 @@ impl PyTradeTick {
         tick: &rithmic_rs::rti::ResponseTickBarReplay,
         sequence: usize,
     ) -> Option<Self> {
-        let ts_event = tick_timestamp_nanos(&tick.data_bar_ssboe, &tick.data_bar_usecs);
-        if ts_event == 0 {
-            return None;
-        }
+        let ts_event = tick_timestamp_nanos(&tick.data_bar_ssboe, &tick.data_bar_usecs)?;
+        let symbol = required_text(tick.symbol.as_deref())?;
+        let exchange = required_text(tick.exchange.as_deref())?;
         let price = tick
             .close_price
             .or(tick.open_price)
             .or(tick.high_price)
             .or(tick.low_price)
-            .unwrap_or(0.0);
+            .filter(|value| value.is_finite())?;
+        let volume = tick.volume.filter(|value| *value > 0)?;
+        let size = Quantity::from_mantissa_exponent_checked(volume, 0, 0)
+            .ok()?
+            .as_f64();
 
         Some(Self {
             inner: TradeTick {
-                symbol: tick.symbol.clone().unwrap_or_default(),
-                exchange: tick.exchange.clone().unwrap_or_default(),
+                symbol,
+                exchange,
                 price,
-                size: tick.volume.unwrap_or(0) as f64,
+                size,
                 aggressor_side: "NO_AGGRESSOR".to_string(),
                 trade_id: format!("replay:{ts_event}:{sequence}"),
                 price_precision: 2,
@@ -781,7 +800,7 @@ impl PyOrderFilled {
 
     /// Remaining quantity.
     #[getter(leaves_qty)]
-    fn py_leaves_qty(&self) -> f64 {
+    fn py_leaves_qty(&self) -> Option<f64> {
         self.inner.leaves_qty
     }
 
@@ -848,7 +867,7 @@ impl PyOrderFilled {
     #[pyo3(name = "__repr__")]
     fn py_repr(&self) -> String {
         format!(
-            "OrderFilled(client_order_id={}, fill_price={:.6}, fill_qty={}, leaves_qty={})",
+            "OrderFilled(client_order_id={}, fill_price={:.6}, fill_qty={}, leaves_qty={:?})",
             self.inner.client_order_id,
             self.inner.fill_price,
             self.inner.fill_qty,
@@ -1184,7 +1203,7 @@ impl PyMarketDataEvent {
     #[pyo3(name = "as_bar")]
     fn py_as_bar(&self) -> Option<PyTimeBar> {
         match &self.inner {
-            MarketDataEvent::Bar(bar) => Some(PyTimeBar::from(bar.clone())),
+            MarketDataEvent::Bar(bar) => PyTimeBar::from_live_bar(bar.clone()),
             _ => None,
         }
     }
@@ -1896,7 +1915,7 @@ impl PyTimeBar {
     /// ----------
     /// bar_type : str
     ///     The full NautilusTrader bar type string
-    ///     (e.g. ``"ESH5.RITHMIC-1-MINUTE-LAST-EXTERNAL"``).
+    ///     (e.g. ``"ESH5.CME.RITHMIC-1-MINUTE-LAST-EXTERNAL"``).
     /// price_precision : int, optional
     ///     Number of decimal places for prices. If not provided, uses stored value.
     /// size_precision : int, optional
@@ -1918,16 +1937,27 @@ impl PyTimeBar {
             .map_err(|e: BarTypeParseError| to_pyvalue_err(e.to_string()))?;
         let price_prec = price_precision.unwrap_or(self.price_precision);
         let size_prec = size_precision.unwrap_or(self.size_precision);
-        Ok(NautilusBar::new(
+        let open = Price::new_checked(self.open_price, price_prec).map_err(to_pyvalue_err)?;
+        let high = Price::new_checked(self.high_price, price_prec).map_err(to_pyvalue_err)?;
+        let low = Price::new_checked(self.low_price, price_prec).map_err(to_pyvalue_err)?;
+        let close = Price::new_checked(self.close_price, price_prec).map_err(to_pyvalue_err)?;
+        let volume = u64::try_from(self.volume)
+            .map_err(to_pyvalue_err)
+            .and_then(|value| {
+                Quantity::from_mantissa_exponent_checked(value, 0, size_prec)
+                    .map_err(to_pyvalue_err)
+            })?;
+        NautilusBar::new_checked(
             bar_type,
-            Price::new(self.open_price, price_prec),
-            Price::new(self.high_price, price_prec),
-            Price::new(self.low_price, price_prec),
-            Price::new(self.close_price, price_prec),
-            Quantity::new(self.volume as f64, size_prec),
+            open,
+            high,
+            low,
+            close,
+            volume,
             self.ts_event.into(),
             self.ts_init.into(),
-        ))
+        )
+        .map_err(to_pyvalue_err)
     }
 
     #[pyo3(name = "__repr__")]
@@ -1950,124 +1980,96 @@ impl PyTimeBar {
 
 impl PyTimeBar {
     /// Creates a PyTimeBar from a Rithmic ResponseTimeBarReplay message.
-    pub(crate) fn from_time_response(bar: &rithmic_rs::rti::ResponseTimeBarReplay) -> Self {
-        let marker = bar.marker.map(i64::from);
-        let ts_event = marker
-            .filter(|value| *value > 0)
-            .map(|value| value as u64 * 1_000_000_000)
-            .or_else(|| {
-                bar.period
-                    .as_deref()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .map(|value| value * 1_000_000_000)
-            })
-            .unwrap_or(0);
+    pub(crate) fn from_time_response(bar: &rithmic_rs::rti::ResponseTimeBarReplay) -> Option<Self> {
+        let marker = i64::from(bar.marker?);
+        let ts_event = seconds_timestamp_nanos(marker)?;
+        let period = required_text(bar.period.as_deref())?;
+        let bar_period = period.parse::<i32>().ok().filter(|value| *value > 0)?;
+        let bar_kind = time_replay_bar_type(bar.r#type?)?;
 
-        Self {
-            symbol: bar.symbol.clone().unwrap_or_default(),
-            exchange: bar.exchange.clone().unwrap_or_default(),
-            open_price: bar.open_price.unwrap_or(0.0),
-            high_price: bar.high_price.unwrap_or(0.0),
-            low_price: bar.low_price.unwrap_or(0.0),
-            close_price: bar.close_price.unwrap_or(0.0),
-            volume: volume_to_i64(bar.volume.unwrap_or(0)),
-            period: bar.period.clone().unwrap_or_default(),
-            bar_kind: bar
-                .r#type
-                .and_then(time_replay_bar_type)
-                .unwrap_or(RithmicBarType::MinuteBar)
-                .as_str()
-                .to_string(),
-            bar_period: bar
-                .period
-                .as_deref()
-                .and_then(|value| value.parse::<i32>().ok())
-                .unwrap_or_default(),
+        Some(Self {
+            symbol: required_text(bar.symbol.as_deref())?,
+            exchange: required_text(bar.exchange.as_deref())?,
+            open_price: bar.open_price.filter(|value| value.is_finite())?,
+            high_price: bar.high_price.filter(|value| value.is_finite())?,
+            low_price: bar.low_price.filter(|value| value.is_finite())?,
+            close_price: bar.close_price.filter(|value| value.is_finite())?,
+            volume: volume_to_i64(bar.volume?)?,
+            period,
+            bar_kind: bar_kind.as_str().to_string(),
+            bar_period,
             price_precision: 2,
             size_precision: 0,
-            marker,
+            marker: Some(marker),
             ts_event,
             ts_init: ts_event,
-        }
+        })
     }
 
     /// Creates a PyTimeBar from a Rithmic ResponseTickBarReplay message.
-    pub(crate) fn from_tick_response(bar: &rithmic_rs::rti::ResponseTickBarReplay) -> Self {
-        let marker = bar.data_bar_ssboe.last().copied().map(i64::from);
-        let ts_event = tick_timestamp_nanos(&bar.data_bar_ssboe, &bar.data_bar_usecs);
+    pub(crate) fn from_tick_response(bar: &rithmic_rs::rti::ResponseTickBarReplay) -> Option<Self> {
+        let marker = i64::from(*bar.data_bar_ssboe.last()?);
+        let ts_event = tick_timestamp_nanos(&bar.data_bar_ssboe, &bar.data_bar_usecs)?;
+        let period = required_text(bar.type_specifier.as_deref())?;
+        let bar_period = period.parse::<i32>().ok().filter(|value| *value > 0)?;
 
-        Self {
-            symbol: bar.symbol.clone().unwrap_or_default(),
-            exchange: bar.exchange.clone().unwrap_or_default(),
-            open_price: bar.open_price.unwrap_or(0.0),
-            high_price: bar.high_price.unwrap_or(0.0),
-            low_price: bar.low_price.unwrap_or(0.0),
-            close_price: bar.close_price.unwrap_or(0.0),
-            volume: volume_to_i64(bar.volume.unwrap_or(0)),
-            period: bar
-                .type_specifier
-                .clone()
-                .unwrap_or_else(|| "1".to_string()),
+        Some(Self {
+            symbol: required_text(bar.symbol.as_deref())?,
+            exchange: required_text(bar.exchange.as_deref())?,
+            open_price: bar.open_price.filter(|value| value.is_finite())?,
+            high_price: bar.high_price.filter(|value| value.is_finite())?,
+            low_price: bar.low_price.filter(|value| value.is_finite())?,
+            close_price: bar.close_price.filter(|value| value.is_finite())?,
+            volume: volume_to_i64(bar.volume?)?,
+            period,
             bar_kind: "TickBar".to_string(),
-            bar_period: bar
-                .type_specifier
-                .as_deref()
-                .and_then(|value| value.parse::<i32>().ok())
-                .unwrap_or(1),
+            bar_period,
             price_precision: 2,
             size_precision: 0,
-            marker,
+            marker: Some(marker),
             ts_event,
             ts_init: ts_event,
-        }
+        })
     }
 
     /// Creates a PyTimeBar from a Rithmic live TimeBar update.
     pub(crate) fn from_live_time_update(bar: &rithmic_rs::rti::TimeBar) -> Option<Self> {
-        let marker = bar.marker.map(i64::from);
-        let ts_event = marker
-            .filter(|value| *value > 0)
-            .map(|value| value as u64 * 1_000_000_000)?;
+        let marker = i64::from(bar.marker?);
+        let ts_event = seconds_timestamp_nanos(marker)?;
+        let period = required_text(bar.period.as_deref())?;
+        let bar_period = period.parse::<i32>().ok().filter(|value| *value > 0)?;
+        let bar_kind = time_replay_bar_type(bar.r#type?)?;
 
         Some(Self {
-            symbol: bar.symbol.clone().unwrap_or_default(),
-            exchange: bar.exchange.clone().unwrap_or_default(),
-            open_price: bar.open_price.unwrap_or(0.0),
-            high_price: bar.high_price.unwrap_or(0.0),
-            low_price: bar.low_price.unwrap_or(0.0),
-            close_price: bar.close_price.unwrap_or(0.0),
-            volume: volume_to_i64(bar.volume.unwrap_or(0)),
-            period: bar.period.clone().unwrap_or_default(),
-            bar_kind: bar
-                .r#type
-                .and_then(time_replay_bar_type)
-                .unwrap_or(RithmicBarType::MinuteBar)
-                .as_str()
-                .to_string(),
-            bar_period: bar
-                .period
-                .as_deref()
-                .and_then(|value| value.parse::<i32>().ok())
-                .unwrap_or_default(),
+            symbol: required_text(bar.symbol.as_deref())?,
+            exchange: required_text(bar.exchange.as_deref())?,
+            open_price: bar.open_price.filter(|value| value.is_finite())?,
+            high_price: bar.high_price.filter(|value| value.is_finite())?,
+            low_price: bar.low_price.filter(|value| value.is_finite())?,
+            close_price: bar.close_price.filter(|value| value.is_finite())?,
+            volume: volume_to_i64(bar.volume?)?,
+            period,
+            bar_kind: bar_kind.as_str().to_string(),
+            bar_period,
             price_precision: 2,
             size_precision: 0,
-            marker,
+            marker: Some(marker),
             ts_event,
             ts_init: ts_event,
         })
     }
 }
 
-impl From<LiveTimeBar> for PyTimeBar {
-    fn from(bar: LiveTimeBar) -> Self {
-        Self {
+impl PyTimeBar {
+    fn from_live_bar(bar: LiveTimeBar) -> Option<Self> {
+        Some(Self {
             symbol: bar.symbol,
             exchange: bar.exchange,
             open_price: bar.open_price,
             high_price: bar.high_price,
             low_price: bar.low_price,
             close_price: bar.close_price,
-            volume: bar.volume as i64,
+            volume: float_volume_to_i64(bar.volume)?,
             period: bar.bar_period.to_string(),
             bar_kind: bar.bar_type.as_str().to_string(),
             bar_period: bar.bar_period,
@@ -2076,7 +2078,7 @@ impl From<LiveTimeBar> for PyTimeBar {
             marker: bar.marker,
             ts_event: bar.ts_event,
             ts_init: bar.ts_init,
-        }
+        })
     }
 }
 
@@ -2166,7 +2168,9 @@ impl PyBookDelta {
         price_precision: Option<u8>,
         size_precision: Option<u8>,
     ) -> PyResult<NautilusOrderBookDelta> {
-        let instrument_id = NautilusInstrumentId::from(instrument_id);
+        let instrument_id = instrument_id
+            .parse::<NautilusInstrumentId>()
+            .map_err(to_pyvalue_err)?;
         let price_precision = price_precision.unwrap_or(self.inner.price_precision.max(2));
         let size_precision = size_precision.unwrap_or(self.inner.size_precision);
 
@@ -2191,12 +2195,11 @@ impl PyBookDelta {
             }
         };
 
-        let order = BookOrder::new(
-            side,
-            Price::new(self.inner.price, price_precision),
-            Quantity::new(self.inner.size, size_precision),
-            self.inner.order_id,
-        );
+        let price =
+            Price::new_checked(self.inner.price, price_precision).map_err(to_pyvalue_err)?;
+        let size =
+            Quantity::new_checked(self.inner.size, size_precision).map_err(to_pyvalue_err)?;
+        let order = BookOrder::new(side, price, size, self.inner.order_id);
 
         NautilusOrderBookDelta::new_checked(
             instrument_id,
@@ -2233,14 +2236,46 @@ impl From<BookDelta> for PyBookDelta {
     }
 }
 
-fn volume_to_i64(value: u64) -> i64 {
-    value.min(i64::MAX as u64) as i64
+fn volume_to_i64(value: u64) -> Option<i64> {
+    Quantity::from_mantissa_exponent_checked(value, 0, 0).ok()?;
+    i64::try_from(value).ok()
 }
 
-fn tick_timestamp_nanos(ssboe: &[i32], usecs: &[i32]) -> u64 {
-    let secs = ssboe.last().copied().unwrap_or_default() as u64;
-    let micros = usecs.last().copied().unwrap_or_default() as u64;
-    secs * 1_000_000_000 + micros * 1_000
+fn float_volume_to_i64(value: f64) -> Option<i64> {
+    let quantity = Quantity::new_checked(value, 0).ok()?;
+    let exact = quantity.as_f64();
+    (exact == value).then_some(exact as i64)
+}
+
+fn required_text(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn seconds_timestamp_nanos(seconds: i64) -> Option<u64> {
+    u64::try_from(seconds)
+        .ok()?
+        .checked_mul(1_000_000_000)
+        .filter(|value| *value != 0)
+}
+
+pub(crate) fn checked_rithmic_timestamp_nanos(ssboe: i32, usecs: i32) -> Option<u64> {
+    let seconds = u64::try_from(ssboe).ok()?;
+    let micros = u64::try_from(usecs).ok()?;
+
+    if micros >= 1_000_000 {
+        return None;
+    }
+
+    seconds
+        .checked_mul(1_000_000_000)?
+        .checked_add(micros.checked_mul(1_000)?)
+        .filter(|value| *value != 0)
+}
+
+fn tick_timestamp_nanos(ssboe: &[i32], usecs: &[i32]) -> Option<u64> {
+    checked_rithmic_timestamp_nanos(*ssboe.last()?, *usecs.last()?)
 }
 
 fn time_replay_bar_type(value: i32) -> Option<RithmicBarType> {
@@ -2283,7 +2318,16 @@ mod tests {
     use rithmic_rs::rti::ResponseTickBarReplay;
     use rstest::rstest;
 
-    use super::PyTradeTick;
+    use super::{PyTradeTick, checked_rithmic_timestamp_nanos, float_volume_to_i64, volume_to_i64};
+
+    #[rstest]
+    #[case(-1, 0)]
+    #[case(1, -1)]
+    #[case(1, 1_000_000)]
+    #[case(0, 0)]
+    fn checked_timestamp_rejects_invalid_wire_values(#[case] ssboe: i32, #[case] usecs: i32) {
+        assert!(checked_rithmic_timestamp_nanos(ssboe, usecs).is_none());
+    }
 
     #[rstest]
     fn replay_tick_uses_exchange_time_for_both_timestamps() {
@@ -2316,5 +2360,37 @@ mod tests {
         };
 
         assert!(PyTradeTick::from_tick_replay(&tick, 99).is_none());
+    }
+
+    #[rstest]
+    fn replay_tick_drops_rows_missing_required_trade_fields() {
+        let tick = ResponseTickBarReplay {
+            symbol: Some("MNQM6".to_string()),
+            exchange: Some("CME".to_string()),
+            close_price: Some(20_000.25),
+            volume: None,
+            data_bar_ssboe: vec![1_700_000_123],
+            data_bar_usecs: vec![456_789],
+            ..Default::default()
+        };
+
+        assert!(PyTradeTick::from_tick_replay(&tick, 99).is_none());
+    }
+
+    #[rstest]
+    fn replay_volume_conversions_reject_unrepresentable_values() {
+        let tick = ResponseTickBarReplay {
+            symbol: Some("MNQM6".to_string()),
+            exchange: Some("CME".to_string()),
+            close_price: Some(20_000.25),
+            volume: Some(u64::MAX),
+            data_bar_ssboe: vec![1_700_000_123],
+            data_bar_usecs: vec![456_789],
+            ..Default::default()
+        };
+
+        assert!(PyTradeTick::from_tick_replay(&tick, 99).is_none());
+        assert!(volume_to_i64(u64::MAX).is_none());
+        assert!(float_volume_to_i64(f64::MAX).is_none());
     }
 }

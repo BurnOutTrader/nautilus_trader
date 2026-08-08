@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -------------------------------------------------------------------------------------------------
 #  Copyright (C) 2026 Kevin Monaghan. All rights reserved.
 #
@@ -17,24 +16,24 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
-from nautilus_trader._libnautilus.core import UUID4
-from nautilus_trader._libnautilus.model import AccountId
-from nautilus_trader._libnautilus.model import ClientId
-from nautilus_trader._libnautilus.model import ClientOrderId
-from nautilus_trader._libnautilus.model import InstrumentId
 from nautilus_trader._libnautilus.common import LogColor
-from nautilus_trader._libnautilus.model import MarketOrder
-from nautilus_trader._libnautilus.model import OrderSide
-from nautilus_trader._libnautilus.model import Quantity
-from nautilus_trader._libnautilus.model import StrategyId
-from nautilus_trader._libnautilus.model import TimeInForce
-from nautilus_trader._libnautilus.trading import Strategy
-from nautilus_trader._libnautilus.trading import StrategyConfig
+from nautilus_trader._libnautilus.core import UUID4
+from nautilus_trader._libnautilus.model import (
+    AccountId,
+    ClientId,
+    ClientOrderId,
+    InstrumentId,
+    MarketOrder,
+    OrderSide,
+    Quantity,
+    StrategyId,
+    TimeInForce,
+)
+from nautilus_trader._libnautilus.trading import Strategy, StrategyConfig
 
 
 @dataclass
@@ -65,7 +64,9 @@ _STATE_LOCK = threading.Lock()
 _EXEC_STATES: dict[str, _ExecState] = {}
 
 
-def register_exec_state(*, key: str, instrument_id: str, account_id: str | None) -> None:
+def register_exec_state(
+    *, key: str, instrument_id: str, account_id: str | None
+) -> None:
     with _STATE_LOCK:
         _EXEC_STATES[key] = _ExecState(
             instrument_id=instrument_id,
@@ -249,7 +250,7 @@ def _coerce_client_id(value: str | ClientId) -> ClientId:
 class RithmicExecStrategyConfig(StrategyConfig):
     def __new__(
         cls,
-        instrument_id: str | InstrumentId = "MNQM6.RITHMIC",
+        instrument_id: str | InstrumentId = "MNQM6.CME.RITHMIC",
         data_client_id: str | ClientId = "RITHMIC",
         exec_client_id: str | ClientId = "RITHMIC",
         account_id: str | AccountId | None = None,
@@ -274,10 +275,14 @@ class RithmicExecStrategyConfig(StrategyConfig):
             else InstrumentId.from_str(instrument_id)
         )
         parsed_strategy_id = (
-            strategy_id if isinstance(strategy_id, StrategyId) else StrategyId(strategy_id)
+            strategy_id
+            if isinstance(strategy_id, StrategyId)
+            else StrategyId(strategy_id)
         )
         parsed_entry_qty = (
-            entry_qty if isinstance(entry_qty, Quantity) else Quantity.from_str(str(entry_qty))
+            entry_qty
+            if isinstance(entry_qty, Quantity)
+            else Quantity.from_str(str(entry_qty))
         )
 
         config = super().__new__(
@@ -353,7 +358,9 @@ class RithmicExecStrategy(Strategy):
             )
 
     def on_stop(self):
-        self._info(f"Stopping Rithmic execution strategy snapshot={self._runtime_snapshot()}")
+        self._info(
+            f"Stopping Rithmic execution strategy snapshot={self._runtime_snapshot()}"
+        )
 
         if self.config.cleanup_on_stop:
             self._cancel_open_orders(stop_phase=True)
@@ -377,7 +384,9 @@ class RithmicExecStrategy(Strategy):
         return None
 
     def on_instrument(self, instrument):
-        self._info(f"Instrument ready: {instrument} snapshot={self._runtime_snapshot()}")
+        self._info(
+            f"Instrument ready: {instrument} snapshot={self._runtime_snapshot()}"
+        )
         self._instrument_ready = True
         _mark_instrument_ready(self.config.state_key)
         self._maybe_submit_entry_order()
@@ -406,14 +415,18 @@ class RithmicExecStrategy(Strategy):
         _mark_order_rejected(self.config.state_key, getattr(event, "reason", None))
         self._cleanup_close_requests.clear()
         self._refresh_cleanup_state()
-        self._error(self._format_order_event("Order rejected", event, include_reason=True))
+        self._error(
+            self._format_order_event("Order rejected", event, include_reason=True)
+        )
         self._maybe_submit_entry_order()
 
     def on_order_canceled(self, event):
         _mark_order_canceled(self.config.state_key, getattr(event, "reason", None))
         self._cleanup_close_requests.clear()
         self._refresh_cleanup_state()
-        self._info(self._format_order_event("Order canceled", event, include_reason=True))
+        self._info(
+            self._format_order_event("Order canceled", event, include_reason=True)
+        )
         self._maybe_submit_entry_order()
 
     def on_order_filled(self, event):
@@ -503,7 +516,8 @@ class RithmicExecStrategy(Strategy):
         if stop_phase:
             cache_kwargs = self._cache_query_kwargs()
             inflight_order_ids = {
-                order.client_order_id.value for order in self.cache.orders_inflight(**cache_kwargs)
+                order.client_order_id.value
+                for order in self.cache.orders_inflight(**cache_kwargs)
             }
 
         if not orders:
@@ -517,7 +531,10 @@ class RithmicExecStrategy(Strategy):
         skipped_inflight = 0
 
         for order in orders:
-            if stop_phase and order.client_order_id.value in self._cleanup_cancel_requests:
+            if (
+                stop_phase
+                and order.client_order_id.value in self._cleanup_cancel_requests
+            ):
                 continue
 
             if stop_phase and getattr(order, "time_in_force", None) == TimeInForce.IOC:
@@ -747,8 +764,12 @@ class RithmicExecStrategy(Strategy):
         return " ".join(parts)
 
     def _refresh_cleanup_state(self):
-        current_order_ids = {order.client_order_id.value for order in self._open_orders()}
-        current_position_ids = {position.id.value for position in self._open_positions()}
+        current_order_ids = {
+            order.client_order_id.value for order in self._open_orders()
+        }
+        current_position_ids = {
+            position.id.value for position in self._open_positions()
+        }
         self._cleanup_cancel_requests.intersection_update(current_order_ids)
         self._cleanup_close_requests.intersection_update(current_position_ids)
 

@@ -56,18 +56,19 @@ import asyncio
 import math
 import time
 
-from nautilus_trader.adapters.rithmic import RithmicDataClient
-from nautilus_trader.adapters.rithmic import RithmicGateway
-from nautilus_trader.adapters.rithmic import load_rithmic_env_file
-from nautilus_trader.adapters.rithmic.bindings import OrderSide
-from nautilus_trader.adapters.rithmic.bindings import OrderType
-from nautilus_trader.adapters.rithmic.bindings import RithmicExecutionClient
-from nautilus_trader.adapters.rithmic.bindings import RithmicInstrumentProvider
-from nautilus_trader.adapters.rithmic.bindings import TimeInForce
-
+from nautilus_trader.adapters.rithmic import (
+    OrderSide,
+    OrderType,
+    RithmicDataClient,
+    RithmicExecutionClient,
+    RithmicGateway,
+    RithmicInstrumentProvider,
+    TimeInForce,
+    load_rithmic_env_file,
+)
 
 PROFILE = None
-INSTRUMENT_ID = "MNQM6.RITHMIC"
+INSTRUMENT_ID = "MNQM6.CME.RITHMIC"
 EXCHANGE = "CME"
 QUANTITY = 1
 INITIAL_LIMIT_POINTS_BELOW_BID = 20.0
@@ -89,9 +90,9 @@ def round_down_to_tick(price: float, tick_size: float) -> float:
 def contract_symbol_from_instrument_id(instrument_id: str) -> str:
     parts = instrument_id.split(".")
 
-    if len(parts) != 2 or parts[1] != "RITHMIC":
+    if len(parts) != 3 or parts[2] != "RITHMIC":
         raise ValueError(
-            f"Expected a symbol.RITHMIC instrument ID, received {instrument_id}",
+            f"Expected a symbol.exchange.RITHMIC instrument ID, received {instrument_id}",
         )
     return parts[0]
 
@@ -167,7 +168,7 @@ async def wait_for_quote(data_queue: asyncio.Queue, symbol: str, exchange: str):
                 return quote
 
 
-async def wait_for_execution_event(  # noqa: C901
+async def wait_for_execution_event(
     execution_queue: asyncio.Queue,
     client_order_id: str,
     label: str,
@@ -178,7 +179,9 @@ async def wait_for_execution_event(  # noqa: C901
     allow_cancelled: bool = False,
 ) -> object:
     while True:
-        event = await asyncio.wait_for(execution_queue.get(), timeout=EVENT_TIMEOUT_SECONDS)
+        event = await asyncio.wait_for(
+            execution_queue.get(), timeout=EVENT_TIMEOUT_SECONDS
+        )
         print(f"{label}: {describe_execution_event(event)}")
 
         if event.is_error():
@@ -195,7 +198,9 @@ async def wait_for_execution_event(  # noqa: C901
             filled = event.as_filled()
 
             if filled.client_order_id == client_order_id:
-                raise RuntimeError("Order filled unexpectedly; the example expects a resting order")
+                raise RuntimeError(
+                    "Order filled unexpectedly; the example expects a resting order"
+                )
             continue
 
         if allow_submitted and event.is_submitted():
@@ -223,7 +228,7 @@ async def wait_for_execution_event(  # noqa: C901
                 return event
 
 
-async def main() -> None:  # noqa: C901
+async def main() -> None:
     profile = PROFILE
     symbol = contract_symbol_from_instrument_id(INSTRUMENT_ID)
     exchange = EXCHANGE
@@ -408,7 +413,7 @@ async def main() -> None:  # noqa: C901
             try:
                 print(f"Best-effort cancel for venue_order_id={venue_order_id}")
                 await execution_client.cancel_order(venue_order_id)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 (best-effort cleanup boundary)
                 print(f"Best-effort cancel failed: {e}")
 
         if data_client is not None:
@@ -418,7 +423,7 @@ async def main() -> None:  # noqa: C901
             for symbol, exchange_name in data_subscriptions:
                 try:
                     await data_client.unsubscribe(symbol, exchange_name)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 (best-effort cleanup boundary)
                     print(f"Failed to unsubscribe {symbol}@{exchange_name}: {e}")
 
         if execution_client is not None:

@@ -30,7 +30,6 @@ use nautilus_core::{
     python::{to_pyruntime_err, to_pyvalue_err},
     time::get_atomic_clock_realtime,
 };
-use nautilus_model::identifiers::InstrumentId;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 #[cfg(feature = "python")]
@@ -44,7 +43,7 @@ use super::{
 };
 use crate::{
     TimeBarType,
-    common::parse::tick_size_to_precision,
+    common::{converters::rithmic_instrument_id, parse::tick_size_to_precision},
     data::{
         MarketDataEvent,
         live::{depth10_from_order_book, order_book_from_snapshot},
@@ -85,6 +84,8 @@ pub(crate) struct PyRithmicDataClient {
     /// Local tracking for Rithmic-specific custom market-data feeds.
     extra_market_data_subscriptions:
         Arc<parking_lot::RwLock<AHashMap<String, ExtraMarketDataSubscription>>>,
+    /// Serializes subscription state transitions across async gateway calls.
+    subscription_update_lock: Arc<tokio::sync::Mutex<()>>,
     /// Python callback for market data events.
     data_callback: Arc<parking_lot::Mutex<Option<Py<PyAny>>>>,
     event_task: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
@@ -92,10 +93,16 @@ pub(crate) struct PyRithmicDataClient {
     shutdown_tx: Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct BookSubscription {
     deltas: bool,
     depth10: bool,
+}
+
+#[derive(Clone, Copy)]
+enum BookSubscriptionKind {
+    Deltas,
+    Depth10,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -157,6 +164,7 @@ impl PyRithmicDataClient {
             status_subscriptions: Arc::new(parking_lot::RwLock::new(AHashSet::new())),
             book_subscriptions: Arc::new(parking_lot::RwLock::new(AHashMap::new())),
             extra_market_data_subscriptions: Arc::new(parking_lot::RwLock::new(AHashMap::new())),
+            subscription_update_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_callback: Arc::new(parking_lot::Mutex::new(None)),
             event_task: Arc::new(parking_lot::Mutex::new(None)),
             event_running: Arc::new(AtomicBool::new(false)),
@@ -305,7 +313,8 @@ impl PyRithmicDataClient {
             let (tx, rx_shutdown) = tokio::sync::oneshot::channel();
             *shutdown_tx.lock() = Some(tx);
 
-            let handle = get_runtime().spawn(Self::event_loop(rx, rx_shutdown, callback));
+            let handle =
+                get_runtime().spawn(Self::event_loop(rx, rx_shutdown, callback, event_running));
 
             *event_task.lock() = Some(handle);
 
@@ -414,19 +423,18 @@ impl PyRithmicDataClient {
 
         let gateway = Arc::clone(&self.gateway);
         let status_subscriptions = Arc::clone(&self.status_subscriptions);
-        let key = format!("{exchange}:{symbol}");
+        let subscription_update_lock = Arc::clone(&self.subscription_update_lock);
 
         future_into_py(py, async move {
-            if !status_subscriptions.write().insert(key) {
-                return Ok(());
-            }
-
-            let gw = gateway.read().await;
-            gw.subscribe_instrument_status(&symbol, &exchange)
-                .await
-                .map_err(|e| {
-                    to_pyruntime_err(format!("Instrument status subscription failed: {e}"))
-                })
+            Self::update_instrument_status_subscription(
+                &gateway,
+                &status_subscriptions,
+                &subscription_update_lock,
+                &symbol,
+                &exchange,
+                true,
+            )
+            .await
         })
     }
 
@@ -598,6 +606,7 @@ impl PyRithmicDataClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         Self::validate_symbol_exchange(&symbol, &exchange)?;
         let bar_type = Self::parse_bar_type(&bar_type)?;
+        Self::checked_bar_period(bar_period)?;
 
         let gateway = Arc::clone(&self.gateway);
         let bar_subscriptions = Arc::clone(&self.bar_subscriptions);
@@ -655,29 +664,19 @@ impl PyRithmicDataClient {
 
         let gateway = Arc::clone(&self.gateway);
         let book_subscriptions = Arc::clone(&self.book_subscriptions);
-        let key = format!("{exchange}:{symbol}");
+        let subscription_update_lock = Arc::clone(&self.subscription_update_lock);
 
         future_into_py(py, async move {
-            let already_subscribed = {
-                let mut subscriptions = book_subscriptions.write();
-                let entry = subscriptions.entry(key.clone()).or_default();
-
-                if entry.deltas {
-                    return Ok(());
-                }
-                entry.deltas = true;
-                false
-            };
-
-            if already_subscribed {
-                return Ok(());
-            }
-
-            let gw = gateway.read().await;
-            gw.subscribe_order_book_bootstrapped(&symbol, &exchange)
-                .await
-                .map_err(|e| to_pyruntime_err(format!("Book delta subscription failed: {e}")))?;
-            Ok(())
+            Self::update_book_subscription(
+                &gateway,
+                &book_subscriptions,
+                &subscription_update_lock,
+                &symbol,
+                &exchange,
+                BookSubscriptionKind::Deltas,
+                true,
+            )
+            .await
         })
     }
 
@@ -693,24 +692,19 @@ impl PyRithmicDataClient {
 
         let gateway = Arc::clone(&self.gateway);
         let book_subscriptions = Arc::clone(&self.book_subscriptions);
-        let key = format!("{exchange}:{symbol}");
+        let subscription_update_lock = Arc::clone(&self.subscription_update_lock);
 
         future_into_py(py, async move {
-            {
-                let mut subscriptions = book_subscriptions.write();
-                let entry = subscriptions.entry(key).or_default();
-
-                if entry.depth10 {
-                    return Ok(());
-                }
-                entry.depth10 = true;
-            }
-
-            let gw = gateway.read().await;
-            gw.subscribe_order_book_depth(&symbol, &exchange)
-                .await
-                .map_err(|e| to_pyruntime_err(format!("Book depth10 subscription failed: {e}")))?;
-            Ok(())
+            Self::update_book_subscription(
+                &gateway,
+                &book_subscriptions,
+                &subscription_update_lock,
+                &symbol,
+                &exchange,
+                BookSubscriptionKind::Depth10,
+                true,
+            )
+            .await
         })
     }
 
@@ -755,17 +749,18 @@ impl PyRithmicDataClient {
 
         let gateway = Arc::clone(&self.gateway);
         let status_subscriptions = Arc::clone(&self.status_subscriptions);
-        let key = format!("{exchange}:{symbol}");
+        let subscription_update_lock = Arc::clone(&self.subscription_update_lock);
 
         future_into_py(py, async move {
-            if !status_subscriptions.write().remove(&key) {
-                return Ok(());
-            }
-
-            let gw = gateway.read().await;
-            gw.unsubscribe_instrument_status(&symbol, &exchange)
-                .await
-                .map_err(|e| to_pyruntime_err(format!("Instrument status unsubscribe failed: {e}")))
+            Self::update_instrument_status_subscription(
+                &gateway,
+                &status_subscriptions,
+                &subscription_update_lock,
+                &symbol,
+                &exchange,
+                false,
+            )
+            .await
         })
     }
 
@@ -935,33 +930,19 @@ impl PyRithmicDataClient {
 
         let gateway = Arc::clone(&self.gateway);
         let book_subscriptions = Arc::clone(&self.book_subscriptions);
-        let key = format!("{exchange}:{symbol}");
+        let subscription_update_lock = Arc::clone(&self.subscription_update_lock);
 
         future_into_py(py, async move {
-            let should_unsubscribe = {
-                let mut subscriptions = book_subscriptions.write();
-
-                if let Some(entry) = subscriptions.get_mut(&key) {
-                    entry.deltas = false;
-
-                    if !entry.depth10 {
-                        subscriptions.remove(&key);
-                    }
-                    true
-                } else {
-                    false
-                }
-            };
-
-            if !should_unsubscribe {
-                return Ok(());
-            }
-
-            let gw = gateway.read().await;
-            gw.unsubscribe_order_book(&symbol, &exchange)
-                .await
-                .map_err(|e| to_pyruntime_err(format!("Book delta unsubscribe failed: {e}")))?;
-            Ok(())
+            Self::update_book_subscription(
+                &gateway,
+                &book_subscriptions,
+                &subscription_update_lock,
+                &symbol,
+                &exchange,
+                BookSubscriptionKind::Deltas,
+                false,
+            )
+            .await
         })
     }
 
@@ -977,34 +958,19 @@ impl PyRithmicDataClient {
 
         let gateway = Arc::clone(&self.gateway);
         let book_subscriptions = Arc::clone(&self.book_subscriptions);
-        let key = format!("{exchange}:{symbol}");
+        let subscription_update_lock = Arc::clone(&self.subscription_update_lock);
 
         future_into_py(py, async move {
-            let should_unsubscribe = {
-                let mut subscriptions = book_subscriptions.write();
-
-                if let Some(entry) = subscriptions.get_mut(&key) {
-                    entry.depth10 = false;
-                    let should = !entry.deltas;
-
-                    if should {
-                        subscriptions.remove(&key);
-                    }
-                    should
-                } else {
-                    false
-                }
-            };
-
-            if !should_unsubscribe {
-                return Ok(());
-            }
-
-            let gw = gateway.read().await;
-            gw.unsubscribe_order_book_depth(&symbol, &exchange)
-                .await
-                .map_err(|e| to_pyruntime_err(format!("Book depth10 unsubscribe failed: {e}")))?;
-            Ok(())
+            Self::update_book_subscription(
+                &gateway,
+                &book_subscriptions,
+                &subscription_update_lock,
+                &symbol,
+                &exchange,
+                BookSubscriptionKind::Depth10,
+                false,
+            )
+            .await
         })
     }
 
@@ -1020,6 +986,7 @@ impl PyRithmicDataClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         Self::validate_symbol_exchange(&symbol, &exchange)?;
         let bar_type = Self::parse_bar_type(&bar_type)?;
+        Self::checked_bar_period(bar_period)?;
 
         let gateway = Arc::clone(&self.gateway);
         let bar_subscriptions = Arc::clone(&self.bar_subscriptions);
@@ -1133,21 +1100,12 @@ impl PyRithmicDataClient {
 
             for (key, subscription) in book_subscriptions {
                 let (exchange, symbol) = Self::parse_market_subscription_key(&key)?;
-                let gw = gateway.read().await;
-
-                if subscription.deltas {
+                if subscription.deltas || subscription.depth10 {
+                    let gw = gateway.read().await;
                     gw.subscribe_order_book_bootstrapped(&symbol, &exchange)
                         .await
                         .map_err(|e| {
-                            to_pyruntime_err(format!("Book delta resubscribe failed: {e}"))
-                        })?;
-                }
-
-                if subscription.depth10 {
-                    gw.subscribe_order_book_depth(&symbol, &exchange)
-                        .await
-                        .map_err(|e| {
-                            to_pyruntime_err(format!("Book depth10 resubscribe failed: {e}"))
+                            to_pyruntime_err(format!("Order-book resubscribe failed: {e}"))
                         })?;
                 }
             }
@@ -1194,6 +1152,7 @@ impl PyRithmicDataClient {
         end_time_sec: i32,
     ) -> PyResult<Bound<'py, PyAny>> {
         Self::validate_symbol_exchange(&symbol, &exchange)?;
+        Self::validate_history_window(start_time_sec, end_time_sec)?;
 
         let gateway = Arc::clone(&self.gateway);
 
@@ -1244,13 +1203,14 @@ impl PyRithmicDataClient {
         start_time_sec: i32,
         end_time_sec: i32,
     ) -> PyResult<Bound<'py, PyAny>> {
-        // Validate inputs
         Self::validate_symbol_exchange(&symbol, &exchange)?;
+        Self::validate_history_window(start_time_sec, end_time_sec)?;
+        let bar_type = Self::parse_bar_type(&bar_type)?;
+        let tick_period = Self::checked_bar_period(bar_period)?;
 
         let gateway = Arc::clone(&self.gateway);
 
         future_into_py(py, async move {
-            let bar_type = Self::parse_bar_type(&bar_type)?;
             let gw = gateway.read().await;
             let responses = match bar_type {
                 ParsedBarType::Time(bar_type) => gw
@@ -1273,7 +1233,7 @@ impl PyRithmicDataClient {
                         .load_tick_bars(
                             symbol.clone(),
                             exchange.clone(),
-                            bar_period as u32,
+                            tick_period,
                             start_time_sec,
                             end_time_sec,
                         )
@@ -1291,7 +1251,9 @@ impl PyRithmicDataClient {
 
                 match response.message {
                     RithmicMessage::ResponseTimeBarReplay(bar) => {
-                        bars.push(PyTimeBar::from_time_response(&bar));
+                        if let Some(bar) = PyTimeBar::from_time_response(&bar) {
+                            bars.push(bar);
+                        }
                     }
                     RithmicMessage::TimeBar(bar) => {
                         if let Some(bar) = PyTimeBar::from_live_time_update(&bar) {
@@ -1299,16 +1261,21 @@ impl PyRithmicDataClient {
                         }
                     }
                     RithmicMessage::ResponseTickBarReplay(bar) => {
-                        let tick_period = bar
+                        let Some(tick_period) = bar
                             .type_specifier
                             .as_deref()
                             .and_then(|value| value.parse::<i32>().ok())
-                            .unwrap_or(1);
+                            .filter(|value| *value > 0)
+                        else {
+                            continue;
+                        };
 
                         if tick_period != bar_period {
                             continue;
                         }
-                        bars.push(PyTimeBar::from_tick_response(&bar));
+                        if let Some(bar) = PyTimeBar::from_tick_response(&bar) {
+                            bars.push(bar);
+                        }
                     }
                     _ => {}
                 }
@@ -1340,17 +1307,22 @@ impl PyRithmicDataClient {
 
             let (price_precision, size_precision) = {
                 let key = format!("{exchange}:{symbol}");
-                gw.instruments()
-                    .try_read()
-                    .ok()
-                    .and_then(|map| map.get(&key).cloned())
-                    .map_or((2, 0), |info| {
-                        (info.tick_size.map_or(2, tick_size_to_precision), 0)
-                    })
+                let instruments = gw.instruments().try_read().map_err(|e| {
+                    to_pyruntime_err(format!("Instrument cache is unavailable: {e}"))
+                })?;
+                let tick_size = instruments
+                    .get(&key)
+                    .and_then(|info| info.tick_size)
+                    .ok_or_else(|| {
+                        to_pyruntime_err(format!("Instrument precision is not available for {key}"))
+                    })?;
+                let price_precision = tick_size_to_precision(tick_size)
+                    .map_err(|e| to_pyruntime_err(e.to_string()))?;
+                (price_precision, 0)
             };
 
-            let _ = exchange;
-            let instrument_id = InstrumentId::from(format!("{symbol}.RITHMIC").as_str());
+            let instrument_id = rithmic_instrument_id(&symbol, &exchange)
+                .map_err(|e| to_pyvalue_err(e.to_string()))?;
 
             let book = order_book_from_snapshot(
                 instrument_id,
@@ -1358,7 +1330,8 @@ impl PyRithmicDataClient {
                 price_precision,
                 size_precision,
                 now,
-            );
+            )
+            .map_err(|e| to_pyruntime_err(format!("Invalid order-book snapshot: {e}")))?;
 
             Ok(depth10_from_order_book(&book, now, now))
         })
@@ -1385,6 +1358,97 @@ struct ExtraMarketDataSubscriptionCmd {
 }
 
 impl PyRithmicDataClient {
+    async fn update_instrument_status_subscription(
+        gateway: &Arc<tokio::sync::RwLock<RithmicGateway>>,
+        subscriptions: &Arc<parking_lot::RwLock<AHashSet<String>>>,
+        update_lock: &Arc<tokio::sync::Mutex<()>>,
+        symbol: &str,
+        exchange: &str,
+        enabled: bool,
+    ) -> PyResult<()> {
+        let _update = update_lock.lock().await;
+        let key = format!("{exchange}:{symbol}");
+        if subscriptions.read().contains(&key) == enabled {
+            return Ok(());
+        }
+
+        let gateway = gateway.read().await;
+        let result = if enabled {
+            gateway.subscribe_instrument_status(symbol, exchange).await
+        } else {
+            gateway
+                .unsubscribe_instrument_status(symbol, exchange)
+                .await
+        };
+        result.map_err(|e| {
+            let operation = if enabled {
+                "subscription"
+            } else {
+                "unsubscribe"
+            };
+            to_pyruntime_err(format!("Instrument status {operation} failed: {e}"))
+        })?;
+
+        if enabled {
+            subscriptions.write().insert(key);
+        } else {
+            subscriptions.write().remove(&key);
+        }
+        Ok(())
+    }
+
+    async fn update_book_subscription(
+        gateway: &Arc<tokio::sync::RwLock<RithmicGateway>>,
+        subscriptions: &Arc<parking_lot::RwLock<AHashMap<String, BookSubscription>>>,
+        update_lock: &Arc<tokio::sync::Mutex<()>>,
+        symbol: &str,
+        exchange: &str,
+        kind: BookSubscriptionKind,
+        enabled: bool,
+    ) -> PyResult<()> {
+        let _update = update_lock.lock().await;
+        let key = format!("{exchange}:{symbol}");
+        let current = subscriptions.read().get(&key).copied().unwrap_or_default();
+        if get_book_subscription_flag(current, kind) == enabled {
+            return Ok(());
+        }
+
+        let mut next = current;
+        set_book_subscription_flag(&mut next, kind, enabled);
+        let venue_was_subscribed = current.deltas || current.depth10;
+        let venue_is_subscribed = next.deltas || next.depth10;
+
+        if venue_was_subscribed != venue_is_subscribed {
+            let gateway = gateway.read().await;
+            let result = if venue_is_subscribed {
+                gateway
+                    .subscribe_order_book_bootstrapped(symbol, exchange)
+                    .await
+            } else {
+                gateway.unsubscribe_order_book(symbol, exchange).await
+            };
+            result.map_err(|e| {
+                let kind = match kind {
+                    BookSubscriptionKind::Deltas => "delta",
+                    BookSubscriptionKind::Depth10 => "depth10",
+                };
+                let operation = if enabled {
+                    "subscription"
+                } else {
+                    "unsubscribe"
+                };
+                to_pyruntime_err(format!("Book {kind} {operation} failed: {e}"))
+            })?;
+        }
+
+        if venue_is_subscribed {
+            subscriptions.write().insert(key, next);
+        } else {
+            subscriptions.write().remove(&key);
+        }
+        Ok(())
+    }
+
     async fn subscribe_market_data_alias(
         gateway: &Arc<tokio::sync::RwLock<RithmicGateway>>,
         subscriptions: &Arc<parking_lot::RwLock<AHashSet<String>>>,
@@ -1427,8 +1491,9 @@ impl PyRithmicDataClient {
         let error_prefix = cmd.error_prefix;
 
         future_into_py(py, async move {
-            {
+            let previous = {
                 let mut subscriptions = subscriptions.write();
+                let previous = subscriptions.get(&key).copied();
                 let changed = Self::update_extra_market_data_subscription_state(
                     &mut subscriptions,
                     &key,
@@ -1439,12 +1504,36 @@ impl PyRithmicDataClient {
                 if !changed {
                     return Ok(());
                 }
+                previous
+            };
+
+            if let Err(e) = Self::apply_extra_market_data_subscription(
+                &gateway, &symbol, &exchange, kind, enabled,
+            )
+            .await
+            {
+                Self::restore_extra_market_data_subscription_state(
+                    &mut subscriptions.write(),
+                    &key,
+                    previous,
+                );
+                return Err(to_pyruntime_err(format!("{error_prefix}: {e}")));
             }
 
-            Self::apply_extra_market_data_subscription(&gateway, &symbol, &exchange, kind, enabled)
-                .await
-                .map_err(|e| to_pyruntime_err(format!("{error_prefix}: {e}")))
+            Ok(())
         })
+    }
+
+    fn restore_extra_market_data_subscription_state(
+        subscriptions: &mut AHashMap<String, ExtraMarketDataSubscription>,
+        key: &str,
+        previous: Option<ExtraMarketDataSubscription>,
+    ) {
+        if let Some(previous) = previous {
+            subscriptions.insert(key.to_string(), previous);
+        } else {
+            subscriptions.remove(key);
+        }
     }
 
     fn update_extra_market_data_subscription_state(
@@ -1565,6 +1654,30 @@ impl PyRithmicDataClient {
         }
     }
 
+    fn checked_bar_period(bar_period: i32) -> PyResult<u32> {
+        if bar_period <= 0 {
+            return Err(to_pyvalue_err("bar_period must be positive"));
+        }
+
+        u32::try_from(bar_period)
+            .map_err(|e| to_pyvalue_err(format!("bar_period is out of range: {e}")))
+    }
+
+    fn validate_history_window(start_time_sec: i32, end_time_sec: i32) -> PyResult<()> {
+        if start_time_sec < 0 || end_time_sec < 0 {
+            return Err(to_pyvalue_err(
+                "start_time_sec and end_time_sec cannot be negative",
+            ));
+        }
+
+        if end_time_sec != 0 && end_time_sec < start_time_sec {
+            return Err(to_pyvalue_err(
+                "end_time_sec must be zero or greater than or equal to start_time_sec",
+            ));
+        }
+        Ok(())
+    }
+
     fn bar_subscription_key(
         symbol: &str,
         exchange: &str,
@@ -1601,6 +1714,7 @@ impl PyRithmicDataClient {
             .ok_or_else(|| to_pyvalue_err(format!("Invalid bar subscription key: {key}")))?
             .parse::<i32>()
             .map_err(|_| to_pyvalue_err(format!("Invalid bar period in key: {key}")))?;
+        Self::checked_bar_period(bar_period)?;
         let bar_type = Self::parse_bar_type(bar_type)?;
         Ok((
             exchange.to_string(),
@@ -1617,6 +1731,7 @@ impl PyRithmicDataClient {
         mut rx: tokio::sync::broadcast::Receiver<MarketDataEvent>,
         mut rx_shutdown: tokio::sync::oneshot::Receiver<()>,
         callback: Arc<parking_lot::Mutex<Option<Py<PyAny>>>>,
+        event_running: Arc<AtomicBool>,
     ) {
         loop {
             tokio::select! {
@@ -1656,6 +1771,7 @@ impl PyRithmicDataClient {
                 }
             }
         }
+        event_running.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1672,6 +1788,24 @@ fn set_extra_market_data_flag(
         ExtraMarketDataKind::EndOfDayPrices => subscription.end_of_day_prices = value,
         ExtraMarketDataKind::OrderPriceLimits => subscription.order_price_limits = value,
         ExtraMarketDataKind::SymbolMarginRate => subscription.symbol_margin_rate = value,
+    }
+}
+
+fn get_book_subscription_flag(subscription: BookSubscription, kind: BookSubscriptionKind) -> bool {
+    match kind {
+        BookSubscriptionKind::Deltas => subscription.deltas,
+        BookSubscriptionKind::Depth10 => subscription.depth10,
+    }
+}
+
+fn set_book_subscription_flag(
+    subscription: &mut BookSubscription,
+    kind: BookSubscriptionKind,
+    value: bool,
+) {
+    match kind {
+        BookSubscriptionKind::Deltas => subscription.deltas = value,
+        BookSubscriptionKind::Depth10 => subscription.depth10 = value,
     }
 }
 
@@ -1758,11 +1892,12 @@ mod tests {
                 "user",
                 "pass",
                 "system",
+                "TestApp",
                 "fcm",
                 "ib",
                 "account",
             )
-            .with_app_name("TestApp"),
+            .expect("valid test gateway configuration"),
         )))
     }
 
@@ -1789,6 +1924,12 @@ mod tests {
         assert!(subscriptions.contains("CME:ESM6"));
     }
 
+    #[test]
+    fn book_snapshot_instrument_id_is_exchange_qualified() {
+        let instrument_id = rithmic_instrument_id("MNQM6", "CME").unwrap();
+        assert_eq!(instrument_id.to_string(), "MNQM6.CME.RITHMIC");
+    }
+
     #[tokio::test]
     async fn subscribe_market_data_alias_rolls_back_tracking_on_error() {
         Python::initialize();
@@ -1807,5 +1948,194 @@ mod tests {
 
         assert!(err.to_string().contains("Subscription failed"));
         assert!(subscriptions.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn instrument_status_failure_does_not_commit_subscription_state() {
+        Python::initialize();
+
+        let gateway = test_gateway();
+        let subscriptions = Arc::new(parking_lot::RwLock::new(AHashSet::new()));
+        let update_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+        let result = PyRithmicDataClient::update_instrument_status_subscription(
+            &gateway,
+            &subscriptions,
+            &update_lock,
+            "ESM6",
+            "CME",
+            true,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(subscriptions.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn instrument_status_unsubscribe_failure_preserves_subscription_state() {
+        Python::initialize();
+
+        let gateway = test_gateway();
+        let subscriptions = Arc::new(parking_lot::RwLock::new(AHashSet::from_iter([
+            "CME:ESM6".to_string()
+        ])));
+        let update_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+        let result = PyRithmicDataClient::update_instrument_status_subscription(
+            &gateway,
+            &subscriptions,
+            &update_lock,
+            "ESM6",
+            "CME",
+            false,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(subscriptions.read().contains("CME:ESM6"));
+    }
+
+    #[tokio::test]
+    async fn book_subscribe_failure_does_not_commit_subscription_state() {
+        Python::initialize();
+
+        let gateway = test_gateway();
+        let subscriptions = Arc::new(parking_lot::RwLock::new(AHashMap::new()));
+        let update_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+        let result = PyRithmicDataClient::update_book_subscription(
+            &gateway,
+            &subscriptions,
+            &update_lock,
+            "ESM6",
+            "CME",
+            BookSubscriptionKind::Deltas,
+            true,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(subscriptions.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn book_dual_intent_only_unsubscribes_upstream_after_last_intent() {
+        Python::initialize();
+
+        let gateway = test_gateway();
+        let subscriptions = Arc::new(parking_lot::RwLock::new(AHashMap::from_iter([(
+            "CME:ESM6".to_string(),
+            BookSubscription {
+                deltas: true,
+                depth10: true,
+            },
+        )])));
+        let update_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+        PyRithmicDataClient::update_book_subscription(
+            &gateway,
+            &subscriptions,
+            &update_lock,
+            "ESM6",
+            "CME",
+            BookSubscriptionKind::Deltas,
+            false,
+        )
+        .await
+        .expect("remaining depth10 intent must not touch the disconnected gateway");
+        assert_eq!(
+            subscriptions.read().get("CME:ESM6").copied(),
+            Some(BookSubscription {
+                deltas: false,
+                depth10: true,
+            })
+        );
+
+        let result = PyRithmicDataClient::update_book_subscription(
+            &gateway,
+            &subscriptions,
+            &update_lock,
+            "ESM6",
+            "CME",
+            BookSubscriptionKind::Depth10,
+            false,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            subscriptions.read().get("CME:ESM6").copied(),
+            Some(BookSubscription {
+                deltas: false,
+                depth10: true,
+            })
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(0)]
+    #[case(-1)]
+    fn bar_period_must_be_positive(#[case] bar_period: i32) {
+        Python::initialize();
+        assert!(PyRithmicDataClient::checked_bar_period(bar_period).is_err());
+    }
+
+    #[rstest::rstest]
+    #[case(-1, 0)]
+    #[case(0, -1)]
+    #[case(10, 9)]
+    fn history_window_rejects_invalid_ranges(#[case] start: i32, #[case] end: i32) {
+        Python::initialize();
+        assert!(PyRithmicDataClient::validate_history_window(start, end).is_err());
+    }
+
+    #[rstest::rstest]
+    fn extra_market_data_state_restores_previous_value_after_failure() {
+        let key = "CME:ESM6";
+        let previous = ExtraMarketDataSubscription {
+            quote_statistics: true,
+            ..Default::default()
+        };
+        let mut subscriptions = AHashMap::from_iter([(key.to_string(), previous)]);
+
+        assert!(
+            PyRithmicDataClient::update_extra_market_data_subscription_state(
+                &mut subscriptions,
+                key,
+                ExtraMarketDataKind::TradeStatistics,
+                true,
+            )
+        );
+        PyRithmicDataClient::restore_extra_market_data_subscription_state(
+            &mut subscriptions,
+            key,
+            Some(previous),
+        );
+
+        let restored = subscriptions.get(key).unwrap();
+        assert!(!restored.trade_statistics);
+        assert!(restored.quote_statistics);
+    }
+
+    #[rstest::rstest]
+    fn extra_market_data_state_removes_new_value_after_failure() {
+        let key = "CME:ESM6";
+        let mut subscriptions = AHashMap::new();
+
+        assert!(
+            PyRithmicDataClient::update_extra_market_data_subscription_state(
+                &mut subscriptions,
+                key,
+                ExtraMarketDataKind::TradeStatistics,
+                true,
+            )
+        );
+        PyRithmicDataClient::restore_extra_market_data_subscription_state(
+            &mut subscriptions,
+            key,
+            None,
+        );
+
+        assert!(!subscriptions.contains_key(key));
     }
 }

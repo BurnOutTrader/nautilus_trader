@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # mypy: disable-error-code="attr-defined"
-# ruff: noqa: E402
 # -------------------------------------------------------------------------------------------------
 #  Copyright (C) 2026 Kevin Monaghan. All rights reserved.
 #
@@ -33,28 +32,27 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from examples.live.rithmic.rithmic_live_node_helpers import TRADER_ID
-from examples.live.rithmic.rithmic_live_node_helpers import RithmicDataClientFactory
-from examples.live.rithmic.rithmic_live_node_helpers import RithmicExecClientFactory
-from examples.live.rithmic.rithmic_live_node_helpers import build_adapter_account_id
-from examples.live.rithmic.rithmic_live_node_helpers import build_data_client_config
-from examples.live.rithmic.rithmic_live_node_helpers import build_data_client_id
-from examples.live.rithmic.rithmic_live_node_helpers import build_exec_client_config
-from examples.live.rithmic.rithmic_live_node_helpers import build_exec_client_id
-from examples.live.rithmic.rithmic_live_node_helpers import load_rithmic_env_file
-from examples.live.rithmic.rithmic_live_node_helpers import schedule_stop
-from nautilus_trader._libnautilus.common import Environment
-from nautilus_trader._libnautilus.common import LoggerConfig
+from nautilus_trader._libnautilus.common import Environment, LoggerConfig
 from nautilus_trader.live import LiveNode
-from nautilus_trader.model import BarType
-from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import BarType, InstrumentId
 
+from examples.live.rithmic.rithmic_live_node_helpers import (
+    TRADER_ID,
+    RithmicDataClientFactory,
+    RithmicExecClientFactory,
+    build_adapter_account_id,
+    build_data_client_config,
+    build_data_client_id,
+    build_exec_client_config,
+    build_exec_client_id,
+    load_rithmic_env_file,
+    schedule_stop,
+)
 
 if TYPE_CHECKING:
     from nautilus_trader.config import ImportableStrategyConfig
@@ -65,7 +63,7 @@ else:
 load_rithmic_env_file()
 
 PROFILE = None
-INSTRUMENT_ID = InstrumentId.from_str("MNQM6.RITHMIC")
+INSTRUMENT_ID = InstrumentId.from_str("MNQM6.CME.RITHMIC")
 BAR_SPEC = "15-SECOND-LAST-EXTERNAL"
 TRADE_SIZE = "1"
 FAST_EMA_PERIOD = 10
@@ -73,8 +71,12 @@ SLOW_EMA_PERIOD = 20
 WARMUP_MINUTES = 30
 RUN_SECONDS = 0
 
-_STRATEGY_PATH = "examples.live.rithmic.rithmic_ema_cross_strategy:RithmicEMACrossStrategy"
-_CONFIG_PATH = "examples.live.rithmic.rithmic_ema_cross_strategy:RithmicEMACrossStrategyConfig"
+_STRATEGY_PATH = (
+    "examples.live.rithmic.rithmic_ema_cross_strategy:RithmicEMACrossStrategy"
+)
+_CONFIG_PATH = (
+    "examples.live.rithmic.rithmic_ema_cross_strategy:RithmicEMACrossStrategyConfig"
+)
 _LOGGING_SPEC = (
     "stdout=Info;"
     "nautilus_execution::order_manager=Warn;"
@@ -118,7 +120,7 @@ def main() -> None:
         .with_timeout_disconnection_secs(10)
         .with_delay_post_stop_secs(5)
         .add_data_client(
-            None,
+            data_client_id,
             RithmicDataClientFactory(),
             build_data_client_config(
                 profile,
@@ -126,7 +128,7 @@ def main() -> None:
             ),
         )
         .add_exec_client(
-            None,
+            exec_client_id,
             RithmicExecClientFactory(),
             build_exec_client_config(profile),
         )

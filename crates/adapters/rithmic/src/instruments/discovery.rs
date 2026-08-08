@@ -50,9 +50,9 @@ pub struct RithmicInstrumentSymbol {
 }
 
 impl RithmicInstrumentSymbol {
-    #[must_use]
-    pub fn instrument_id(&self) -> String {
-        format!("{}.RITHMIC", self.symbol)
+    pub fn instrument_id(&self) -> Result<String> {
+        crate::common::converters::rithmic_instrument_id(&self.symbol, &self.exchange)
+            .map(|instrument_id| instrument_id.to_string())
     }
 }
 
@@ -192,17 +192,17 @@ async fn search_symbols_for_supported_product_with_handle(
                     return Ok(listings);
                 }
             }
-            Err(error) => {
+            Err(e) => {
                 last_error = Some(format!(
-                    "Product symbol search failed for {} on {}: {error}",
+                    "Product symbol search failed for {} on {}: {e}",
                     product.code, exchange
                 ));
             }
         }
     }
 
-    if let Some(error) = last_error {
-        return Err(RithmicError::Api(error));
+    if let Some(e) = last_error {
+        return Err(RithmicError::Api(e));
     }
 
     Ok(Vec::new())
@@ -254,12 +254,12 @@ pub(crate) async fn discover_exchange_symbols_with_handle(
                     }),
                 );
             }
-            Err(error) => {
+            Err(e) => {
                 tracing::debug!(
                     "Failed to discover raw contract listings for product {} on {}: {}",
                     product_code,
                     exchange,
-                    error
+                    e
                 );
             }
         }
@@ -284,22 +284,22 @@ pub(crate) async fn discover_all_symbols_with_handle(
                     }),
                 );
             }
-            Err(error) => {
+            Err(e) => {
                 tracing::warn!(
                     "Failed to discover raw contract listings from {}: {}",
                     exchange,
-                    error
+                    e
                 );
-                last_error = Some(format!("{exchange}: {error}"));
+                last_error = Some(format!("{exchange}: {e}"));
             }
         }
     }
 
     if listings.is_empty()
-        && let Some(error) = last_error
+        && let Some(e) = last_error
     {
         return Err(RithmicError::Instrument(format!(
-            "Failed to discover any supported Rithmic contract listings: {error}"
+            "Failed to discover any supported Rithmic contract listings: {e}"
         )));
     }
 
@@ -351,7 +351,7 @@ mod tests {
             Some("Micro E-mini Nasdaq-100")
         );
         assert_eq!(listing.expiration_date.as_deref(), Some("20260619"));
-        assert_eq!(listing.instrument_id(), "MNQM6.RITHMIC");
+        assert_eq!(listing.instrument_id().unwrap(), "MNQM6.CME.RITHMIC");
     }
 
     #[rstest]

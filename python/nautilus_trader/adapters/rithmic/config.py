@@ -17,11 +17,26 @@ Configuration helpers for the Rithmic adapter.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from nautilus_trader._libnautilus.rithmic import RithmicDataClientConfig
 from nautilus_trader._libnautilus.rithmic import RithmicEnv
+from nautilus_trader._libnautilus.rithmic import (
+    get_rithmic_adapter_account_id as _binding_get_rithmic_adapter_account_id,
+)
+from nautilus_trader._libnautilus.rithmic import (
+    get_rithmic_data_client_id as _binding_get_rithmic_data_client_id,
+)
+from nautilus_trader._libnautilus.rithmic import (
+    get_rithmic_exec_client_id as _binding_get_rithmic_exec_client_id,
+)
+from nautilus_trader._libnautilus.rithmic import (
+    get_rithmic_profiles_from_env as _binding_get_rithmic_profiles_from_env,
+)
+from nautilus_trader._libnautilus.rithmic import (
+    normalize_rithmic_client_component as _binding_normalize_rithmic_client_component,
+)
+from nautilus_trader._libnautilus.rithmic import parse_rithmic_env as _binding_parse_rithmic_env
 
 
 RITHMIC_PROFILES_ENV = "RITHMIC_PROFILES"
@@ -41,133 +56,38 @@ def load_rithmic_env_file(path: str | None = None) -> int:
     """
     Load `RITHMIC_*` keys from a dotenv file via the PyO3 bindings.
 
-    Existing environment variables are not overwritten.
+    Values are stored in an adapter-owned cache; the process environment is not mutated and any
+    existing process value keeps precedence.
 
     """
     return int(RithmicDataClientConfig.load_env_file(path))
 
 
-def _normalize_profile_token(profile: str) -> str:
-    if "," in profile:
-        raise ValueError(
-            f"Multiple Rithmic env profiles must be configured via {RITHMIC_PROFILES_ENV}",
-        )
-    normalized = "".join(char.upper() if char.isalnum() else "_" for char in profile.strip())
-    normalized = "_".join(part for part in normalized.split("_") if part)
-
-    if not normalized:
-        raise ValueError("Rithmic env profile cannot be empty")
-    return normalized
-
-
 def normalize_rithmic_client_component(value: str) -> str:
-    normalized = _normalize_profile_token(value)
-
-    if "-" in normalized:
-        raise ValueError("Normalized Rithmic client component must not contain '-'")
-    return normalized
+    return _binding_normalize_rithmic_client_component(value)
 
 
 def get_rithmic_data_client_id(system_name: str) -> str:
-    return normalize_rithmic_client_component(system_name)
+    return _binding_get_rithmic_data_client_id(system_name)
 
 
 def get_rithmic_exec_client_id(system_name: str, account_id: str) -> str:
-    system_key = normalize_rithmic_client_component(system_name)
-    account_key = normalize_rithmic_client_component(account_id)
-    return f"{system_key}_{account_key}"
+    return _binding_get_rithmic_exec_client_id(system_name, account_id)
 
 
 def get_rithmic_adapter_account_id(system_name: str, account_id: str) -> str:
-    client_id = get_rithmic_exec_client_id(system_name, account_id)
-    return f"{client_id}-{account_id}"
-
-
-def _candidate_env_keys(
-    key: str,
-    profile: str | None = None,
-) -> list[str]:
-    candidates: list[str] = []
-
-    if profile:
-        candidates.append(f"RITHMIC_{_normalize_profile_token(profile)}_{key}")
-    candidates.append(f"RITHMIC_{key}")
-    return candidates
-
-
-def _optional_env(
-    key: str,
-    profile: str | None = None,
-) -> str | None:
-    for candidate in _candidate_env_keys(key, profile):
-        value = os.environ.get(candidate)
-
-        if value:
-            return value
-    return None
-
-
-def _required_env(
-    key: str,
-    profile: str | None = None,
-) -> str:
-    value = _optional_env(key, profile)
-
-    if value:
-        return value
-    missing_key = _candidate_env_keys(key, profile)[0]
-    raise ValueError(f"{missing_key} environment variable not set")
-
-
-def _optional_int_env(
-    key: str,
-    profile: str | None = None,
-) -> int | None:
-    value = _optional_env(key, profile)
-
-    if value is None:
-        return None
-    return int(value)
+    return _binding_get_rithmic_adapter_account_id(system_name, account_id)
 
 
 def get_rithmic_profiles_from_env() -> list[str]:
-    value = os.environ.get(RITHMIC_PROFILES_ENV)
-
-    if not value:
-        return []
-
-    profiles: list[str] = []
-    seen: set[str] = set()
-
-    for profile in (part.strip() for part in value.split(",")):
-        if not profile:
-            continue
-        normalized = _normalize_profile_token(profile)
-
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        profiles.append(profile)
-    return profiles
+    return list(_binding_get_rithmic_profiles_from_env())
 
 
-def parse_rithmic_env(value: str | None) -> Any:
+def parse_rithmic_env(value: str | None) -> RithmicEnv:
     """
     Parse a Rithmic environment token into the PyO3 `RithmicEnv` type.
     """
-    if value is None:
-        return RithmicEnv.DEMO
-
-    token = value.strip().lower()
-
-    if token in {"demo", "paper"}:
-        return RithmicEnv.DEMO
-    if token in {"live", "prod", "production"}:
-        return RithmicEnv.LIVE
-    if token == "test":
-        return RithmicEnv.TEST
-
-    raise ValueError(f"Invalid Rithmic environment {value!r}; expected demo, live, or test")
+    return _binding_parse_rithmic_env(value)
 
 
 def rithmic_env_token(environment: Any) -> str:
@@ -186,7 +106,7 @@ def rithmic_env_token(environment: Any) -> str:
     raise TypeError(f"Cannot normalize Rithmic environment token from {environment!r}")
 
 
-def to_binding_environment(environment: Any) -> Any:
+def to_binding_environment(environment: Any) -> RithmicEnv:
     """
     Normalize supported environment tokens into the PyO3 `RithmicEnv` type.
     """

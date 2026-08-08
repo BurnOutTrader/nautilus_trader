@@ -31,7 +31,11 @@
 //! gateway.connect().await?;
 //! ```
 
-use std::{env, fmt::Debug, sync::Arc, time::Duration};
+use std::{
+    fmt::Debug,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use ahash::AHashMap;
 use arc_swap::ArcSwap;
@@ -60,13 +64,16 @@ use rithmic_rs::{
     ws::ConnectStrategy,
 };
 use tokio::{
-    sync::{RwLock, broadcast, mpsc},
+    sync::{RwLock, broadcast},
     task::JoinHandle,
 };
 use ustr::Ustr;
 
 use crate::{
-    common::{enums::ConnectionState, parse::rithmic_depth_order_id},
+    common::{
+        enums::ConnectionState,
+        parse::{rithmic_depth_order_id, tick_size_to_precision},
+    },
     config::{RithmicEnv, optional_env_var, parse_rithmic_env, required_env_var},
     data::{
         MarketDataEvent, RithmicBarType,
@@ -85,8 +92,11 @@ use crate::{
 /// Maximum reconnection attempts before giving up.
 const MAX_RECONNECT_ATTEMPTS: u32 = 100;
 
-const DEFAULT_APP_NAME: &str = "";
 const DEFAULT_APP_VERSION: &str = "1.0";
+
+// The supported catalog is limited to USD-margined contracts on CME, CBOT,
+// NYMEX, and COMEX. Rithmic account PnL messages carry no currency field.
+const SUPPORTED_ACCOUNT_CURRENCY: &str = "USD";
 
 /// Initial backoff duration for reconnection.
 const INITIAL_BACKOFF_MS: u64 = 1000;
@@ -99,6 +109,12 @@ const DISCONNECT_TIMEOUT_SECS: u64 = 5;
 
 /// Broadcast buffer for downstream market data, execution, and PnL consumers.
 const DOWNSTREAM_EVENT_BUFFER_CAPACITY: usize = 10_000;
+
+/// Maximum number of live deltas held while a depth snapshot is in flight.
+const ORDER_BOOK_BOOTSTRAP_MAX_DELTAS: usize = 10_000;
+
+/// Maximum time an order-book snapshot may keep live deltas buffered.
+const ORDER_BOOK_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum automatic resume attempts for a single historical bar request.
 const MAX_HISTORY_RESUME_ATTEMPTS: usize = 128;
@@ -203,7 +219,7 @@ where
 /// This unified configuration contains all credentials needed to connect
 /// to any Rithmic plant. Use `from_env()` to load from environment variables.
 #[must_use]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GatewayConfig {
     /// Rithmic environment (Demo, Live, Test).
     pub environment: RithmicEnv,
@@ -241,23 +257,59 @@ pub struct GatewayConfig {
     pub enable_history: bool,
 }
 
+impl Debug for GatewayConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(GatewayConfig))
+            .field("environment", &self.environment)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("system_name", &self.system_name)
+            .field("app_name", &self.app_name)
+            .field("app_version", &self.app_version)
+            .field("fcm_id", &self.fcm_id)
+            .field("ib_id", &self.ib_id)
+            .field("account_id", &self.account_id)
+            .field("server", &self.server)
+            .field("alt_server", &self.alt_server)
+            .field(
+                "url_override",
+                &self.url_override.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "beta_url_override",
+                &self.beta_url_override.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("enable_ticker", &self.enable_ticker)
+            .field("enable_order", &self.enable_order)
+            .field("enable_pnl", &self.enable_pnl)
+            .field("enable_history", &self.enable_history)
+            .finish()
+    }
+}
+
 impl GatewayConfig {
-    /// Creates a new gateway configuration.
+    /// Creates a validated gateway configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a required login or application identity is empty.
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         environment: RithmicEnv,
         username: impl Into<String>,
         password: impl Into<String>,
         system_name: impl Into<String>,
+        app_name: impl Into<String>,
         fcm_id: impl Into<String>,
         ib_id: impl Into<String>,
         account_id: impl Into<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let config = Self {
             environment,
             username: username.into(),
             password: password.into(),
             system_name: system_name.into(),
-            app_name: DEFAULT_APP_NAME.to_string(),
+            app_name: app_name.into(),
             app_version: DEFAULT_APP_VERSION.to_string(),
             fcm_id: fcm_id.into(),
             ib_id: ib_id.into(),
@@ -270,7 +322,25 @@ impl GatewayConfig {
             enable_order: true,
             enable_pnl: true,
             enable_history: false, // Lazy by default
+        };
+        config.validate_identity()?;
+        Ok(config)
+    }
+
+    fn validate_identity(&self) -> Result<()> {
+        for (name, value) in [
+            ("username", self.username.as_str()),
+            ("password", self.password.as_str()),
+            ("system_name", self.system_name.as_str()),
+            ("app_name", self.app_name.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(RithmicError::Config(format!(
+                    "Rithmic {name} cannot be empty"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// Creates configuration from environment variables.
@@ -295,8 +365,13 @@ impl GatewayConfig {
     pub fn from_env_with_profile(profile: Option<&str>) -> Result<Self> {
         let environment = optional_env_var("ENV", profile)?
             .map_or(Ok(RithmicEnv::Demo), |s| parse_rithmic_env(&s))?;
+        let (url_key, alt_url_key) = match environment {
+            RithmicEnv::Demo => ("DEMO_URL", "DEMO_ALT_URL"),
+            RithmicEnv::Live => ("LIVE_URL", "LIVE_ALT_URL"),
+            RithmicEnv::Test => ("TEST_URL", "TEST_ALT_URL"),
+        };
 
-        Ok(Self {
+        let config = Self {
             environment,
             username: required_env_var("USERNAME", profile)?,
             password: required_env_var("PASSWORD", profile)?,
@@ -309,14 +384,16 @@ impl GatewayConfig {
             account_id: required_env_var("ACCOUNT_ID", profile)?,
             server: optional_env_var("SERVER", profile)?,
             alt_server: optional_env_var("ALT_SERVER", profile)?,
-            url_override: None,
-            beta_url_override: None,
+            url_override: optional_env_var(url_key, profile)?,
+            beta_url_override: optional_env_var(alt_url_key, profile)?,
             enable_ticker: true,
             enable_order: true,
             enable_pnl: true,
             enable_history: optional_env_var("ENABLE_HISTORY", profile)?
                 .is_some_and(|v| !matches!(v.to_lowercase().as_str(), "false" | "0" | "no")),
-        })
+        };
+        config.validate_identity()?;
+        Ok(config)
     }
 
     /// Enables or disables the ticker plant.
@@ -381,26 +458,8 @@ impl GatewayConfig {
 
     /// Converts to rithmic-rs RithmicConfig.
     pub(crate) fn to_rithmic_config(&self) -> Result<RithmicConfig> {
+        self.validate_identity()?;
         let env = self.environment;
-
-        // Map environment to the required connection fields
-        let (url_var, beta_url_var, default_system_name) = match env {
-            RithmicEnv::Demo => (
-                "RITHMIC_DEMO_URL",
-                "RITHMIC_DEMO_ALT_URL",
-                "Rithmic Paper Trading".to_string(),
-            ),
-            RithmicEnv::Live => (
-                "RITHMIC_LIVE_URL",
-                "RITHMIC_LIVE_ALT_URL",
-                "Rithmic 01".to_string(),
-            ),
-            RithmicEnv::Test => (
-                "RITHMIC_TEST_URL",
-                "RITHMIC_TEST_ALT_URL",
-                "Rithmic Test".to_string(),
-            ),
-        };
 
         let named_url = Some(
             resolve_server_endpoint(self.server.as_deref().unwrap_or(default_server_name(env)))?
@@ -409,9 +468,8 @@ impl GatewayConfig {
         let url = self
             .url_override
             .clone()
-            .or_else(|| env::var(url_var).ok())
             .or(named_url)
-            .ok_or_else(|| RithmicError::Config(format!("{url_var} not set")))?;
+            .ok_or_else(|| RithmicError::Config("Rithmic URL is not configured".to_string()))?;
 
         let named_beta_url = self
             .alt_server
@@ -422,16 +480,8 @@ impl GatewayConfig {
         let beta_url = self
             .beta_url_override
             .clone()
-            .or_else(|| env::var(beta_url_var).ok())
             .or(named_beta_url)
             .unwrap_or_default();
-
-        if self.app_name.is_empty() {
-            return Err(RithmicError::Config(
-                "Rithmic app_name cannot be empty; supply your own conformance app name"
-                    .to_string(),
-            ));
-        }
 
         let mut builder = RithmicConfig::builder(env)
             .user(self.username.clone())
@@ -441,13 +491,7 @@ impl GatewayConfig {
             .url(url)
             .beta_url(beta_url);
 
-        // Use provided system name override when present; otherwise fall back to rithmic-rs default
-        let system_name = if self.system_name.is_empty() {
-            default_system_name
-        } else {
-            self.system_name.clone()
-        };
-        builder = builder.system_name(system_name);
+        builder = builder.system_name(self.system_name.clone());
 
         builder
             .build()
@@ -494,9 +538,19 @@ pub enum PnlEvent {
     Position(PositionEvent),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PendingOrderBookBootstrap {
     live_deltas: Vec<crate::data::BookDelta>,
+    started_at: Instant,
+}
+
+impl Default for PendingOrderBookBootstrap {
+    fn default() -> Self {
+        Self {
+            live_deltas: Vec::new(),
+            started_at: Instant::now(),
+        }
+    }
 }
 
 /// Central gateway for Rithmic connections.
@@ -538,9 +592,6 @@ pub struct RithmicGateway {
 
     // Background task handles
     task_handles: Vec<JoinHandle<()>>,
-
-    // Shutdown signal
-    shutdown_tx: Option<mpsc::Sender<()>>,
 }
 
 impl RithmicGateway {
@@ -570,7 +621,6 @@ impl RithmicGateway {
             execution_tx,
             pnl_tx,
             task_handles: Vec::new(),
-            shutdown_tx: None,
         }
     }
 
@@ -1176,14 +1226,31 @@ impl RithmicGateway {
         let key = order_book_subscription_key(symbol, exchange);
         self.begin_order_book_bootstrap(&key).await;
 
-        let result = async {
-            self.subscribe_order_book(symbol, exchange).await?;
-            self.bootstrap_order_book_snapshot(symbol, exchange).await
+        let subscribed = self.subscribe_order_book(symbol, exchange).await;
+        if let Err(e) = subscribed {
+            self.clear_order_book_bootstrap(&key).await;
+            return Err(e);
         }
-        .await;
+
+        let result = tokio::time::timeout(
+            ORDER_BOOK_BOOTSTRAP_TIMEOUT,
+            self.bootstrap_order_book_snapshot(symbol, exchange),
+        )
+        .await
+        .map_err(|_| {
+            RithmicError::Connection(format!(
+                "Order book snapshot timed out for {symbol} on {exchange}"
+            ))
+        })
+        .and_then(|result| result);
 
         if result.is_err() {
             self.clear_order_book_bootstrap(&key).await;
+            if let Err(e) = self.unsubscribe_order_book(symbol, exchange).await {
+                tracing::warn!(
+                    "Failed to roll back order-book subscription for {symbol} on {exchange}: {e}"
+                );
+            }
         }
 
         result
@@ -1202,12 +1269,31 @@ impl RithmicGateway {
             .as_ref()
             .ok_or_else(|| RithmicError::Connection("Ticker plant not connected".to_string()))?;
 
-        handle
+        let responses = handle
             .request_depth_by_order_snapshot(symbol, exchange)
             .await
             .map_err(|e| {
                 RithmicError::Connection(format!("Order book snapshot request failed: {e}"))
-            })
+            })?;
+        if let Some(e) = responses
+            .iter()
+            .find_map(|response| response.error.as_ref())
+        {
+            return Err(RithmicError::Api(format!(
+                "Order book snapshot rejected for {exchange}:{symbol}: {e}"
+            )));
+        }
+        if !responses.iter().any(|response| {
+            matches!(
+                response.message,
+                RithmicMessage::ResponseDepthByOrderSnapshot(_)
+            )
+        }) {
+            return Err(RithmicError::Api(format!(
+                "Order book snapshot returned no snapshot rows for {exchange}:{symbol}"
+            )));
+        }
+        Ok(responses)
     }
 
     /// Bootstraps the local order book by replaying a fresh snapshot into the market-data channel.
@@ -1216,7 +1302,13 @@ impl RithmicGateway {
         let snapshot_sequence = depth_snapshot_sequence(&responses);
         let instruments = self.instruments.read().await;
 
-        for event in depth_snapshot_to_events(&responses, &instruments) {
+        let events = depth_snapshot_to_events(&responses, &instruments);
+        if events.is_empty() {
+            return Err(RithmicError::Api(format!(
+                "Order book snapshot contained no valid rows for {exchange}:{symbol}"
+            )));
+        }
+        for event in events {
             let _ = self.market_data_tx.send(event);
         }
 
@@ -1507,34 +1599,70 @@ impl RithmicGateway {
 
     /// Ensures the gateway is connected with the requested plants enabled.
     pub async fn connect_requested(&mut self, requested: &GatewayConfig) -> Result<()> {
+        let previous_enabled = (
+            self.config.enable_ticker,
+            self.config.enable_order,
+            self.config.enable_pnl,
+            self.config.enable_history,
+        );
         self.merge_requested_plants(requested);
 
         if !self.is_connected() {
-            return self.connect().await;
+            let result = self.connect().await;
+            if result.is_err() {
+                (
+                    self.config.enable_ticker,
+                    self.config.enable_order,
+                    self.config.enable_pnl,
+                    self.config.enable_history,
+                ) = previous_enabled;
+            }
+            return result;
         }
 
-        let rithmic_config = self.config.to_rithmic_config()?;
+        let previous_plants = self.connected_plants();
+        let result = async {
+            let rithmic_config = self.config.to_rithmic_config()?;
 
-        let ticker_handle = if self.config.enable_ticker && !self.has_ticker_plant() {
-            Some(self.connect_ticker_plant(&rithmic_config).await?)
-        } else {
-            None
-        };
+            let ticker_handle = if self.config.enable_ticker && !self.has_ticker_plant() {
+                Some(self.connect_ticker_plant(&rithmic_config).await?)
+            } else {
+                None
+            };
 
-        if self.config.enable_order && !self.has_order_plant() {
-            self.connect_order_plant(&rithmic_config).await?;
+            if self.config.enable_order && !self.has_order_plant() {
+                self.connect_order_plant(&rithmic_config).await?;
+            }
+
+            if self.config.enable_pnl && !self.has_pnl_plant() {
+                self.connect_pnl_plant(&rithmic_config).await?;
+            }
+
+            if self.config.enable_history && !self.has_history_plant() {
+                self.connect_history_plant(&rithmic_config).await?;
+            }
+
+            Ok(ticker_handle)
         }
+        .await;
 
-        if self.config.enable_pnl && !self.has_pnl_plant() {
-            self.connect_pnl_plant(&rithmic_config).await?;
+        match result {
+            Ok(ticker_handle) => {
+                self.spawn_processors(ticker_handle, !previous_plants.3);
+                Ok(())
+            }
+            Err(e) => {
+                (
+                    self.config.enable_ticker,
+                    self.config.enable_order,
+                    self.config.enable_pnl,
+                    self.config.enable_history,
+                ) = previous_enabled;
+                self.rollback_new_plants(previous_plants).await;
+                self.set_connection_state(ConnectionState::Connected);
+                Err(e)
+            }
         }
-
-        if self.config.enable_history && !self.has_history_plant() {
-            self.connect_history_plant(&rithmic_config).await?;
-        }
-
-        self.spawn_processors(ticker_handle);
-        Ok(())
     }
 
     /// Connects to all enabled Rithmic plants.
@@ -1552,35 +1680,48 @@ impl RithmicGateway {
         self.set_connection_state(ConnectionState::Connecting);
         tracing::info!("Connecting to Rithmic gateway...");
 
-        let rithmic_config = self.config.to_rithmic_config()?;
-        // Create shutdown channel
-        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
-        self.shutdown_tx = Some(shutdown_tx);
+        let previous_plants = self.connected_plants();
+        let result = async {
+            let rithmic_config = self.config.to_rithmic_config()?;
 
-        // Connect to each enabled plant and collect handles for processors
-        let ticker_handle = if self.config.enable_ticker {
-            Some(self.connect_ticker_plant(&rithmic_config).await?)
-        } else {
-            None
+            let ticker_handle = if self.config.enable_ticker && !self.has_ticker_plant() {
+                Some(self.connect_ticker_plant(&rithmic_config).await?)
+            } else {
+                None
+            };
+
+            if self.config.enable_order && !self.has_order_plant() {
+                self.connect_order_plant(&rithmic_config).await?;
+            }
+
+            if self.config.enable_pnl && !self.has_pnl_plant() {
+                self.connect_pnl_plant(&rithmic_config).await?;
+            }
+
+            if self.config.enable_history && !self.has_history_plant() {
+                tracing::info!("Connecting to history plant...");
+                self.connect_history_plant(&rithmic_config).await?;
+            } else if !self.config.enable_history {
+                tracing::info!("Skipping history plant connection (enable_history=false)");
+            }
+
+            Ok(ticker_handle)
+        }
+        .await;
+
+        let ticker_handle = match result {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.rollback_new_plants(previous_plants).await;
+                self.set_connection_state(ConnectionState::Disconnected);
+                return Err(e);
+            }
         };
 
-        if self.config.enable_order {
-            self.connect_order_plant(&rithmic_config).await?;
-        }
-
-        if self.config.enable_pnl {
-            self.connect_pnl_plant(&rithmic_config).await?;
-        }
-
-        if self.config.enable_history {
-            tracing::info!("Connecting to history plant...");
-            self.connect_history_plant(&rithmic_config).await?;
-        } else {
-            tracing::info!("Skipping history plant connection (enable_history=false)");
-        }
-
-        // Spawn processor tasks with the handles
-        self.spawn_processors(ticker_handle);
+        self.spawn_processors(
+            ticker_handle,
+            self.config.enable_history && !previous_plants.3,
+        );
 
         self.set_connection_state(ConnectionState::Connected);
 
@@ -1731,7 +1872,11 @@ impl RithmicGateway {
     }
 
     /// Spawns background processor tasks for each connected plant.
-    fn spawn_processors(&mut self, ticker_handle: Option<RithmicTickerPlantHandle>) {
+    fn spawn_processors(
+        &mut self,
+        ticker_handle: Option<RithmicTickerPlantHandle>,
+        spawn_history: bool,
+    ) {
         // Spawn ticker processor
 
         if let Some(handle) = ticker_handle {
@@ -1753,7 +1898,7 @@ impl RithmicGateway {
             self.task_handles.push(task);
         }
 
-        if let Some(handle) = self.history_handle.clone() {
+        if spawn_history && let Some(handle) = self.history_handle.clone() {
             let event_tx = self.market_data_tx.clone();
             let connection_state = Arc::clone(&self.connection_state);
             let instruments = Arc::clone(&self.instruments);
@@ -1765,6 +1910,101 @@ impl RithmicGateway {
         }
     }
 
+    fn connected_plants(&self) -> (bool, bool, bool, bool) {
+        (
+            self.ticker_plant.is_some(),
+            self.order_plant.is_some(),
+            self.pnl_plant.is_some(),
+            self.history_plant.is_some(),
+        )
+    }
+
+    fn has_connection_resources(&self) -> bool {
+        let (ticker, order, pnl, history) = self.connected_plants();
+        ticker
+            || order
+            || pnl
+            || history
+            || self.ticker_query_handle.is_some()
+            || self.history_handle.is_some()
+            || !self.task_handles.is_empty()
+    }
+
+    /// Rolls back only plants added by the current connection transaction,
+    /// preserving any plants which were already serving another shared lease.
+    async fn rollback_new_plants(&mut self, previous: (bool, bool, bool, bool)) {
+        let account = self.config.to_rithmic_account();
+
+        if !previous.0
+            && let Some(plant) = self.ticker_plant.take()
+        {
+            let handle = plant.get_handle();
+            if !matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(DISCONNECT_TIMEOUT_SECS),
+                    handle.disconnect(),
+                )
+                .await,
+                Ok(Ok(_))
+            ) {
+                handle.abort();
+            }
+            self.ticker_query_handle = None;
+        }
+
+        if !previous.1
+            && let Some(plant) = self.order_plant.take()
+        {
+            let handle = plant.get_handle(&account);
+            if !matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(DISCONNECT_TIMEOUT_SECS),
+                    handle.disconnect(),
+                )
+                .await,
+                Ok(Ok(_))
+            ) {
+                handle.abort();
+            }
+            self.order_updates_available = false;
+        }
+
+        if !previous.2
+            && let Some(plant) = self.pnl_plant.take()
+        {
+            let handle = plant.get_handle(&account);
+            if !matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(DISCONNECT_TIMEOUT_SECS),
+                    handle.disconnect(),
+                )
+                .await,
+                Ok(Ok(_))
+            ) {
+                handle.abort();
+            }
+        }
+
+        if !previous.3
+            && let Some(plant) = self.history_plant.take()
+        {
+            let handle = plant.get_handle();
+            if !matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(DISCONNECT_TIMEOUT_SECS),
+                    handle.disconnect(),
+                )
+                .await,
+                Ok(Ok(_))
+            ) {
+                handle.abort();
+            }
+            self.history_handle = None;
+        }
+
+        self.order_book_bootstraps.write().await.clear();
+    }
+
     /// Disconnects from all Rithmic plants.
     ///
     /// This method:
@@ -1772,22 +2012,20 @@ impl RithmicGateway {
     /// 2. Disconnects from each plant
     /// 3. Cleans up resources
     pub async fn disconnect(&mut self) -> Result<()> {
-        if !self.is_connected() && self.connection_state() != ConnectionState::Reconnecting {
+        if !self.has_connection_resources() {
+            self.set_connection_state(ConnectionState::Disconnected);
             return Ok(());
         }
 
         tracing::info!("Disconnecting from Rithmic gateway...");
 
-        // Signal shutdown
-
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(()).await;
-        }
-
-        // Abort all processor tasks (they own the streaming handles)
-
-        for handle in self.task_handles.drain(..) {
+        // Abort and drain all processor tasks (they own the streaming handles).
+        let handles = self.task_handles.drain(..).collect::<Vec<_>>();
+        for handle in &handles {
             handle.abort();
+        }
+        for handle in handles {
+            let _ = handle.await;
         }
 
         self.order_book_bootstraps.write().await.clear();
@@ -1964,8 +2202,7 @@ impl RithmicGateway {
         self.order_book_bootstraps
             .write()
             .await
-            .entry(key.to_string())
-            .or_default();
+            .insert(key.to_string(), PendingOrderBookBootstrap::default());
     }
 
     async fn clear_order_book_bootstrap(&self, key: &str) {
@@ -2076,8 +2313,18 @@ async fn ticker_processor(
                 let events = if let Some(key) = live_order_book_key(&response.message) {
                     match buffer_live_order_book_events(&order_book_bootstraps, &key, events).await
                     {
-                        Some(events) => events,
-                        None => continue,
+                        OrderBookBufferResult::Publish(events) => events,
+                        OrderBookBufferResult::Buffered => continue,
+                        OrderBookBufferResult::RecoveryRequired => {
+                            tracing::warn!(
+                                "Order-book bootstrap exceeded its bounds for {key}; reconnecting"
+                            );
+                            let _ = event_tx.send(MarketDataEvent::Error(format!(
+                                "Order-book bootstrap bounds exceeded for {key}"
+                            )));
+                            notify_market_data_reconnecting(&event_tx, &connection_state);
+                            break;
+                        }
                     }
                 } else {
                     events
@@ -2298,11 +2545,22 @@ async fn buffer_live_order_book_events(
     order_book_bootstraps: &Arc<RwLock<AHashMap<String, PendingOrderBookBootstrap>>>,
     key: &str,
     events: Vec<MarketDataEvent>,
-) -> Option<Vec<MarketDataEvent>> {
+) -> OrderBookBufferResult {
     let mut bootstraps = order_book_bootstraps.write().await;
     let Some(state) = bootstraps.get_mut(key) else {
-        return Some(events);
+        return OrderBookBufferResult::Publish(events);
     };
+
+    let incoming = events
+        .iter()
+        .filter(|event| matches!(event, MarketDataEvent::BookDelta(_)))
+        .count();
+    if state.started_at.elapsed() >= ORDER_BOOK_BOOTSTRAP_TIMEOUT
+        || state.live_deltas.len().saturating_add(incoming) > ORDER_BOOK_BOOTSTRAP_MAX_DELTAS
+    {
+        bootstraps.remove(key);
+        return OrderBookBufferResult::RecoveryRequired;
+    }
 
     for event in events {
         if let MarketDataEvent::BookDelta(delta) = event {
@@ -2310,7 +2568,13 @@ async fn buffer_live_order_book_events(
         }
     }
 
-    None
+    OrderBookBufferResult::Buffered
+}
+
+enum OrderBookBufferResult {
+    Publish(Vec<MarketDataEvent>),
+    Buffered,
+    RecoveryRequired,
 }
 
 /// Converts Rithmic's ssboe (seconds since beginning of epoch) and usecs to Unix nanoseconds.
@@ -2319,10 +2583,15 @@ async fn buffer_live_order_book_events(
 /// - `ssboe`: Seconds since Unix epoch (1970-01-01)
 /// - `usecs`: Microseconds component
 #[inline]
-fn rithmic_timestamp_to_nanos(ssboe: Option<i32>, usecs: Option<i32>) -> u64 {
-    let secs = ssboe.unwrap_or(0) as u64;
-    let micros = usecs.unwrap_or(0) as u64;
-    secs * 1_000_000_000 + micros * 1_000
+fn rithmic_timestamp_to_nanos(ssboe: Option<i32>, usecs: Option<i32>) -> Option<u64> {
+    let secs = u64::try_from(ssboe?).ok()?;
+    let micros = u64::try_from(usecs.unwrap_or_default()).ok()?;
+    if micros >= 1_000_000 {
+        return None;
+    }
+
+    secs.checked_mul(1_000_000_000)?
+        .checked_add(micros.checked_mul(1_000)?)
 }
 
 /// Returns current time in Unix nanoseconds.
@@ -2353,9 +2622,9 @@ fn live_bar_type_to_replay(value: i32) -> Option<TimeBarType> {
 
 #[inline]
 fn time_bar_timestamp_to_nanos(marker: Option<i32>) -> Option<u64> {
-    marker
-        .filter(|value| *value > 0)
-        .map(|value| value as u64 * 1_000_000_000)
+    u64::try_from(marker.filter(|value| *value > 0)?)
+        .ok()?
+        .checked_mul(1_000_000_000)
 }
 
 #[inline]
@@ -2364,10 +2633,11 @@ fn tick_bar_marker(data_bar_ssboe: &[i32]) -> Option<i64> {
 }
 
 #[inline]
-fn tick_bar_timestamp_to_nanos(data_bar_ssboe: &[i32], data_bar_usecs: &[i32]) -> u64 {
-    let secs = data_bar_ssboe.last().copied().unwrap_or_default() as u64;
-    let micros = data_bar_usecs.last().copied().unwrap_or_default() as u64;
-    secs * 1_000_000_000 + micros * 1_000
+fn tick_bar_timestamp_to_nanos(data_bar_ssboe: &[i32], data_bar_usecs: &[i32]) -> Option<u64> {
+    rithmic_timestamp_to_nanos(
+        data_bar_ssboe.last().copied(),
+        data_bar_usecs.last().copied(),
+    )
 }
 
 #[inline]
@@ -2393,18 +2663,27 @@ fn quote_is_complete(quote: &crate::data::QuoteTick) -> bool {
 }
 
 #[inline]
-fn get_precisions(instruments: &AHashMap<String, InstrumentInfo>, key: &str) -> (u8, u8) {
-    instruments.get(key).map_or((2, 0), |info| {
-        let price_precision = info.tick_size.map_or(2, |ts| {
-            if ts <= 0.0 {
-                2
-            } else {
-                -ts.log10().ceil() as u8
-            }
-        });
-        let size_precision = 0;
-        (price_precision, size_precision)
-    })
+fn get_precisions(instruments: &AHashMap<String, InstrumentInfo>, key: &str) -> Option<(u8, u8)> {
+    let tick_size = instruments.get(key)?.tick_size?;
+    if !tick_size.is_finite() || tick_size <= 0.0 {
+        return None;
+    }
+
+    let price_precision = tick_size_to_precision(tick_size).ok()?;
+    Price::new_checked(tick_size, price_precision).ok()?;
+    // Rithmic depth and trade sizes are integer contract counts.
+    Some((price_precision, 0))
+}
+
+fn checked_market_price(value: f64, precision: u8) -> Option<f64> {
+    Price::new_checked(value, precision).ok()?;
+    Some(value)
+}
+
+fn checked_market_quantity(value: u64, precision: u8) -> Option<f64> {
+    Quantity::from_mantissa_exponent_checked(value, 0, precision)
+        .ok()
+        .map(|quantity| quantity.as_f64())
 }
 
 /// Transforms a ticker plant response to a market data event.
@@ -2436,18 +2715,23 @@ fn transform_history_market_data_message(
             let bar_period = bar.period.as_ref()?.parse::<i32>().ok()?;
             let ts_event = time_bar_timestamp_to_nanos(bar.marker)?;
             let ts_init = now_nanos();
-            let (price_precision, size_precision) = get_precisions(instruments, &key);
+            let (price_precision, size_precision) = get_precisions(instruments, &key)?;
+            let open_price = checked_market_price(bar.open_price?, price_precision)?;
+            let high_price = checked_market_price(bar.high_price?, price_precision)?;
+            let low_price = checked_market_price(bar.low_price?, price_precision)?;
+            let close_price = checked_market_price(bar.close_price?, price_precision)?;
+            let volume = checked_market_quantity(bar.volume?, size_precision)?;
 
             Some(MarketDataEvent::Bar(crate::data::TimeBar {
                 symbol: symbol.clone(),
                 exchange: exchange.clone(),
                 bar_type,
                 bar_period,
-                open_price: bar.open_price.unwrap_or(0.0),
-                high_price: bar.high_price.unwrap_or(0.0),
-                low_price: bar.low_price.unwrap_or(0.0),
-                close_price: bar.close_price.unwrap_or(0.0),
-                volume: bar.volume.unwrap_or(0) as f64,
+                open_price,
+                high_price,
+                low_price,
+                close_price,
+                volume,
                 price_precision,
                 size_precision,
                 marker: bar.marker.map(i64::from),
@@ -2461,20 +2745,25 @@ fn transform_history_market_data_message(
             let key = format!("{exchange}:{symbol}");
             let bar_type = live_tick_bar_type_to_bar_type(bar.r#type?)?;
             let bar_period = bar.type_specifier.as_deref()?.parse::<i32>().ok()?;
-            let ts_event = tick_bar_timestamp_to_nanos(&bar.data_bar_ssboe, &bar.data_bar_usecs);
+            let ts_event = tick_bar_timestamp_to_nanos(&bar.data_bar_ssboe, &bar.data_bar_usecs)?;
             let ts_init = now_nanos();
-            let (price_precision, size_precision) = get_precisions(instruments, &key);
+            let (price_precision, size_precision) = get_precisions(instruments, &key)?;
+            let open_price = checked_market_price(bar.open_price?, price_precision)?;
+            let high_price = checked_market_price(bar.high_price?, price_precision)?;
+            let low_price = checked_market_price(bar.low_price?, price_precision)?;
+            let close_price = checked_market_price(bar.close_price?, price_precision)?;
+            let volume = checked_market_quantity(bar.volume?, size_precision)?;
 
             Some(MarketDataEvent::Bar(crate::data::TimeBar {
                 symbol: symbol.clone(),
                 exchange: exchange.clone(),
                 bar_type,
                 bar_period,
-                open_price: bar.open_price.unwrap_or(0.0),
-                high_price: bar.high_price.unwrap_or(0.0),
-                low_price: bar.low_price.unwrap_or(0.0),
-                close_price: bar.close_price.unwrap_or(0.0),
-                volume: bar.volume.unwrap_or(0) as f64,
+                open_price,
+                high_price,
+                low_price,
+                close_price,
+                volume,
                 price_precision,
                 size_precision,
                 marker: tick_bar_marker(&bar.data_bar_ssboe),
@@ -2518,46 +2807,67 @@ fn transform_market_data_message(
                 bbo.ask_price,
                 bbo.ask_size,
             );
+            let bid_cleared = bbo
+                .clear_bits
+                .is_some_and(|bits| bits & PresenceBits::Bid as u32 != 0);
+            let ask_cleared = bbo
+                .clear_bits
+                .is_some_and(|bits| bits & PresenceBits::Ask as u32 != 0);
 
-            if !bid_updated && !ask_updated {
+            if !bid_updated && !ask_updated && !bid_cleared && !ask_cleared {
                 return vec![];
             }
 
-            let ts_event = rithmic_timestamp_to_nanos(bbo.ssboe, bbo.usecs);
+            let Some(ts_event) = rithmic_timestamp_to_nanos(bbo.ssboe, bbo.usecs) else {
+                return vec![];
+            };
             let ts_init = now_nanos();
             let key = format!("{exchange}:{symbol}");
             let prior = quote_state.get(&key);
 
-            let (price_precision, size_precision) = get_precisions(instruments, &key);
+            let Some((price_precision, size_precision)) = get_precisions(instruments, &key) else {
+                tracing::debug!("Dropping BBO before instrument precision is known: {key}");
+                return vec![];
+            };
 
+            // A zero component is an internal sentinel for a side not received
+            // yet. Incomplete state is cached but never published.
             let quote = QuoteTick {
                 symbol: symbol.clone(),
                 exchange: exchange.clone(),
-                bid_price: if bid_updated {
+                bid_price: if bid_cleared {
+                    0.0
+                } else if bid_updated {
                     bbo.bid_price
                         .or_else(|| prior.as_ref().map(|quote| quote.bid_price))
                         .unwrap_or(0.0)
                 } else {
                     prior.as_ref().map_or(0.0, |quote| quote.bid_price)
                 },
-                ask_price: if ask_updated {
+                ask_price: if ask_cleared {
+                    0.0
+                } else if ask_updated {
                     bbo.ask_price
                         .or_else(|| prior.as_ref().map(|quote| quote.ask_price))
                         .unwrap_or(0.0)
                 } else {
                     prior.as_ref().map_or(0.0, |quote| quote.ask_price)
                 },
-                bid_size: if bid_updated {
+                bid_size: if bid_cleared {
+                    0.0
+                } else if bid_updated {
                     bbo.bid_size
-                        .map(|value| value as f64)
+                        .map(f64::from)
                         .or_else(|| prior.as_ref().map(|quote| quote.bid_size))
                         .unwrap_or(0.0)
                 } else {
                     prior.as_ref().map_or(0.0, |quote| quote.bid_size)
                 },
-                ask_size: if ask_updated {
+                ask_size: if ask_cleared {
+                    0.0
+                } else if ask_updated {
                     bbo.ask_size
-                        .map(|value| value as f64)
+                        .map(f64::from)
                         .or_else(|| prior.as_ref().map(|quote| quote.ask_size))
                         .unwrap_or(0.0)
                 } else {
@@ -2568,6 +2878,19 @@ fn transform_market_data_message(
                 ts_event,
                 ts_init,
             };
+
+            if (quote.bid_price != 0.0
+                && checked_market_price(quote.bid_price, price_precision).is_none())
+                || (quote.ask_price != 0.0
+                    && checked_market_price(quote.ask_price, price_precision).is_none())
+                || (quote.bid_size != 0.0
+                    && Quantity::new_checked(quote.bid_size, size_precision).is_err())
+                || (quote.ask_size != 0.0
+                    && Quantity::new_checked(quote.ask_size, size_precision).is_err())
+            {
+                tracing::warn!("Dropping BBO with malformed numeric payload for {key}");
+                return vec![];
+            }
 
             quote_state.insert(key, quote.clone());
 
@@ -2586,11 +2909,12 @@ fn transform_market_data_message(
                 Some(p) => p,
                 None => return vec![],
             };
-            let size = trade.trade_size.unwrap_or(0);
+            let Some(size) = trade.trade_size else {
+                return vec![];
+            };
 
-            // Skip trades with no price or zero size
-
-            if size == 0 {
+            // Skip trades with no price or non-positive size.
+            if size <= 0 {
                 return vec![];
             }
 
@@ -2602,18 +2926,44 @@ fn transform_market_data_message(
                 _ => "UNKNOWN",
             };
 
-            let ts_event = rithmic_timestamp_to_nanos(trade.ssboe, trade.usecs);
+            let Some(ts_event) = rithmic_timestamp_to_nanos(trade.ssboe, trade.usecs) else {
+                return vec![];
+            };
             let ts_init = now_nanos();
             let key = format!("{exchange}:{symbol}");
-            let (price_precision, size_precision) = get_precisions(instruments, &key);
+            let Some((price_precision, size_precision)) = get_precisions(instruments, &key) else {
+                tracing::debug!("Dropping trade before instrument precision is known: {key}");
+                return vec![];
+            };
+            let Some(price) = checked_market_price(price, price_precision) else {
+                return vec![];
+            };
+            let Some(size) =
+                checked_market_quantity(u64::from(size.cast_unsigned()), size_precision)
+            else {
+                return vec![];
+            };
 
             vec![MarketDataEvent::Trade(TradeTick {
                 symbol: symbol.clone(),
                 exchange: exchange.clone(),
                 price,
-                size: size as f64,
+                size,
                 aggressor_side: aggressor_side.to_string(),
-                trade_id: trade.exchange_order_id.clone().unwrap_or_default(),
+                trade_id: trade
+                    .exchange_order_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| {
+                        trade
+                            .aggressor_exchange_order_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                    })
+                    .unwrap_or_default()
+                    .to_string(),
                 price_precision,
                 size_precision,
                 ts_event,
@@ -2632,20 +2982,32 @@ fn transform_market_data_message(
                 _ => return vec![],
             };
             let key = format!("{exchange}:{symbol}");
-            let (price_precision, size_precision) = get_precisions(instruments, &key);
-            let sequence = depth.sequence_number.unwrap_or(0);
-            let ts_event = rithmic_timestamp_to_nanos(depth.ssboe, depth.usecs);
+            let Some((price_precision, size_precision)) = get_precisions(instruments, &key) else {
+                tracing::debug!(
+                    "Dropping depth update before instrument precision is known: {key}"
+                );
+                return vec![];
+            };
+            let Some(sequence) = depth.sequence_number else {
+                return vec![];
+            };
+            let Some(ts_event) = rithmic_timestamp_to_nanos(depth.ssboe, depth.usecs) else {
+                return vec![];
+            };
             let ts_init = now_nanos();
 
             let n = depth.update_type.len();
             let mut events = Vec::with_capacity(n);
 
             for i in 0..n {
-                let action = match UpdateType::try_from(depth.update_type[i]) {
-                    Ok(UpdateType::New) => "ADD",
-                    Ok(UpdateType::Change) => "UPDATE",
-                    Ok(UpdateType::Delete) => "REMOVE",
+                let update_type = match UpdateType::try_from(depth.update_type[i]) {
+                    Ok(value) => value,
                     _ => continue,
+                };
+                let action = match update_type {
+                    UpdateType::New => "ADD",
+                    UpdateType::Change => "UPDATE",
+                    UpdateType::Delete => "REMOVE",
                 };
                 let side = match depth
                     .transaction_type
@@ -2657,15 +3019,41 @@ fn transform_market_data_message(
                     Some(TransactionType::Sell) => "SELL",
                     _ => continue,
                 };
-                let price = depth.depth_price.get(i).copied().unwrap_or(0.0);
-                let size = depth.depth_size.get(i).copied().unwrap_or(0) as f64;
-                let order_id = rithmic_depth_order_id(
-                    depth.exchange_order_id.get(i).map(String::as_str),
-                    depth.depth_order_priority.get(i).copied().unwrap_or(0),
-                );
-                // F_LAST (0x80 = 128) marks the last delta in a batch so the order
-                // book engine knows when to apply the complete update.
-                let flags: u8 = if i == n - 1 { 128 } else { 0 };
+                // Rithmic encodes depth fields as independent repeated vectors.
+                // A delete is keyed by exchange order ID/priority and can omit
+                // numeric fields; Nautilus accepts zero price/size for that action.
+                let price = match depth.depth_price.get(i).copied() {
+                    Some(value) => match checked_market_price(value, price_precision) {
+                        Some(value) => value,
+                        None => continue,
+                    },
+                    None if update_type == UpdateType::Delete => 0.0,
+                    None => continue,
+                };
+                let size = match depth.depth_size.get(i).copied() {
+                    Some(value) => {
+                        let Ok(value) = u64::try_from(value) else {
+                            continue;
+                        };
+                        let Some(value) = checked_market_quantity(value, size_precision) else {
+                            continue;
+                        };
+                        value
+                    }
+                    None if update_type == UpdateType::Delete => 0.0,
+                    None => continue,
+                };
+                let exchange_order_id = depth
+                    .exchange_order_id
+                    .get(i)
+                    .map(String::as_str)
+                    .filter(|value| !value.is_empty());
+                let priority = match depth.depth_order_priority.get(i).copied() {
+                    Some(value) => value,
+                    None if exchange_order_id.is_some() => 0,
+                    None => continue,
+                };
+                let order_id = rithmic_depth_order_id(exchange_order_id, priority);
 
                 events.push(MarketDataEvent::BookDelta(BookDelta {
                     symbol: symbol.clone(),
@@ -2676,12 +3064,15 @@ fn transform_market_data_message(
                     size,
                     order_id,
                     sequence,
-                    flags,
+                    flags: 0,
                     price_precision,
                     size_precision,
                     ts_event,
                     ts_init,
                 }));
+            }
+            if let Some(MarketDataEvent::BookDelta(last)) = events.last_mut() {
+                last.flags |= RecordFlag::F_LAST as u8;
             }
             events
         }
@@ -2725,8 +3116,16 @@ fn transform_market_data_message(
     }
 }
 
-fn rithmic_instrument_id(symbol: &str, _exchange: &str) -> InstrumentId {
-    crate::common::converters::rithmic_instrument_id(symbol)
+fn rithmic_instrument_id(symbol: &str, exchange: &str) -> Option<InstrumentId> {
+    match crate::common::converters::rithmic_instrument_id(symbol, exchange) {
+        Ok(instrument_id) => Some(instrument_id),
+        Err(e) => {
+            tracing::warn!(
+                "Dropping invalid Rithmic instrument identity {symbol:?}/{exchange:?}: {e}"
+            );
+            None
+        }
+    }
 }
 
 fn empty_depth_orders(side: OrderSide, precision: u8) -> [BookOrder; DEPTH10_LEN] {
@@ -2743,8 +3142,8 @@ fn order_book_to_depth10(
     };
 
     let key = format!("{exchange}:{symbol}");
-    let (price_precision, _) = get_precisions(instruments, &key);
-    let instrument_id = rithmic_instrument_id(symbol, exchange);
+    let (price_precision, _) = get_precisions(instruments, &key)?;
+    let instrument_id = rithmic_instrument_id(symbol, exchange)?;
 
     let mut bids = empty_depth_orders(OrderSide::Buy, price_precision);
     let mut asks = empty_depth_orders(OrderSide::Sell, price_precision);
@@ -2752,33 +3151,57 @@ fn order_book_to_depth10(
     let mut ask_counts = [0_u32; DEPTH10_LEN];
 
     for (i, price) in book.bid_price.iter().take(DEPTH10_LEN).enumerate() {
-        let size = book.bid_size.get(i).copied().unwrap_or_default();
+        let Some(size) = book.bid_size.get(i).copied() else {
+            tracing::warn!("Dropping bid depth with misaligned price/size vectors");
+            return None;
+        };
 
         if size <= 0 {
             continue;
         }
-        bids[i] = BookOrder::new(
-            OrderSide::Buy,
-            Price::new(*price, price_precision),
-            Quantity::from(size),
-            0,
-        );
-        bid_counts[i] = book.bid_orders.get(i).copied().unwrap_or(1).max(0) as u32;
+        let Some(count) = book.bid_orders.get(i).copied() else {
+            tracing::warn!("Dropping bid depth with missing order count");
+            return None;
+        };
+        let Ok(count) = u32::try_from(count) else {
+            tracing::warn!("Dropping bid depth with negative order count");
+            return None;
+        };
+        let price = Price::new_checked(*price, price_precision)
+            .map_err(|e| tracing::warn!("Dropping malformed bid depth price: {e}"))
+            .ok()?;
+        let size = Quantity::from_mantissa_exponent_checked(u64::from(size.cast_unsigned()), 0, 0)
+            .map_err(|e| tracing::warn!("Dropping malformed bid depth size: {e}"))
+            .ok()?;
+        bids[i] = BookOrder::new(OrderSide::Buy, price, size, 0);
+        bid_counts[i] = count;
     }
 
     for (i, price) in book.ask_price.iter().take(DEPTH10_LEN).enumerate() {
-        let size = book.ask_size.get(i).copied().unwrap_or_default();
+        let Some(size) = book.ask_size.get(i).copied() else {
+            tracing::warn!("Dropping ask depth with misaligned price/size vectors");
+            return None;
+        };
 
         if size <= 0 {
             continue;
         }
-        asks[i] = BookOrder::new(
-            OrderSide::Sell,
-            Price::new(*price, price_precision),
-            Quantity::from(size),
-            0,
-        );
-        ask_counts[i] = book.ask_orders.get(i).copied().unwrap_or(1).max(0) as u32;
+        let Some(count) = book.ask_orders.get(i).copied() else {
+            tracing::warn!("Dropping ask depth with missing order count");
+            return None;
+        };
+        let Ok(count) = u32::try_from(count) else {
+            tracing::warn!("Dropping ask depth with negative order count");
+            return None;
+        };
+        let price = Price::new_checked(*price, price_precision)
+            .map_err(|e| tracing::warn!("Dropping malformed ask depth price: {e}"))
+            .ok()?;
+        let size = Quantity::from_mantissa_exponent_checked(u64::from(size.cast_unsigned()), 0, 0)
+            .map_err(|e| tracing::warn!("Dropping malformed ask depth size: {e}"))
+            .ok()?;
+        asks[i] = BookOrder::new(OrderSide::Sell, price, size, 0);
+        ask_counts[i] = count;
     }
 
     let mut flags = RecordFlag::F_MBP as u8;
@@ -2815,7 +3238,7 @@ fn order_book_to_depth10(
         ask_counts,
         flags,
         0,
-        rithmic_timestamp_to_nanos(book.ssboe, book.usecs).into(),
+        rithmic_timestamp_to_nanos(book.ssboe, book.usecs)?.into(),
         now_nanos().into(),
     ))
 }
@@ -2833,16 +3256,22 @@ fn market_mode_to_status(mode: &rithmic_rs::rti::MarketMode) -> Option<Instrumen
         _ => MarketStatusAction::None,
     };
 
-    let is_trading = Some(matches!(action, MarketStatusAction::Trading));
-    let is_quoting = Some(matches!(
-        action,
-        MarketStatusAction::Trading | MarketStatusAction::PreOpen
-    ));
+    let (is_trading, is_quoting) = if action == MarketStatusAction::None {
+        (None, None)
+    } else {
+        (
+            Some(matches!(action, MarketStatusAction::Trading)),
+            Some(matches!(
+                action,
+                MarketStatusAction::Trading | MarketStatusAction::PreOpen
+            )),
+        )
+    };
 
     Some(InstrumentStatus::new(
-        rithmic_instrument_id(symbol, exchange),
+        rithmic_instrument_id(symbol, exchange)?,
         action,
-        rithmic_timestamp_to_nanos(mode.ssboe, mode.usecs).into(),
+        rithmic_timestamp_to_nanos(mode.ssboe, mode.usecs)?.into(),
         now_nanos().into(),
         mode.halt_reason.as_deref().map(Ustr::from),
         mode.trade_date.as_deref().map(Ustr::from),
@@ -2852,16 +3281,30 @@ fn market_mode_to_status(mode: &rithmic_rs::rti::MarketMode) -> Option<Instrumen
     ))
 }
 
+#[derive(Debug)]
+struct InvalidCustomNumeric;
+
+fn checked_optional_custom_numeric(
+    value: Option<f64>,
+) -> std::result::Result<Option<f64>, InvalidCustomNumeric> {
+    match value {
+        Some(value) => Price::new_checked(value, 9)
+            .map(|_| Some(value))
+            .map_err(|_| InvalidCustomNumeric),
+        None => Ok(None),
+    }
+}
+
 fn trade_statistics_to_custom(
     stats: &rithmic_rs::rti::TradeStatistics,
 ) -> Option<RithmicCustomData> {
     Some(RithmicCustomData::TradeStatistics(RithmicTradeStatistics {
-        instrument_id: rithmic_instrument_id(stats.symbol.as_deref()?, stats.exchange.as_deref()?),
-        is_snapshot: stats.is_snapshot.unwrap_or(false),
-        open_price: stats.open_price,
-        high_price: stats.high_price,
-        low_price: stats.low_price,
-        ts_event: rithmic_timestamp_to_nanos(stats.ssboe, stats.usecs).into(),
+        instrument_id: rithmic_instrument_id(stats.symbol.as_deref()?, stats.exchange.as_deref()?)?,
+        is_snapshot: stats.is_snapshot?,
+        open_price: checked_optional_custom_numeric(stats.open_price).ok()?,
+        high_price: checked_optional_custom_numeric(stats.high_price).ok()?,
+        low_price: checked_optional_custom_numeric(stats.low_price).ok()?,
+        ts_event: rithmic_timestamp_to_nanos(stats.ssboe, stats.usecs)?.into(),
         ts_init: now_nanos().into(),
     }))
 }
@@ -2870,11 +3313,11 @@ fn quote_statistics_to_custom(
     stats: &rithmic_rs::rti::QuoteStatistics,
 ) -> Option<RithmicCustomData> {
     Some(RithmicCustomData::QuoteStatistics(RithmicQuoteStatistics {
-        instrument_id: rithmic_instrument_id(stats.symbol.as_deref()?, stats.exchange.as_deref()?),
-        is_snapshot: stats.is_snapshot.unwrap_or(false),
-        highest_bid_price: stats.highest_bid_price,
-        lowest_ask_price: stats.lowest_ask_price,
-        ts_event: rithmic_timestamp_to_nanos(stats.ssboe, stats.usecs).into(),
+        instrument_id: rithmic_instrument_id(stats.symbol.as_deref()?, stats.exchange.as_deref()?)?,
+        is_snapshot: stats.is_snapshot?,
+        highest_bid_price: checked_optional_custom_numeric(stats.highest_bid_price).ok()?,
+        lowest_ask_price: checked_optional_custom_numeric(stats.lowest_ask_price).ok()?,
+        ts_event: rithmic_timestamp_to_nanos(stats.ssboe, stats.usecs)?.into(),
         ts_init: now_nanos().into(),
     }))
 }
@@ -2886,11 +3329,11 @@ fn indicator_prices_to_custom(
         instrument_id: rithmic_instrument_id(
             prices.symbol.as_deref()?,
             prices.exchange.as_deref()?,
-        ),
-        is_snapshot: prices.is_snapshot.unwrap_or(false),
-        opening_indicator: prices.opening_indicator,
-        closing_indicator: prices.closing_indicator,
-        ts_event: rithmic_timestamp_to_nanos(prices.ssboe, prices.usecs).into(),
+        )?,
+        is_snapshot: prices.is_snapshot?,
+        opening_indicator: checked_optional_custom_numeric(prices.opening_indicator).ok()?,
+        closing_indicator: checked_optional_custom_numeric(prices.closing_indicator).ok()?,
+        ts_event: rithmic_timestamp_to_nanos(prices.ssboe, prices.usecs)?.into(),
         ts_init: now_nanos().into(),
     }))
 }
@@ -2902,11 +3345,11 @@ fn open_interest_to_custom(
         instrument_id: rithmic_instrument_id(
             open_interest.symbol.as_deref()?,
             open_interest.exchange.as_deref()?,
-        ),
-        is_snapshot: open_interest.is_snapshot.unwrap_or(false),
-        should_clear: open_interest.should_clear.unwrap_or(false),
+        )?,
+        is_snapshot: open_interest.is_snapshot?,
+        should_clear: open_interest.should_clear?,
         open_interest: open_interest.open_interest,
-        ts_event: rithmic_timestamp_to_nanos(open_interest.ssboe, open_interest.usecs).into(),
+        ts_event: rithmic_timestamp_to_nanos(open_interest.ssboe, open_interest.usecs)?.into(),
         ts_init: now_nanos().into(),
     }))
 }
@@ -2918,16 +3361,19 @@ fn end_of_day_prices_to_custom(
         instrument_id: rithmic_instrument_id(
             prices.symbol.as_deref()?,
             prices.exchange.as_deref()?,
-        ),
-        is_snapshot: prices.is_snapshot.unwrap_or(false),
-        close_price: prices.close_price,
+        )?,
+        is_snapshot: prices.is_snapshot?,
+        close_price: checked_optional_custom_numeric(prices.close_price).ok()?,
         close_date: prices.close_date.clone(),
-        adjusted_close_price: prices.adjusted_close_price,
-        settlement_price: prices.settlement_price,
+        adjusted_close_price: checked_optional_custom_numeric(prices.adjusted_close_price).ok()?,
+        settlement_price: checked_optional_custom_numeric(prices.settlement_price).ok()?,
         settlement_date: prices.settlement_date.clone(),
         settlement_price_type: prices.settlement_price_type.clone(),
-        projected_settlement_price: prices.projected_settlement_price,
-        ts_event: rithmic_timestamp_to_nanos(prices.ssboe, prices.usecs).into(),
+        projected_settlement_price: checked_optional_custom_numeric(
+            prices.projected_settlement_price,
+        )
+        .ok()?,
+        ts_event: rithmic_timestamp_to_nanos(prices.ssboe, prices.usecs)?.into(),
         ts_init: now_nanos().into(),
     }))
 }
@@ -2940,11 +3386,11 @@ fn order_price_limits_to_custom(
             instrument_id: rithmic_instrument_id(
                 limits.symbol.as_deref()?,
                 limits.exchange.as_deref()?,
-            ),
-            is_snapshot: limits.is_snapshot.unwrap_or(false),
-            high_price_limit: limits.high_price_limit,
-            low_price_limit: limits.low_price_limit,
-            ts_event: rithmic_timestamp_to_nanos(limits.ssboe, limits.usecs).into(),
+            )?,
+            is_snapshot: limits.is_snapshot?,
+            high_price_limit: checked_optional_custom_numeric(limits.high_price_limit).ok()?,
+            low_price_limit: checked_optional_custom_numeric(limits.low_price_limit).ok()?,
+            ts_event: rithmic_timestamp_to_nanos(limits.ssboe, limits.usecs)?.into(),
             ts_init: now_nanos().into(),
         },
     ))
@@ -2953,16 +3399,19 @@ fn order_price_limits_to_custom(
 fn symbol_margin_rate_to_custom(
     rate: &rithmic_rs::rti::SymbolMarginRate,
 ) -> Option<RithmicCustomData> {
+    // SymbolMarginRate carries no venue timestamp; use one receipt timestamp
+    // consistently for both event and initialization time.
+    let received_at = now_nanos();
     Some(RithmicCustomData::SymbolMarginRate(
         RithmicSymbolMarginRate {
             instrument_id: rithmic_instrument_id(
                 rate.symbol.as_deref()?,
                 rate.exchange.as_deref()?,
-            ),
-            is_snapshot: rate.is_snapshot.unwrap_or(false),
-            margin_rate: rate.margin_rate,
-            ts_event: now_nanos().into(),
-            ts_init: now_nanos().into(),
+            )?,
+            is_snapshot: rate.is_snapshot?,
+            margin_rate: checked_optional_custom_numeric(rate.margin_rate).ok()?,
+            ts_event: received_at.into(),
+            ts_init: received_at.into(),
         },
     ))
 }
@@ -3004,16 +3453,23 @@ fn depth_snapshot_rows_to_events(
         return events;
     }
 
-    let first = snapshot_rows[0];
+    let Some(first) = snapshot_rows.first() else {
+        return events;
+    };
     let (symbol, exchange) = match (first.symbol.as_ref(), first.exchange.as_ref()) {
         (Some(symbol), Some(exchange)) => (symbol.clone(), exchange.clone()),
         _ => return events,
     };
-    let sequence = first.sequence_number.unwrap_or(0);
+    let Some(sequence) = first.sequence_number else {
+        return events;
+    };
     let ts_event = now_nanos();
     let ts_init = now_nanos();
     let key = format!("{exchange}:{symbol}");
-    let (price_precision, size_precision) = get_precisions(instruments, &key);
+    let Some((price_precision, size_precision)) = get_precisions(instruments, &key) else {
+        tracing::debug!("Dropping depth snapshot before instrument precision is known: {key}");
+        return events;
+    };
 
     events.push(MarketDataEvent::BookDelta(crate::data::BookDelta {
         symbol: symbol.clone(),
@@ -3031,7 +3487,13 @@ fn depth_snapshot_rows_to_events(
         ts_init,
     }));
 
-    for (snapshot_index, snapshot) in snapshot_rows.iter().enumerate() {
+    for snapshot in snapshot_rows {
+        if snapshot.symbol.as_deref() != Some(symbol.as_str())
+            || snapshot.exchange.as_deref() != Some(exchange.as_str())
+        {
+            tracing::warn!("Ignoring mismatched instrument row in Rithmic depth snapshot");
+            continue;
+        }
         let side = match snapshot
             .depth_side
             .and_then(|value| TransactionType::try_from(value).ok())
@@ -3040,16 +3502,25 @@ fn depth_snapshot_rows_to_events(
             Some(TransactionType::Sell) => "SELL",
             None => continue,
         };
-        let price = snapshot.depth_price.unwrap_or(0.0);
-        let sequence = snapshot.sequence_number.unwrap_or(0);
+        let Some(price) = snapshot
+            .depth_price
+            .and_then(|value| checked_market_price(value, price_precision))
+        else {
+            continue;
+        };
+        let Some(sequence) = snapshot.sequence_number else {
+            continue;
+        };
 
         for (i, depth_order_priority) in snapshot.depth_order_priority.iter().enumerate() {
-            let flags = if snapshot_index == snapshot_rows.len() - 1
-                && i == snapshot.depth_order_priority.len().saturating_sub(1)
-            {
-                RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8
-            } else {
-                RecordFlag::F_SNAPSHOT as u8
+            let Some(size) = snapshot.depth_size.get(i).copied() else {
+                continue;
+            };
+            let Ok(size) = u64::try_from(size) else {
+                continue;
+            };
+            let Some(size) = checked_market_quantity(size, size_precision) else {
+                continue;
             };
             let order_id = rithmic_depth_order_id(
                 snapshot.exchange_order_id.get(i).map(String::as_str),
@@ -3061,10 +3532,10 @@ fn depth_snapshot_rows_to_events(
                 action: "ADD".to_string(),
                 side: side.to_string(),
                 price,
-                size: snapshot.depth_size.get(i).copied().unwrap_or_default() as f64,
+                size,
                 order_id,
                 sequence,
-                flags,
+                flags: RecordFlag::F_SNAPSHOT as u8,
                 price_precision,
                 size_precision,
                 ts_event,
@@ -3073,8 +3544,8 @@ fn depth_snapshot_rows_to_events(
         }
     }
 
-    if let [MarketDataEvent::BookDelta(delta)] = events.as_mut_slice() {
-        delta.flags = RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8;
+    if let Some(MarketDataEvent::BookDelta(delta)) = events.last_mut() {
+        delta.flags |= RecordFlag::F_LAST as u8;
     }
 
     events
@@ -3096,12 +3567,13 @@ fn transform_pnl_message(message: &RithmicMessage) -> Option<PnlEvent> {
             let account_id = update.account_id.clone()?;
 
             // Parse string fields to f64 (Rithmic sends numeric values as strings)
-            let total = parse_optional_f64(&update.account_balance).unwrap_or(0.0);
-            let available = parse_optional_f64(&update.cash_on_hand).unwrap_or(0.0);
-            let locked = parse_optional_f64(&update.margin_balance).unwrap_or(0.0);
-            let unrealized_pnl = parse_optional_f64(&update.open_position_pnl).unwrap_or(0.0);
-            let realized_pnl = parse_optional_f64(&update.closed_position_pnl).unwrap_or(0.0);
-            let ts_event = rithmic_timestamp_to_nanos(update.ssboe, update.usecs);
+            let total = parse_optional_f64(&update.account_balance)?;
+            let available = parse_optional_f64(&update.cash_on_hand)?;
+            let locked = parse_optional_f64(&update.margin_balance)?;
+            let unrealized_pnl = parse_optional_f64(&update.open_position_pnl)?;
+            let realized_pnl = parse_optional_f64(&update.closed_position_pnl)?;
+            let is_snapshot = update.is_snapshot?;
+            let ts_event = rithmic_timestamp_to_nanos(update.ssboe, update.usecs)?;
 
             tracing::debug!(
                 "AccountPnLPositionUpdate: account={}, balance={}, available={}, margin={}",
@@ -3113,9 +3585,9 @@ fn transform_pnl_message(message: &RithmicMessage) -> Option<PnlEvent> {
 
             Some(PnlEvent::Account(AccountEvent::BalanceUpdate(
                 AccountBalance {
-                    is_snapshot: update.is_snapshot.unwrap_or(false),
+                    is_snapshot,
                     account_id,
-                    currency: "USD".to_string(), // Futures typically USD
+                    currency: SUPPORTED_ACCOUNT_CURRENCY.to_string(),
                     total,
                     available,
                     locked,
@@ -3131,21 +3603,27 @@ fn transform_pnl_message(message: &RithmicMessage) -> Option<PnlEvent> {
             let exchange = update.exchange.clone()?;
 
             // Net position is buy_qty - sell_qty
-            let quantity = update.buy_qty.unwrap_or(0) as f64 - update.sell_qty.unwrap_or(0) as f64;
-            let avg_price = update.avg_open_fill_price.unwrap_or(0.0);
+            let quantity = f64::from(update.buy_qty?) - f64::from(update.sell_qty?);
+            let avg_price = match update.avg_open_fill_price {
+                Some(value) if value.is_finite() => value,
+                None if quantity == 0.0 => 0.0,
+                _ => return None,
+            };
 
             // InstrumentPnLPositionUpdate has f64 for day_open_pnl/day_closed_pnl
             // but string for open_position_pnl/closed_position_pnl
             let unrealized_pnl = update
                 .day_open_pnl
-                .or_else(|| parse_optional_f64(&update.open_position_pnl))
-                .unwrap_or(0.0);
+                .filter(|value| value.is_finite())
+                .or_else(|| parse_optional_f64(&update.open_position_pnl))?;
             let realized_pnl = update
                 .day_closed_pnl
-                .or_else(|| parse_optional_f64(&update.closed_position_pnl))
-                .unwrap_or(0.0);
+                .filter(|value| value.is_finite())
+                .or_else(|| parse_optional_f64(&update.closed_position_pnl))?;
 
-            let ts_event = rithmic_timestamp_to_nanos(update.ssboe, update.usecs);
+            let is_snapshot = update.is_snapshot?;
+
+            let ts_event = rithmic_timestamp_to_nanos(update.ssboe, update.usecs)?;
 
             tracing::debug!(
                 "InstrumentPnLPositionUpdate: {}:{} qty={}, avg_price={}, pnl={}",
@@ -3157,7 +3635,7 @@ fn transform_pnl_message(message: &RithmicMessage) -> Option<PnlEvent> {
             );
 
             Some(PnlEvent::Position(PositionEvent::Updated(Position {
-                is_snapshot: update.is_snapshot.unwrap_or(false),
+                is_snapshot,
                 account_id,
                 symbol,
                 exchange,
@@ -3181,22 +3659,23 @@ fn transform_pnl_message(message: &RithmicMessage) -> Option<PnlEvent> {
 /// Parses an optional string field to f64.
 #[inline]
 fn parse_optional_f64(s: &Option<String>) -> Option<f64> {
-    s.as_ref().and_then(|s| s.parse().ok())
+    s.as_ref()
+        .and_then(|value| value.parse().ok())
+        .filter(|value: &f64| value.is_finite())
 }
 
 #[cfg(test)]
+#[allow(
+    unsafe_code,
+    reason = "test environment mutation is serialized by ENV_LOCK"
+)]
 mod tests {
-    use std::{
-        fs,
-        path::PathBuf,
-        sync::{LazyLock, Mutex},
-    };
+    use std::{fs, path::PathBuf};
 
     use serde::{Deserialize, de::DeserializeOwned};
 
     use super::*;
-
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    use crate::config::RITHMIC_ENV_TEST_LOCK;
 
     #[derive(Debug, Deserialize)]
     struct DepthSnapshotFixture {
@@ -3534,6 +4013,27 @@ mod tests {
             .unwrap_or_else(|e| panic!("failed parsing fixture {path:?}: {e}"))
     }
 
+    fn test_instruments() -> AHashMap<String, InstrumentInfo> {
+        ["ESM6", "ESZ4"]
+            .into_iter()
+            .map(|symbol| {
+                (
+                    format!("CME:{symbol}"),
+                    InstrumentInfo {
+                        symbol: symbol.to_string(),
+                        exchange: "CME".to_string(),
+                        tick_size: Some(0.25),
+                        point_value: Some(50.0),
+                        product_code: Some("ES".to_string()),
+                        description: Some("E-mini S&P 500".to_string()),
+                        currency: Some("USD".to_string()),
+                        is_tradeable: true,
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn set_env(key: &str, value: Option<&str>) -> Option<String> {
         let previous = std::env::var(key).ok();
 
@@ -3593,10 +4093,12 @@ mod tests {
             "user",
             "pass",
             "system",
+            "TestApp",
             "fcm",
             "ib",
             "account",
-        );
+        )
+        .unwrap();
         let gateway = RithmicGateway::new(config);
 
         assert_eq!(gateway.connection_state(), ConnectionState::Disconnected);
@@ -3612,10 +4114,12 @@ mod tests {
             "user",
             "pass",
             "system",
+            "TestApp",
             "fcm",
             "ib",
             "account",
         )
+        .unwrap()
         .with_ticker(true)
         .with_order(false)
         .with_pnl(true)
@@ -3625,8 +4129,102 @@ mod tests {
         assert!(!config.enable_order);
         assert!(config.enable_pnl);
         assert!(!config.enable_history);
-        assert_eq!(config.app_name, "");
+        assert_eq!(config.app_name, "TestApp");
         assert_eq!(config.app_version, DEFAULT_APP_VERSION);
+    }
+
+    #[rstest::rstest]
+    fn test_gateway_config_debug_redacts_password() {
+        let config = GatewayConfig::new(
+            RithmicEnv::Demo,
+            "user",
+            "super-secret",
+            "system",
+            "TestApp",
+            "fcm",
+            "ib",
+            "account",
+        )
+        .unwrap();
+        let output = format!("{config:?}");
+
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("super-secret"));
+    }
+
+    #[tokio::test]
+    async fn connect_config_failure_rolls_back_connecting_state() {
+        let mut config = GatewayConfig::new(
+            RithmicEnv::Demo,
+            "user",
+            "pass",
+            "system",
+            "TestApp",
+            "fcm",
+            "ib",
+            "account",
+        )
+        .unwrap();
+        config.app_name.clear();
+        let mut gateway = RithmicGateway::new(config);
+
+        assert!(gateway.connect().await.is_err());
+        assert_eq!(gateway.connection_state(), ConnectionState::Disconnected);
+        assert!(!gateway.has_connection_resources());
+    }
+
+    #[tokio::test]
+    async fn order_book_bootstrap_timeout_requires_recovery() {
+        let bootstraps = Arc::new(RwLock::new(AHashMap::from_iter([(
+            "CME:ESM6".to_string(),
+            PendingOrderBookBootstrap {
+                live_deltas: Vec::new(),
+                started_at: Instant::now()
+                    .checked_sub(ORDER_BOOK_BOOTSTRAP_TIMEOUT)
+                    .expect("test timeout must fit within monotonic clock range"),
+            },
+        )])));
+
+        let result = buffer_live_order_book_events(&bootstraps, "CME:ESM6", Vec::new()).await;
+
+        assert!(matches!(result, OrderBookBufferResult::RecoveryRequired));
+        assert!(bootstraps.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn order_book_bootstrap_delta_limit_requires_recovery() {
+        let delta = crate::data::BookDelta {
+            symbol: "ESM6".to_string(),
+            exchange: "CME".to_string(),
+            action: "ADD".to_string(),
+            side: "BUY".to_string(),
+            price: 4_500.0,
+            size: 1.0,
+            order_id: 1,
+            sequence: 1,
+            flags: 0,
+            price_precision: 2,
+            size_precision: 0,
+            ts_event: 1,
+            ts_init: 1,
+        };
+        let bootstraps = Arc::new(RwLock::new(AHashMap::from_iter([(
+            "CME:ESM6".to_string(),
+            PendingOrderBookBootstrap {
+                live_deltas: vec![delta.clone(); ORDER_BOOK_BOOTSTRAP_MAX_DELTAS],
+                started_at: Instant::now(),
+            },
+        )])));
+
+        let result = buffer_live_order_book_events(
+            &bootstraps,
+            "CME:ESM6",
+            vec![MarketDataEvent::BookDelta(delta)],
+        )
+        .await;
+
+        assert!(matches!(result, OrderBookBufferResult::RecoveryRequired));
+        assert!(bootstraps.read().await.is_empty());
     }
 
     #[rstest::rstest]
@@ -3636,11 +4234,12 @@ mod tests {
             "user",
             "pass",
             "system",
+            "OwnApp",
             "fcm",
             "ib",
             "account",
         )
-        .with_app_name("OwnApp")
+        .unwrap()
         .with_url_override("ws://127.0.0.1:12345")
         .with_beta_url_override("ws://127.0.0.1:12346");
 
@@ -3653,7 +4252,7 @@ mod tests {
 
     #[rstest::rstest]
     fn test_gateway_config_to_rithmic_config_defaults_primary_server() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = RITHMIC_ENV_TEST_LOCK.lock().unwrap();
         let previous = [
             ("RITHMIC_DEMO_URL", set_env("RITHMIC_DEMO_URL", None)),
             (
@@ -3667,11 +4266,12 @@ mod tests {
             "user",
             "pass",
             "system",
+            "OwnApp",
             "fcm",
             "ib",
             "account",
         )
-        .with_app_name("OwnApp");
+        .unwrap();
 
         let rithmic = config.to_rithmic_config().unwrap();
 
@@ -3688,11 +4288,12 @@ mod tests {
             "user",
             "pass",
             "system",
+            "OwnApp",
             "fcm",
             "ib",
             "account",
         )
-        .with_app_name("OwnApp")
+        .unwrap()
         .with_server("Chicago")
         .with_alt_server("Sydney");
 
@@ -3704,7 +4305,7 @@ mod tests {
 
     #[rstest::rstest]
     fn test_gateway_config_from_env_uses_canonical_vars() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = RITHMIC_ENV_TEST_LOCK.lock().unwrap();
         let previous = [
             ("RITHMIC_ENV", set_env("RITHMIC_ENV", Some("demo"))),
             (
@@ -3759,7 +4360,7 @@ mod tests {
 
     #[rstest::rstest]
     fn test_gateway_config_from_env_requires_canonical_username() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = RITHMIC_ENV_TEST_LOCK.lock().unwrap();
         let previous = [
             ("RITHMIC_ENV", set_env("RITHMIC_ENV", Some("demo"))),
             ("RITHMIC_USERNAME", set_env("RITHMIC_USERNAME", None)),
@@ -3787,31 +4388,49 @@ mod tests {
             ),
         ];
 
-        let error = GatewayConfig::from_env().unwrap_err();
-        assert!(error.to_string().contains("RITHMIC_USERNAME not set"));
+        let e = GatewayConfig::from_env().unwrap_err();
+        assert!(e.to_string().contains("RITHMIC_USERNAME not set"));
 
         restore_env(&previous);
     }
 
     #[rstest::rstest]
     fn test_gateway_config_to_rithmic_config_requires_app_name() {
-        let config = GatewayConfig::new(
+        let e = GatewayConfig::new(
             RithmicEnv::Demo,
             "user",
             "pass",
             "system",
+            "",
             "fcm",
             "ib",
             "account",
-        );
+        )
+        .unwrap_err();
 
-        let error = config.to_rithmic_config().unwrap_err();
-        assert!(error.to_string().contains("app_name cannot be empty"));
+        assert!(e.to_string().contains("app_name cannot be empty"));
+    }
+
+    #[rstest::rstest]
+    fn test_gateway_config_requires_system_name() {
+        let e = GatewayConfig::new(
+            RithmicEnv::Demo,
+            "user",
+            "pass",
+            "",
+            "TestApp",
+            "fcm",
+            "ib",
+            "account",
+        )
+        .unwrap_err();
+
+        assert!(e.to_string().contains("system_name cannot be empty"));
     }
 
     #[rstest::rstest]
     fn test_gateway_config_from_profile_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = RITHMIC_ENV_TEST_LOCK.lock().unwrap();
         let previous = [
             (
                 "RITHMIC_APEX_ENV",
@@ -3845,6 +4464,17 @@ mod tests {
                 "RITHMIC_APEX_SERVER",
                 set_env("RITHMIC_APEX_SERVER", Some("Frankfurt")),
             ),
+            (
+                "RITHMIC_APEX_LIVE_URL",
+                set_env("RITHMIC_APEX_LIVE_URL", Some("wss://primary.example.test")),
+            ),
+            (
+                "RITHMIC_APEX_LIVE_ALT_URL",
+                set_env(
+                    "RITHMIC_APEX_LIVE_ALT_URL",
+                    Some("wss://alternate.example.test"),
+                ),
+            ),
         ];
 
         let config = GatewayConfig::from_env_with_profile(Some("Apex")).unwrap();
@@ -3857,6 +4487,14 @@ mod tests {
         assert_eq!(config.account_id, "account");
         assert_eq!(config.fcm_id, "fcm");
         assert_eq!(config.server.as_deref(), Some("Frankfurt"));
+        assert_eq!(
+            config.url_override.as_deref(),
+            Some("wss://primary.example.test")
+        );
+        assert_eq!(
+            config.beta_url_override.as_deref(),
+            Some("wss://alternate.example.test")
+        );
 
         restore_env(&previous);
     }
@@ -3868,10 +4506,12 @@ mod tests {
             "user",
             "pass",
             "system",
+            "TestApp",
             "fcm",
             "ib",
             "account",
-        );
+        )
+        .unwrap();
         let gateway = RithmicGateway::new(config);
 
         assert_eq!(gateway.connection_state(), ConnectionState::Disconnected);
@@ -3884,10 +4524,12 @@ mod tests {
             "user",
             "pass",
             "system",
+            "TestApp",
             "fcm",
             "ib",
             "account",
-        );
+        )
+        .unwrap();
         let gateway = RithmicGateway::new(config);
         let instruments = gateway.instruments().blocking_read();
         assert!(instruments.is_empty());
@@ -3900,10 +4542,12 @@ mod tests {
             "user",
             "pass",
             "system",
+            "TestApp",
             "fcm",
             "ib",
             "account",
-        );
+        )
+        .unwrap();
         let gateway = RithmicGateway::new(config);
 
         let _market_rx_a = gateway.subscribe_market_data_events();
@@ -3919,22 +4563,25 @@ mod tests {
         // Test with both ssboe and usecs
         let nanos = rithmic_timestamp_to_nanos(Some(1704067200), Some(123456));
         // 1704067200 * 1e9 + 123456 * 1e3 = 1704067200000000000 + 123456000
-        assert_eq!(nanos, 1704067200123456000);
+        assert_eq!(nanos, Some(1704067200123456000));
 
         // Test with only ssboe
         let nanos = rithmic_timestamp_to_nanos(Some(1704067200), None);
-        assert_eq!(nanos, 1704067200000000000);
+        assert_eq!(nanos, Some(1704067200000000000));
 
         // Test with None values
         let nanos = rithmic_timestamp_to_nanos(None, None);
-        assert_eq!(nanos, 0);
+        assert_eq!(nanos, None);
+
+        assert_eq!(rithmic_timestamp_to_nanos(Some(-1), Some(0)), None);
+        assert_eq!(rithmic_timestamp_to_nanos(Some(1), Some(1_000_000)), None);
     }
 
     #[rstest::rstest]
     fn test_transform_bbo_to_quote() {
         use rithmic_rs::rti::BestBidOffer;
 
-        let instruments = AHashMap::new();
+        let instruments = test_instruments();
         let mut quote_state = AHashMap::new();
         let bbo = BestBidOffer {
             template_id: 150,
@@ -3979,10 +4626,38 @@ mod tests {
     }
 
     #[rstest::rstest]
+    fn test_transform_bbo_waits_for_instrument_precision() {
+        use rithmic_rs::rti::BestBidOffer;
+
+        let instruments = AHashMap::new();
+        let mut quote_state = AHashMap::new();
+        let bbo = BestBidOffer {
+            symbol: Some("ESM6".to_string()),
+            exchange: Some("CME".to_string()),
+            bid_price: Some(4500.25),
+            bid_size: Some(1),
+            ask_price: Some(4500.50),
+            ask_size: Some(2),
+            ssboe: Some(1_700_000_000),
+            usecs: Some(0),
+            ..Default::default()
+        };
+
+        let event = transform_market_data_for_test(
+            RithmicMessage::BestBidOffer(bbo),
+            &instruments,
+            &mut quote_state,
+        );
+
+        assert!(event.is_none());
+        assert!(quote_state.is_empty());
+    }
+
+    #[rstest::rstest]
     fn test_transform_bbo_preserves_last_seen_opposite_side() {
         use rithmic_rs::rti::{BestBidOffer, best_bid_offer::PresenceBits};
 
-        let instruments = AHashMap::new();
+        let instruments = test_instruments();
         let mut quote_state = AHashMap::new();
 
         let initial = RithmicMessage::BestBidOffer(BestBidOffer {
@@ -4047,7 +4722,7 @@ mod tests {
     fn test_transform_bbo_preserves_last_seen_ask_when_bid_only_update_zeroes_ask_fields() {
         use rithmic_rs::rti::{BestBidOffer, best_bid_offer::PresenceBits};
 
-        let instruments = AHashMap::new();
+        let instruments = test_instruments();
         let mut quote_state = AHashMap::new();
 
         let initial = RithmicMessage::BestBidOffer(BestBidOffer {
@@ -4112,7 +4787,7 @@ mod tests {
     fn test_transform_bbo_waits_until_both_sides_seen_before_emitting_quote() {
         use rithmic_rs::rti::{BestBidOffer, best_bid_offer::PresenceBits};
 
-        let instruments = AHashMap::new();
+        let instruments = test_instruments();
         let mut quote_state = AHashMap::new();
 
         let ask_only = RithmicMessage::BestBidOffer(BestBidOffer {
@@ -4176,10 +4851,100 @@ mod tests {
     }
 
     #[rstest::rstest]
+    fn test_transform_bbo_clear_resets_side_until_repopulated() {
+        use rithmic_rs::rti::{BestBidOffer, best_bid_offer::PresenceBits};
+
+        let instruments = test_instruments();
+        let mut quote_state = AHashMap::new();
+        let initial = BestBidOffer {
+            symbol: Some("ESM6".to_string()),
+            exchange: Some("CME".to_string()),
+            presence_bits: Some((PresenceBits::Bid as u32) | (PresenceBits::Ask as u32)),
+            bid_price: Some(4500.25),
+            bid_size: Some(3),
+            ask_price: Some(4500.50),
+            ask_size: Some(4),
+            ssboe: Some(1_700_000_000),
+            usecs: Some(0),
+            ..Default::default()
+        };
+        let clear_bid = BestBidOffer {
+            symbol: Some("ESM6".to_string()),
+            exchange: Some("CME".to_string()),
+            clear_bits: Some(PresenceBits::Bid as u32),
+            ssboe: Some(1_700_000_001),
+            usecs: Some(0),
+            ..Default::default()
+        };
+        let ask_only = BestBidOffer {
+            symbol: Some("ESM6".to_string()),
+            exchange: Some("CME".to_string()),
+            presence_bits: Some(PresenceBits::Ask as u32),
+            ask_price: Some(4500.75),
+            ask_size: Some(2),
+            ssboe: Some(1_700_000_002),
+            usecs: Some(0),
+            ..Default::default()
+        };
+        let bid_only = BestBidOffer {
+            symbol: Some("ESM6".to_string()),
+            exchange: Some("CME".to_string()),
+            presence_bits: Some(PresenceBits::Bid as u32),
+            bid_price: Some(4500.50),
+            bid_size: Some(1),
+            ssboe: Some(1_700_000_003),
+            usecs: Some(0),
+            ..Default::default()
+        };
+
+        assert!(
+            transform_market_data_for_test(
+                RithmicMessage::BestBidOffer(initial),
+                &instruments,
+                &mut quote_state,
+            )
+            .is_some()
+        );
+        assert!(
+            transform_market_data_for_test(
+                RithmicMessage::BestBidOffer(clear_bid),
+                &instruments,
+                &mut quote_state,
+            )
+            .is_none()
+        );
+        let cached = quote_state
+            .get("CME:ESM6")
+            .expect("quote state should remain");
+        assert_eq!(cached.bid_price, 0.0);
+        assert_eq!(cached.bid_size, 0.0);
+        assert_eq!(cached.ask_price, 4500.50);
+        assert!(
+            transform_market_data_for_test(
+                RithmicMessage::BestBidOffer(ask_only),
+                &instruments,
+                &mut quote_state,
+            )
+            .is_none()
+        );
+
+        let event = transform_market_data_for_test(
+            RithmicMessage::BestBidOffer(bid_only),
+            &instruments,
+            &mut quote_state,
+        );
+        let Some(MarketDataEvent::Quote(quote)) = event else {
+            panic!("expected repopulated quote")
+        };
+        assert_eq!(quote.bid_price, 4500.50);
+        assert_eq!(quote.ask_price, 4500.75);
+    }
+
+    #[rstest::rstest]
     fn test_transform_last_trade_to_trade() {
         use rithmic_rs::rti::LastTrade;
 
-        let instruments = AHashMap::new();
+        let instruments = test_instruments();
         let mut quote_state = AHashMap::new();
         let trade = LastTrade {
             template_id: 151,
@@ -4231,7 +4996,7 @@ mod tests {
     fn test_transform_bbo_missing_symbol_returns_none() {
         use rithmic_rs::rti::BestBidOffer;
 
-        let instruments = AHashMap::new();
+        let instruments = test_instruments();
         let mut quote_state = AHashMap::new();
         let bbo = BestBidOffer {
             template_id: 150,
@@ -4267,7 +5032,7 @@ mod tests {
     fn test_transform_bbo_no_prices_returns_none() {
         use rithmic_rs::rti::BestBidOffer;
 
-        let instruments = AHashMap::new();
+        let instruments = test_instruments();
         let mut quote_state = AHashMap::new();
         let bbo = BestBidOffer {
             template_id: 150,
@@ -4303,7 +5068,7 @@ mod tests {
     fn test_transform_trade_zero_size_returns_none() {
         use rithmic_rs::rti::LastTrade;
 
-        let instruments = AHashMap::new();
+        let instruments = test_instruments();
         let mut quote_state = AHashMap::new();
         let trade = LastTrade {
             template_id: 151,
@@ -4343,7 +5108,7 @@ mod tests {
     fn test_transform_trade_sell_aggressor() {
         use rithmic_rs::rti::LastTrade;
 
-        let instruments = AHashMap::new();
+        let instruments = test_instruments();
         let mut quote_state = AHashMap::new();
         let trade = LastTrade {
             template_id: 151,
@@ -4355,21 +5120,24 @@ mod tests {
             trade_price: Some(5000.25),
             trade_size: Some(5),
             aggressor: Some(2), // Sell
-            exchange_order_id: None,
-            aggressor_exchange_order_id: None,
+            exchange_order_id: Some("passive-order-id".to_string()),
+            aggressor_exchange_order_id: Some("aggressor-order-id".to_string()),
             net_change: None,
             percent_change: None,
             volume: None,
             vwap: None,
             trade_time: None,
-            ssboe: None,
-            usecs: None,
+            ssboe: Some(1_700_000_000),
+            usecs: Some(0),
             source_ssboe: None,
             source_usecs: None,
             source_nsecs: None,
             jop_ssboe: None,
             jop_nsecs: None,
         };
+
+        let mut aggressor_only = trade.clone();
+        aggressor_only.exchange_order_id = None;
 
         let event = transform_market_data_for_test(
             RithmicMessage::LastTrade(trade),
@@ -4380,16 +5148,27 @@ mod tests {
 
         if let Some(MarketDataEvent::Trade(trade)) = event {
             assert_eq!(trade.aggressor_side, "SELL");
+            assert_eq!(trade.trade_id, "passive-order-id");
         } else {
             panic!("Expected Trade event");
         }
+
+        let event = transform_market_data_for_test(
+            RithmicMessage::LastTrade(aggressor_only),
+            &instruments,
+            &mut quote_state,
+        );
+        let Some(MarketDataEvent::Trade(trade)) = event else {
+            panic!("Expected Trade event");
+        };
+        assert_eq!(trade.trade_id, "aggressor-order-id");
     }
 
     #[rstest::rstest]
     fn test_transform_order_book_to_depth10() {
         use rithmic_rs::rti::OrderBook;
 
-        let instruments = AHashMap::new();
+        let instruments = test_instruments();
         let mut quote_state = AHashMap::new();
         let book = OrderBook {
             template_id: 152,
@@ -4419,13 +5198,71 @@ mod tests {
         let MarketDataEvent::Depth10(depth) = event else {
             panic!("expected depth10 event");
         };
-        assert_eq!(depth.instrument_id, InstrumentId::from("ESM6.RITHMIC"));
+        assert_eq!(depth.instrument_id, InstrumentId::from("ESM6.CME.RITHMIC"));
         assert_eq!(depth.bids[0].price.as_f64(), 4500.25);
         assert_eq!(depth.asks[0].price.as_f64(), 4500.50);
         assert_eq!(depth.bid_counts[0], 2);
         assert_eq!(depth.ask_counts[0], 3);
         assert!(depth.flags & RecordFlag::F_MBP as u8 != 0);
         assert!(depth.flags & RecordFlag::F_SNAPSHOT as u8 != 0);
+    }
+
+    #[rstest::rstest]
+    fn test_transform_order_book_drops_non_finite_price() {
+        use rithmic_rs::rti::OrderBook;
+
+        let instruments = test_instruments();
+        let mut quote_state = AHashMap::new();
+        let book = OrderBook {
+            template_id: 152,
+            symbol: Some("ESM6".to_string()),
+            exchange: Some("CME".to_string()),
+            presence_bits: None,
+            update_type: Some(rithmic_rs::rti::order_book::UpdateType::SnapshotImage as i32),
+            bid_price: vec![f64::NAN],
+            bid_size: vec![10],
+            bid_orders: vec![1],
+            impl_bid_size: vec![],
+            ask_price: vec![4500.50],
+            ask_size: vec![12],
+            ask_orders: vec![1],
+            impl_ask_size: vec![],
+            ssboe: Some(1_700_000_000),
+            usecs: Some(123_456),
+        };
+
+        let event = transform_market_data_for_test(
+            RithmicMessage::OrderBook(book),
+            &instruments,
+            &mut quote_state,
+        );
+        assert!(event.is_none());
+    }
+
+    #[rstest::rstest]
+    fn test_transform_order_book_drops_misaligned_order_counts() {
+        use rithmic_rs::rti::OrderBook;
+
+        let instruments = test_instruments();
+        let mut quote_state = AHashMap::new();
+        let book = OrderBook {
+            symbol: Some("ESM6".to_string()),
+            exchange: Some("CME".to_string()),
+            update_type: Some(rithmic_rs::rti::order_book::UpdateType::SnapshotImage as i32),
+            bid_price: vec![4500.25],
+            bid_size: vec![10],
+            bid_orders: vec![],
+            ssboe: Some(1_700_000_000),
+            usecs: Some(0),
+            ..Default::default()
+        };
+
+        let event = transform_market_data_for_test(
+            RithmicMessage::OrderBook(book),
+            &instruments,
+            &mut quote_state,
+        );
+        assert!(event.is_none());
     }
 
     #[rstest::rstest]
@@ -4455,11 +5292,30 @@ mod tests {
         let MarketDataEvent::InstrumentStatus(status) = event else {
             panic!("expected instrument status event");
         };
-        assert_eq!(status.instrument_id, InstrumentId::from("ESM6.RITHMIC"));
+        assert_eq!(status.instrument_id, InstrumentId::from("ESM6.CME.RITHMIC"));
         assert_eq!(status.action, MarketStatusAction::Halt);
         assert_eq!(status.reason, Some(Ustr::from("NEWS_PENDING")));
         assert_eq!(status.trading_event, Some(Ustr::from("20260402")));
         assert_eq!(status.is_trading, Some(false));
+    }
+
+    #[rstest::rstest]
+    fn test_unknown_market_mode_does_not_assert_closed_state() {
+        use rithmic_rs::rti::MarketMode;
+
+        let status = market_mode_to_status(&MarketMode {
+            symbol: Some("ESM6".to_string()),
+            exchange: Some("CME".to_string()),
+            market_mode: Some("UNRECOGNIZED_MODE".to_string()),
+            ssboe: Some(1_700_000_000),
+            usecs: Some(0),
+            ..Default::default()
+        })
+        .expect("unknown mode should remain observable");
+
+        assert_eq!(status.action, MarketStatusAction::None);
+        assert_eq!(status.is_trading, None);
+        assert_eq!(status.is_quoting, None);
     }
 
     #[rstest::rstest]
@@ -4497,15 +5353,32 @@ mod tests {
         let MarketDataEvent::Custom(RithmicCustomData::TradeStatistics(value)) = event else {
             panic!("expected trade statistics custom event");
         };
-        assert_eq!(value.instrument_id, InstrumentId::from("ESM6.RITHMIC"));
+        assert_eq!(value.instrument_id, InstrumentId::from("ESM6.CME.RITHMIC"));
         assert!(value.is_snapshot);
         assert_eq!(value.high_price, Some(4505.0));
     }
 
     #[rstest::rstest]
+    fn test_custom_data_drops_non_finite_numeric_payload() {
+        use rithmic_rs::rti::TradeStatistics;
+
+        let malformed = TradeStatistics {
+            symbol: Some("ESM6".to_string()),
+            exchange: Some("CME".to_string()),
+            is_snapshot: Some(false),
+            open_price: Some(f64::NAN),
+            ssboe: Some(1_700_000_000),
+            usecs: Some(0),
+            ..Default::default()
+        };
+
+        assert!(trade_statistics_to_custom(&malformed).is_none());
+    }
+
+    #[rstest::rstest]
     fn test_depth_snapshot_fixture_emits_clear_then_snapshot_adds() {
         let fixture = load_fixture::<DepthSnapshotFixture>("depth_snapshot_delta.json");
-        let instruments = AHashMap::new();
+        let instruments = test_instruments();
         let snapshot_rows: Vec<rithmic_rs::rti::ResponseDepthByOrderSnapshot> = fixture
             .snapshots
             .into_iter()
@@ -4558,7 +5431,7 @@ mod tests {
     #[rstest::rstest]
     fn test_depth_delta_fixture_sets_last_flag_on_final_delta() {
         let fixture = load_fixture::<DepthSnapshotFixture>("depth_snapshot_delta.json");
-        let instruments = AHashMap::new();
+        let instruments = test_instruments();
         let mut quote_state = AHashMap::new();
 
         let events = transform_market_data_message(
@@ -4594,6 +5467,49 @@ mod tests {
             crate::common::parse::rithmic_depth_order_id(Some("ask-22"), 22)
         );
         assert_eq!(second.flags, RecordFlag::F_LAST as u8);
+    }
+
+    #[rstest::rstest]
+    fn test_depth_delete_without_numeric_fields_preserves_order_identity() {
+        use rithmic_rs::rti::{
+            DepthByOrder,
+            depth_by_order::{TransactionType, UpdateType},
+        };
+
+        let instruments = test_instruments();
+        let mut quote_state = AHashMap::new();
+        let message = DepthByOrder {
+            symbol: Some("ESM6".to_string()),
+            exchange: Some("CME".to_string()),
+            sequence_number: Some(102),
+            update_type: vec![UpdateType::Delete as i32],
+            transaction_type: vec![TransactionType::Buy as i32],
+            depth_price: vec![],
+            depth_size: vec![],
+            depth_order_priority: vec![11],
+            exchange_order_id: vec!["bid-11".to_string()],
+            ssboe: Some(1_700_000_000),
+            usecs: Some(0),
+            ..Default::default()
+        };
+
+        let events = transform_market_data_message(
+            &RithmicMessage::DepthByOrder(message),
+            &instruments,
+            &mut quote_state,
+        );
+        let [MarketDataEvent::BookDelta(delta)] = events.as_slice() else {
+            panic!("expected one delete delta")
+        };
+        assert_eq!(delta.action, "REMOVE");
+        assert_eq!(delta.side, "BUY");
+        assert_eq!(delta.price, 0.0);
+        assert_eq!(delta.size, 0.0);
+        assert_eq!(
+            delta.order_id,
+            crate::common::parse::rithmic_depth_order_id(Some("bid-11"), 11)
+        );
+        assert_eq!(delta.flags, RecordFlag::F_LAST as u8);
     }
 
     #[rstest::rstest]
@@ -4750,6 +5666,7 @@ mod tests {
 
         if let Some(PnlEvent::Account(AccountEvent::BalanceUpdate(balance))) = event {
             assert_eq!(balance.account_id, "ACCOUNT123");
+            assert_eq!(balance.currency, SUPPORTED_ACCOUNT_CURRENCY);
             assert_eq!(balance.total, 100000.0);
             assert_eq!(balance.available, 75000.0);
             assert_eq!(balance.locked, 25000.0);
@@ -4872,6 +5789,23 @@ mod tests {
     }
 
     #[rstest::rstest]
+    fn test_transform_account_pnl_missing_required_balance_is_dropped() {
+        use rithmic_rs::rti::AccountPnLPositionUpdate;
+
+        let update = AccountPnLPositionUpdate {
+            template_id: 450,
+            is_snapshot: Some(false),
+            account_id: Some("ACCOUNT123".to_string()),
+            ssboe: Some(1_704_067_200),
+            usecs: Some(0),
+            ..Default::default()
+        };
+
+        let event = transform_pnl_for_test(RithmicMessage::AccountPnLPositionUpdate(update));
+        assert!(event.is_none());
+    }
+
+    #[rstest::rstest]
     fn live_time_bar_without_marker_is_dropped() {
         let instruments = AHashMap::from_iter([(
             "CME:ESM6".to_string(),
@@ -4896,6 +5830,30 @@ mod tests {
                 period: Some("1".to_string()),
                 marker: None,
                 open_price: Some(4500.75),
+                close_price: Some(4501.25),
+                high_price: Some(4501.50),
+                low_price: Some(4500.50),
+                volume: Some(110),
+                ..Default::default()
+            }),
+            &instruments,
+        );
+
+        assert!(event.is_none());
+    }
+
+    #[rstest::rstest]
+    fn live_time_bar_missing_required_ohlcv_is_dropped() {
+        let instruments = test_instruments();
+        let event = transform_history_market_data_for_test(
+            RithmicMessage::TimeBar(rithmic_rs::rti::TimeBar {
+                template_id: 250,
+                symbol: Some("ESM6".to_string()),
+                exchange: Some("CME".to_string()),
+                r#type: Some(rithmic_rs::rti::request_time_bar_update::BarType::MinuteBar as i32),
+                period: Some("1".to_string()),
+                marker: Some(1_704_067_200),
+                open_price: None,
                 close_price: Some(4501.25),
                 high_price: Some(4501.50),
                 low_price: Some(4500.50),
@@ -4971,5 +5929,9 @@ mod tests {
 
         // Empty string
         assert_eq!(parse_optional_f64(&Some(String::new())), None);
+
+        // Non-finite protocol values
+        assert_eq!(parse_optional_f64(&Some("NaN".to_string())), None);
+        assert_eq!(parse_optional_f64(&Some("inf".to_string())), None);
     }
 }

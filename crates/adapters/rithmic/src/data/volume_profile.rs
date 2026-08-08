@@ -31,7 +31,7 @@
 //! let data_type = DataType::new(
 //!     VOLUME_PROFILE_TYPE_NAME,
 //!     None,
-//!     Some("ESM5.RITHMIC".to_string()),
+//!     Some("ESM5.CME.RITHMIC".to_string()),
 //! );
 //! actor.request_data(client_id, data_type, Some(start), Some(end), None, None);
 //! ```
@@ -53,7 +53,7 @@ pub const VOLUME_PROFILE_TYPE_NAME: &str = "RithmicMinuteVolumeProfileBar";
 ///
 /// Returned by `request_data` when the `DataType` type-name is
 /// `"RithmicMinuteVolumeProfileBar"` and the identifier is an
-/// `InstrumentId` string (e.g. `"ESM5.RITHMIC"`).
+/// `InstrumentId` string (e.g. `"ESM5.CME.RITHMIC"`).
 ///
 /// The optional `period` metadata key (integer) sets the bar period in
 /// minutes — defaults to `1` if not supplied.
@@ -67,9 +67,17 @@ pub const VOLUME_PROFILE_TYPE_NAME: &str = "RithmicMinuteVolumeProfileBar";
 ///
 /// `poc_price` is derived from these arrays at parse time as the price with
 /// the highest total (bid + ask) volume.
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.rithmic", frozen, from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.rithmic")
+)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RithmicMinuteVolumeProfileBar {
-    /// Instrument identifier (e.g. `ESM5.RITHMIC`).
+    /// Instrument identifier (e.g. `ESM5.CME.RITHMIC`).
     pub instrument_id: InstrumentId,
     /// Bar open price.
     pub open_price: f64,
@@ -115,7 +123,10 @@ impl RithmicMinuteVolumeProfileBar {
         profile_price
             .iter()
             .zip(profile_bid_volume.iter().zip(profile_ask_volume.iter()))
-            .max_by_key(|(_, (bid, ask))| *bid + *ask)
+            .max_by_key(|entry| {
+                let (_, (bid, ask)) = *entry;
+                i64::from(*bid) + i64::from(*ask)
+            })
             .map(|(price, _)| *price)
     }
 }
@@ -154,6 +165,11 @@ impl CustomDataTrait for RithmicMinuteVolumeProfileBar {
             .is_some_and(|o| self == o)
     }
 
+    #[cfg(feature = "python")]
+    fn to_pyobject(&self, py: pyo3::Python<'_>) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
+        nautilus_model::data::custom::clone_pyclass_to_pyobject(self, py)
+    }
+
     fn type_name_static() -> &'static str
     where
         Self: Sized,
@@ -183,7 +199,7 @@ mod tests {
         ask: Vec<i32>,
     ) -> RithmicMinuteVolumeProfileBar {
         RithmicMinuteVolumeProfileBar {
-            instrument_id: InstrumentId::from("ESM5.RITHMIC"),
+            instrument_id: InstrumentId::from("ESM5.CME.RITHMIC"),
             open_price: 5000.0,
             high_price: 5010.0,
             low_price: 4990.0,
@@ -215,6 +231,17 @@ mod tests {
     fn test_compute_poc_empty() {
         let poc = RithmicMinuteVolumeProfileBar::compute_poc(&[], &[], &[]);
         assert_eq!(poc, None);
+    }
+
+    #[rstest]
+    fn test_compute_poc_widens_venue_volume_before_adding() {
+        let prices = vec![5000.0, 5001.0];
+        let bid = vec![i32::MAX, i32::MAX];
+        let ask = vec![i32::MAX - 1, i32::MAX];
+
+        let poc = RithmicMinuteVolumeProfileBar::compute_poc(&prices, &bid, &ask);
+
+        assert_eq!(poc, Some(5001.0));
     }
 
     #[rstest]

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # mypy: disable-error-code="arg-type,index"
-# ruff: noqa: E402
 # -------------------------------------------------------------------------------------------------
 #  Copyright (C) 2026 Kevin Monaghan. All rights reserved.
 #
@@ -25,34 +24,37 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from examples.live.live_node_run_helpers import interrupt_live_node_run
-from examples.live.live_node_run_helpers import sleep_or_cancel
-from examples.live.live_node_run_helpers import start_live_node_monitor
-from examples.live.live_node_run_helpers import wait_for_event_or_cancel
-
-from examples.live.rithmic.rithmic_data_capture import clear_capture_state
-from examples.live.rithmic.rithmic_data_capture import register_capture_state
-from examples.live.rithmic.rithmic_data_capture import snapshot_capture_state
-from examples.live.rithmic.rithmic_data_capture import wait_for_capture_data
-from examples.live.rithmic.rithmic_data_capture import wait_for_capture_stop
-from examples.live.rithmic.rithmic_live_node_helpers import TRADER_ID
-from examples.live.rithmic.rithmic_live_node_helpers import RithmicDataClientFactory
-from examples.live.rithmic.rithmic_live_node_helpers import build_data_client_config
-from examples.live.rithmic.rithmic_live_node_helpers import build_data_client_id
-from examples.live.rithmic.rithmic_live_node_helpers import load_rithmic_env_file
-from examples.live.rithmic.rithmic_live_node_helpers import resolve_instrument_id
 from nautilus_trader._libnautilus.common import Environment
 from nautilus_trader.live import LiveNode
-from nautilus_trader.model import BarType
-from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import BarType, InstrumentId
 from nautilus_trader.persistence import ParquetDataCatalog
 
+from examples.live.live_node_run_helpers import (
+    interrupt_live_node_run,
+    sleep_or_cancel,
+    start_live_node_monitor,
+    wait_for_event_or_cancel,
+)
+from examples.live.rithmic.rithmic_data_capture import (
+    clear_capture_state,
+    register_capture_state,
+    snapshot_capture_state,
+    wait_for_capture_data,
+    wait_for_capture_stop,
+)
+from examples.live.rithmic.rithmic_live_node_helpers import (
+    TRADER_ID,
+    RithmicDataClientFactory,
+    build_data_client_config,
+    build_data_client_id,
+    load_rithmic_env_file,
+    resolve_instrument_id,
+)
 
 if TYPE_CHECKING:
     from nautilus_trader.config import ImportableStrategyConfig
@@ -95,7 +97,9 @@ LOG_DATA = False
 FAIL_ON_TIMEOUT = False
 
 _STRATEGY_PATH = "examples.live.rithmic.rithmic_data_capture:RithmicDataCaptureStrategy"
-_CONFIG_PATH = "examples.live.rithmic.rithmic_data_capture:RithmicDataCaptureStrategyConfig"
+_CONFIG_PATH = (
+    "examples.live.rithmic.rithmic_data_capture:RithmicDataCaptureStrategyConfig"
+)
 
 
 def _catalog_counts(
@@ -241,7 +245,7 @@ def _write_capture_to_catalog(
         catalog.write_data(captured_bars)
 
 
-def run_capture(  # noqa: C901
+def run_capture(
     *,
     profile: str | None,
     catalog_path: Path,
@@ -285,7 +289,7 @@ def run_capture(  # noqa: C901
         .with_timeout_disconnection_secs(10)
         .with_delay_post_stop_secs(5)
         .add_data_client(
-            None,
+            data_client_id,
             RithmicDataClientFactory(),
             build_data_client_config(
                 profile,
@@ -304,7 +308,9 @@ def run_capture(  # noqa: C901
                 "data_client_id": data_client_id,
                 "strategy_id": f"RITHMIC-DATA-CAPTURE-{uuid4().hex[:8].upper()}",
                 "state_key": state_key,
-                "bar_type": str(bar_type) if capture_bars and bar_type is not None else None,
+                "bar_type": str(bar_type)
+                if capture_bars and bar_type is not None
+                else None,
                 "subscribe_quotes": capture_quotes,
                 "subscribe_trades": capture_trades,
                 "subscribe_depth": capture_depth,
@@ -357,9 +363,7 @@ def run_capture(  # noqa: C901
             return
 
         if not ready_snapshot["instrument_ready"] and ready_snapshot["data_seen"]:
-            initial_wait_warning = (
-                "Received Rithmic data before the instrument response; continuing capture."
-            )
+            initial_wait_warning = "Received Rithmic data before the instrument response; continuing capture."
 
         initial_wait = min(first_data_wait_seconds, max(capture_seconds, 0.0))
 
@@ -429,7 +433,9 @@ def run_capture(  # noqa: C901
         "depth_levels": depth_levels,
         "before_counts": before_counts,
         "after_counts": after_counts,
-        "catalog_delta": {key: after_counts[key] - before_counts[key] for key in before_counts},
+        "catalog_delta": {
+            key: after_counts[key] - before_counts[key] for key in before_counts
+        },
         "strategy_counts": {
             "instruments": 1 if snapshot["instrument"] is not None else 0,
             "instrument_events": snapshot["instrument_events"],
@@ -465,8 +471,10 @@ def main() -> None:
             PRODUCT_CODE,
             EXCHANGE,
         )
-        bar_type = BarType.from_str(f"{instrument_id}-{BAR_SPEC}") if CAPTURE_BARS else None
-    except Exception as exc:
+        bar_type = (
+            BarType.from_str(f"{instrument_id}-{BAR_SPEC}") if CAPTURE_BARS else None
+        )
+    except Exception as exc:  # noqa: BLE001 (CLI boundary reports any adapter failure)
         print(f"Rithmic instrument resolution failed: {exc}")
 
         if FAIL_ON_TIMEOUT:

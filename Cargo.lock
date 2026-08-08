@@ -8743,6 +8743,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "bon",
  "chrono",
  "dashmap",
  "dotenvy",
@@ -8781,7 +8782,7 @@ dependencies = [
 [[package]]
 name = "rithmic-rs"
 version = "2.0.0"
-source = "git+https://github.com/BurnOutTrader/rithmic-rs?branch=main#2c6264d9db4a4777b767b95022cd5ab7e94663f0"
+source = "git+https://github.com/BurnOutTrader/rithmic-rs?rev=2c6264d9db4a4777b767b95022cd5ab7e94663f0#2c6264d9db4a4777b767b95022cd5ab7e94663f0"
 dependencies = [
  "futures-util",
  "prost 0.14.4",

@@ -41,8 +41,11 @@ mod support;
 
 use nautilus_common::{enums::Environment, live::get_runtime};
 use nautilus_live::node::LiveNode;
-use nautilus_model::{identifiers::StrategyId, instruments::Instrument};
-use rithmic_nt::{RithmicDataClientFactory, RithmicExecClientFactory, RithmicInstrumentProvider};
+use nautilus_model::{identifiers::StrategyId, instruments::Instrument, types::Quantity};
+use rithmic_nt::{
+    RithmicDataClientFactory, RithmicExecClientFactory, RithmicInstrumentProvider, data_client_id,
+    exec_client_id,
+};
 
 use crate::support::{
     bar_ema_cross::{RithmicBarEmaCrossConfig, RithmicBarEmaCrossStrategy},
@@ -69,8 +72,10 @@ async fn main() -> anyhow::Result<()> {
     let warmup_minutes = env_usize("RITHMIC_WARMUP_MINUTES", 30);
     let fast_ema = env_usize("RITHMIC_FAST_EMA", 10);
     let slow_ema = env_usize("RITHMIC_SLOW_EMA", 20);
-    let trade_size =
-        nautilus_model::types::Quantity::from(env_string("RITHMIC_TRADE_SIZE", "1").as_str());
+    let trade_size_value = env_string("RITHMIC_TRADE_SIZE", "1");
+    let trade_size = trade_size_value.parse::<Quantity>().map_err(|e| {
+        anyhow::anyhow!("Invalid quantity in RITHMIC_TRADE_SIZE={trade_size_value:?}: {e}")
+    })?;
     let run_seconds = env_u64("RITHMIC_RUN_SECONDS", 0);
 
     let gateway = connect_history_gateway(profile.as_deref()).await?;
@@ -83,6 +88,8 @@ async fn main() -> anyhow::Result<()> {
     let bar_type = build_external_bar_type(instrument_id, &bar_spec)?;
     let data_config = data_config_from_env(profile.as_deref(), true)?;
     let exec_config = exec_config_from_env(profile.as_deref())?;
+    let data_id = data_client_id(&data_config.system_name)?;
+    let exec_id = exec_client_id(&exec_config.system_name, &exec_config.account_id)?;
     let trader_id = exec_config.trader_id;
 
     let strategy = RithmicBarEmaCrossStrategy::new(RithmicBarEmaCrossConfig {
@@ -104,12 +111,12 @@ async fn main() -> anyhow::Result<()> {
         .with_reconciliation(true)
         .with_delay_post_stop_secs(5)
         .add_data_client(
-            None,
+            Some(data_id.to_string()),
             Box::new(RithmicDataClientFactory::new()),
             Box::new(data_config),
         )?
         .add_exec_client(
-            None,
+            Some(exec_id.to_string()),
             Box::new(RithmicExecClientFactory::new()),
             Box::new(exec_config),
         )?

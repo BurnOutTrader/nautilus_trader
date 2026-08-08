@@ -118,5 +118,6 @@ def instrument_provider() -> RithmicInstrumentProvider:
             username="u",
             password="p",
             system_name="Apex",
+            app_name="TestApp",
         ),
     )

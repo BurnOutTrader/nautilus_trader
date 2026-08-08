@@ -390,14 +390,14 @@ fn test_client_ids_preserve_registration_order(mut execution_engine: ExecutionEn
     // Pin IndexMap iteration order on ExecutionEngine.clients: client_ids() drives
     // routing dispatch via get_clients_for_orders, so the registration order must
     // appear in the returned Vec across runs.
-    for (id, venue) in [
-        ("ZULU", Venue::from("ZULU")),
-        ("ALPHA", Venue::from("ALPHA")),
-        ("MIKE", Venue::from("MIKE")),
+    for (id, account, venue) in [
+        ("ZULU", "TEST-ZULU", Venue::from("ZULU")),
+        ("ALPHA", "TEST-ALPHA", Venue::from("ALPHA")),
+        ("MIKE", "TEST-MIKE", Venue::from("MIKE")),
     ] {
         let client = StubExecutionClient::new(
             ClientId::from(id),
-            AccountId::from("TEST-ACCOUNT"),
+            AccountId::from(account),
             venue,
             OmsType::Netting,
             None,
@@ -470,6 +470,48 @@ fn test_subscribe_venue_instruments_delivers_to_client_adapter(
 }
 
 #[rstest]
+fn test_subscribe_venue_instruments_delivers_to_all_clients_for_venue(
+    mut execution_engine: ExecutionEngine,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let venue = Venue::test_default();
+    let client_a = StubExecutionClient::new(
+        ClientId::from("CLIENT_A"),
+        AccountId::from("ACCOUNT-A"),
+        venue,
+        OmsType::Netting,
+        None,
+    );
+    let client_b = StubExecutionClient::new(
+        ClientId::from("CLIENT_B"),
+        AccountId::from("ACCOUNT-B"),
+        venue,
+        OmsType::Netting,
+        None,
+    );
+    let received_a = client_a.received_instruments();
+    let received_b = client_b.received_instruments();
+    execution_engine
+        .register_client(Box::new(client_a))
+        .unwrap();
+    execution_engine
+        .register_client(Box::new(client_b))
+        .unwrap();
+
+    let engine_rc = Rc::new(RefCell::new(execution_engine));
+    ExecutionEngine::subscribe_venue_instruments(&engine_rc, venue);
+    let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+    msgbus::publish_instrument(
+        switchboard::get_instrument_topic(instrument.id()),
+        &instrument,
+    );
+
+    assert_eq!(received_a.borrow().as_slice(), &[instrument.clone()]);
+    assert_eq!(received_b.borrow().as_slice(), &[instrument]);
+}
+
+#[rstest]
 fn test_deregister_client_removes_client(
     mut execution_engine: ExecutionEngine,
     stub_client: StubExecutionClient,
@@ -495,6 +537,45 @@ fn test_deregister_client_removes_client(
         execution_engine.get_client(&client_id).is_none(),
         "Client should be removed after deregistration"
     );
+}
+
+#[rstest]
+fn test_deregister_venue_default_promotes_remaining_client(mut execution_engine: ExecutionEngine) {
+    let venue = Venue::test_default();
+    let client_a_id = ClientId::from("CLIENT_A");
+    let client_b_id = ClientId::from("CLIENT_B");
+    let client_a = StubExecutionClient::new(
+        client_a_id,
+        AccountId::from("ACCOUNT-A"),
+        venue,
+        OmsType::Netting,
+        None,
+    );
+    let client_b = StubExecutionClient::new(
+        client_b_id,
+        AccountId::from("ACCOUNT-B"),
+        venue,
+        OmsType::Netting,
+        None,
+    );
+    execution_engine
+        .register_client(Box::new(client_a))
+        .unwrap();
+    execution_engine
+        .register_client(Box::new(client_b))
+        .unwrap();
+
+    execution_engine.deregister_client(client_a_id).unwrap();
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(audusd_sim().id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .build();
+
+    let clients = execution_engine.get_clients_for_orders(&[order]);
+
+    assert_eq!(clients.len(), 1);
+    assert_eq!(clients[0].client_id(), client_b_id);
 }
 
 #[rstest]
@@ -14177,7 +14258,9 @@ fn test_submit_order_with_no_client_denies_order(execution_engine: ExecutionEngi
 }
 
 #[rstest]
-fn test_register_client_errors_on_duplicate_venue(mut execution_engine: ExecutionEngine) {
+fn test_register_client_allows_duplicate_venue_with_distinct_accounts(
+    mut execution_engine: ExecutionEngine,
+) {
     let client_a = StubExecutionClient::new(
         ClientId::from("CLIENT_A"),
         AccountId::from("ACCOUNT-A"),
@@ -14192,12 +14275,61 @@ fn test_register_client_errors_on_duplicate_venue(mut execution_engine: Executio
         OmsType::Netting,
         None,
     );
+    let queried_a = client_a.queried_account_ids();
+    let queried_b = client_b.queried_account_ids();
 
     execution_engine
         .register_client(Box::new(client_a))
         .unwrap();
 
+    execution_engine
+        .register_client(Box::new(client_b))
+        .unwrap();
+
+    let client_ids = execution_engine.client_ids();
+    assert_eq!(client_ids.len(), 2);
+    assert!(client_ids.contains(&ClientId::from("CLIENT_A")));
+    assert!(client_ids.contains(&ClientId::from("CLIENT_B")));
+
+    let account_id = AccountId::from("ACCOUNT-B");
+    execution_engine.execute(TradingCommand::QueryAccount(QueryAccount {
+        trader_id: TraderId::test_default(),
+        client_id: None,
+        account_id,
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    }));
+
+    assert!(queried_a.borrow().is_empty());
+    assert_eq!(queried_b.borrow().as_slice(), &[account_id]);
+}
+
+#[rstest]
+fn test_register_client_errors_on_duplicate_account(mut execution_engine: ExecutionEngine) {
+    let account_id = AccountId::from("ACCOUNT-A");
+    let client_a = StubExecutionClient::new(
+        ClientId::from("CLIENT_A"),
+        account_id,
+        Venue::test_default(),
+        OmsType::Netting,
+        None,
+    );
+    let client_b = StubExecutionClient::new(
+        ClientId::from("CLIENT_B"),
+        account_id,
+        Venue::test_default(),
+        OmsType::Netting,
+        None,
+    );
+
+    execution_engine
+        .register_client(Box::new(client_a))
+        .unwrap();
     let result = execution_engine.register_client(Box::new(client_b));
+
     assert!(result.is_err());
     assert!(
         result

@@ -84,7 +84,7 @@ jobs:
         run: cargo clippy -p rithmic-nt --all-targets --all-features -- -D warnings
 
       - name: Run Rust tests
-        run: make cargo-test-crate-rithmic-nt NEXTEST_PROFILE=ci
+        run: make cargo-test-crate-rithmic-nt-all-targets NEXTEST_PROFILE=ci
 
   python:
     name: python

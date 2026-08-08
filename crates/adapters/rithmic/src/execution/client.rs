@@ -18,12 +18,14 @@ use std::{fmt::Debug, sync::Arc};
 
 use dashmap::DashMap;
 use nautilus_common::live::get_runtime;
+use nautilus_model::types::Price;
 use rithmic_rs::{
-    OrderSide, OrderStatus, OrderType, RithmicAccount, RithmicCancelOrder, RithmicModifyOrder,
-    RithmicOrder, TimeInForce, TrailingStop, api::RithmicResponse,
-    plants::order_plant::RithmicOrderPlantHandle, rithmic_to_unix_nanos,
+    OrderSide, OrderStatus, OrderType, RithmicAccount, RithmicCancelOrder,
+    RithmicError as RithmicApiError, RithmicModifyOrder, RithmicOrder, TimeInForce, TrailingStop,
+    api::RithmicResponse, plants::order_plant::RithmicOrderPlantHandle,
     rti::messages::RithmicMessage,
 };
+use thiserror::Error;
 use tokio::{
     sync::{RwLock, mpsc},
     task::JoinHandle,
@@ -96,8 +98,8 @@ pub struct OrderFilled {
     pub fill_price: f64,
     /// Fill quantity.
     pub fill_qty: f64,
-    /// Remaining quantity.
-    pub leaves_qty: f64,
+    /// Remaining quantity, when provided by Rithmic.
+    pub leaves_qty: Option<f64>,
     /// Commission.
     pub commission: f64,
     /// Timestamp.
@@ -253,6 +255,78 @@ pub struct OrderRequest {
     pub trailing_stop: Option<TrailingStopConfig>,
 }
 
+/// Certainty of the venue outcome after an order command fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandFailureKind {
+    /// The command definitely did not result in an accepted venue operation.
+    Definitive,
+    /// The venue outcome is unknown and must be reconciled.
+    Unknown,
+}
+
+/// Classified order-command failure which preserves the typed `rithmic-rs` source.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub(crate) struct OrderCommandError {
+    kind: CommandFailureKind,
+    message: String,
+    #[source]
+    source: Option<OrderCommandSource>,
+}
+
+#[derive(Debug, Error)]
+enum OrderCommandSource {
+    #[error(transparent)]
+    Api(#[from] RithmicApiError),
+    #[error(transparent)]
+    Adapter(#[from] RithmicError),
+}
+
+impl OrderCommandError {
+    fn definitive(message: impl Into<String>) -> Self {
+        Self {
+            kind: CommandFailureKind::Definitive,
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    pub(crate) fn unknown(message: impl Into<String>) -> Self {
+        Self {
+            kind: CommandFailureKind::Unknown,
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    pub(crate) fn from_api(source: RithmicApiError) -> Self {
+        let kind = classify_api_error(&source);
+        Self {
+            kind,
+            message: source.to_string(),
+            source: Some(source.into()),
+        }
+    }
+
+    fn from_adapter(source: RithmicError) -> Self {
+        Self {
+            kind: CommandFailureKind::Definitive,
+            message: source.to_string(),
+            source: Some(source.into()),
+        }
+    }
+
+    /// Returns the certainty of the venue outcome.
+    pub(crate) const fn kind(&self) -> CommandFailureKind {
+        self.kind
+    }
+
+    /// Returns whether the command definitively failed.
+    pub(crate) const fn is_definitive(&self) -> bool {
+        matches!(self.kind, CommandFailureKind::Definitive)
+    }
+}
+
 /// Order state tracking.
 #[derive(Debug, Clone)]
 pub struct OrderState {
@@ -322,6 +396,252 @@ fn first_response_error(responses: &[RithmicResponse]) -> Option<String> {
         .find_map(|response| response.error.as_ref().map(|e| e.to_string()))
 }
 
+fn classify_api_error(e: &RithmicApiError) -> CommandFailureKind {
+    match e {
+        RithmicApiError::RequestRejected(_) | RithmicApiError::InvalidArgument(_) => {
+            CommandFailureKind::Definitive
+        }
+        _ => CommandFailureKind::Unknown,
+    }
+}
+
+pub(crate) fn first_command_response_error(
+    responses: &[RithmicResponse],
+) -> Option<OrderCommandError> {
+    responses.iter().find_map(|response| {
+        response
+            .error
+            .as_ref()
+            .cloned()
+            .map(OrderCommandError::from_api)
+    })
+}
+
+fn whole_contracts(quantity: f64) -> std::result::Result<i32, OrderCommandError> {
+    if !quantity.is_finite() {
+        return Err(OrderCommandError::definitive(format!(
+            "Quantity must be finite, received: {quantity}"
+        )));
+    }
+
+    if quantity <= 0.0 {
+        return Err(OrderCommandError::definitive(format!(
+            "Quantity must be positive, received: {quantity}"
+        )));
+    }
+
+    if quantity.fract() != 0.0 {
+        return Err(OrderCommandError::definitive(format!(
+            "Quantity must be a whole number (contracts), received: {quantity}"
+        )));
+    }
+
+    if quantity > f64::from(i32::MAX) {
+        return Err(OrderCommandError::definitive(format!(
+            "Quantity exceeds maximum: {quantity}"
+        )));
+    }
+
+    // The finite, positive, integral value was bounded to `i32::MAX` above.
+    Ok(quantity as i32)
+}
+
+fn is_positive_representable_price(value: f64) -> bool {
+    value > 0.0 && Price::new_checked(value, 9).is_ok_and(|price| price.as_f64() > 0.0)
+}
+
+pub(crate) fn validate_command_price(
+    price: f64,
+    label: &str,
+) -> std::result::Result<(), OrderCommandError> {
+    if !is_positive_representable_price(price) {
+        return Err(OrderCommandError::definitive(format!(
+            "{label} must be positive and representable as a Nautilus price, received: {price}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_order_request(request: &OrderRequest) -> std::result::Result<(), OrderCommandError> {
+    if request.client_order_id.trim().is_empty() {
+        return Err(OrderCommandError::definitive(
+            "Client order ID must not be empty",
+        ));
+    }
+    if request.symbol.trim().is_empty() || request.exchange.trim().is_empty() {
+        return Err(OrderCommandError::definitive(
+            "Order symbol and exchange must not be empty",
+        ));
+    }
+    match request.side {
+        OrderSide::Buy | OrderSide::Sell => {}
+        _ => return Err(OrderCommandError::definitive("Unsupported order side")),
+    }
+    match request.order_type {
+        OrderType::Market | OrderType::Limit | OrderType::StopMarket | OrderType::StopLimit => {}
+        _ => return Err(OrderCommandError::definitive("Unsupported order type")),
+    }
+    match request.time_in_force {
+        TimeInForce::Day | TimeInForce::Gtc | TimeInForce::Ioc | TimeInForce::Fok => {}
+        _ => {
+            return Err(OrderCommandError::definitive("Unsupported time-in-force"));
+        }
+    }
+
+    whole_contracts(request.quantity)?;
+    if let Some(price) = request.price {
+        validate_command_price(price, "Order price")?;
+    }
+    if let Some(stop_price) = request.stop_price {
+        validate_command_price(stop_price, "Stop price")?;
+    }
+    if let Some(trailing_stop) = &request.trailing_stop {
+        if trailing_stop.trail_by_ticks <= 0 {
+            return Err(OrderCommandError::definitive(
+                "Trailing stop ticks must be positive",
+            ));
+        }
+        if !matches!(
+            request.order_type,
+            OrderType::StopMarket | OrderType::StopLimit
+        ) {
+            return Err(OrderCommandError::definitive(
+                "Trailing stop is only supported for stop orders",
+            ));
+        }
+    }
+
+    if matches!(request.order_type, OrderType::Limit | OrderType::StopLimit)
+        && request.price.is_none()
+    {
+        return Err(OrderCommandError::definitive(
+            "Limit/StopLimit order requires price",
+        ));
+    }
+    if matches!(
+        request.order_type,
+        OrderType::StopMarket | OrderType::StopLimit
+    ) && request.stop_price.is_none()
+        && request.trailing_stop.is_none()
+    {
+        return Err(OrderCommandError::definitive(
+            "Stop order requires stop_price or trailing stop",
+        ));
+    }
+    Ok(())
+}
+
+fn checked_rithmic_timestamp(ssboe: Option<i32>, usecs: Option<i32>) -> Option<u64> {
+    let ssboe = ssboe.filter(|value| *value >= 0)?;
+    let usecs = usecs.filter(|value| (0..1_000_000).contains(value))?;
+    (ssboe as u64)
+        .checked_mul(1_000_000_000)?
+        .checked_add((usecs as u64).checked_mul(1_000)?)
+}
+
+fn validate_optional_positive(
+    value: Option<f64>,
+    message: &'static str,
+) -> std::result::Result<(), &'static str> {
+    if value.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+        return Err(message);
+    }
+    Ok(())
+}
+
+fn validate_optional_non_negative(
+    value: Option<f64>,
+    message: &'static str,
+) -> std::result::Result<(), &'static str> {
+    if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+        return Err(message);
+    }
+    Ok(())
+}
+
+fn validate_optional_price(
+    value: Option<f64>,
+    message: &'static str,
+) -> std::result::Result<(), &'static str> {
+    if value.is_some_and(|value| !is_positive_representable_price(value)) {
+        return Err(message);
+    }
+    Ok(())
+}
+
+fn validate_order_context(context: &OrderContext) -> std::result::Result<(), &'static str> {
+    validate_optional_positive(
+        context.quantity,
+        "Rithmic order quantity must be finite and positive",
+    )?;
+    validate_optional_non_negative(
+        context.filled_qty,
+        "Rithmic filled quantity must be finite and non-negative",
+    )?;
+    validate_optional_non_negative(
+        context.leaves_qty,
+        "Rithmic leaves quantity must be finite and non-negative",
+    )?;
+    validate_optional_price(
+        context.price,
+        "Rithmic order price must be positive and representable",
+    )?;
+    validate_optional_price(
+        context.trigger_price,
+        "Rithmic trigger price must be positive and representable",
+    )?;
+    validate_optional_price(
+        context.avg_price,
+        "Rithmic average fill price must be positive and representable",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn validate_execution_event(
+    event: &ExecutionEvent,
+) -> std::result::Result<(), &'static str> {
+    match event {
+        ExecutionEvent::Submitted(event) => validate_order_context(&event.context),
+        ExecutionEvent::Accepted(event) => validate_order_context(&event.context),
+        ExecutionEvent::Rejected(event) => validate_order_context(&event.context),
+        ExecutionEvent::Filled(event) => {
+            validate_order_context(&event.context)?;
+            validate_optional_price(
+                Some(event.fill_price),
+                "Rithmic fill price must be positive and representable",
+            )?;
+            validate_optional_positive(
+                Some(event.fill_qty),
+                "Rithmic fill quantity must be finite and positive",
+            )?;
+            validate_optional_non_negative(
+                event.leaves_qty,
+                "Rithmic fill leaves quantity must be finite and non-negative",
+            )?;
+            if !event.commission.is_finite() {
+                return Err("Rithmic fill commission must be finite");
+            }
+            Ok(())
+        }
+        ExecutionEvent::Cancelled(event) => validate_order_context(&event.context),
+        ExecutionEvent::Modified(event) => {
+            validate_order_context(&event.context)?;
+            validate_optional_price(
+                event.new_price,
+                "Rithmic modified price must be positive and representable",
+            )?;
+            validate_optional_positive(
+                event.new_qty,
+                "Rithmic modified quantity must be finite and positive",
+            )
+        }
+        ExecutionEvent::ConnectionState(_)
+        | ExecutionEvent::Reconnected
+        | ExecutionEvent::Authenticated
+        | ExecutionEvent::Error(_) => Ok(()),
+    }
+}
+
 fn status_rank(status: OrderStatus) -> u8 {
     match status {
         OrderStatus::Pending => 1,
@@ -345,30 +665,29 @@ fn order_state_from_context(
 ) -> Option<OrderState> {
     let symbol = context.symbol.clone()?;
     let exchange = context.exchange.clone()?;
+    let side = context.side?;
     let order_type = context.order_type?;
-    let quantity = context
-        .quantity
-        .or_else(|| {
-            fill_qty
-                .zip(leaves_qty)
-                .map(|(filled, leaves)| filled + leaves)
-        })
+    let time_in_force = context.time_in_force?;
+    let quantity = context.quantity.or_else(|| {
+        fill_qty
+            .zip(leaves_qty)
+            .map(|(filled, leaves)| filled + leaves)
+    })?;
+    let reported_leaves = context.leaves_qty.or(leaves_qty);
+    let filled_qty = context
+        .filled_qty
         .or(fill_qty)
-        .unwrap_or_default();
-    let filled_qty = context.filled_qty.or(fill_qty).unwrap_or_default();
-    let leaves_qty = context
-        .leaves_qty
-        .or(leaves_qty)
-        .unwrap_or_else(|| (quantity - filled_qty).max(0.0));
+        .or_else(|| reported_leaves.map(|leaves| (quantity - leaves).max(0.0)))?;
+    let leaves_qty = reported_leaves.unwrap_or_else(|| (quantity - filled_qty).max(0.0));
 
     Some(OrderState {
         client_order_id: client_order_id.to_string(),
         venue_order_id: venue_order_id.map(ToOwned::to_owned),
         symbol,
         exchange,
-        side: context.side.unwrap_or(OrderSide::Buy),
+        side,
         order_type,
-        time_in_force: context.time_in_force.unwrap_or(TimeInForce::Day),
+        time_in_force,
         price: context.price,
         trigger_price: context.trigger_price,
         status,
@@ -406,6 +725,17 @@ impl RithmicExecutionClient {
         &self.account
     }
 
+    fn mark_submit_rejected(&self, client_order_id: &str) {
+        self.update_order_state(
+            client_order_id,
+            None,
+            OrderStatus::Rejected,
+            None,
+            Some(0.0),
+            None,
+        );
+    }
+
     async fn order_handle(&self) -> Result<RithmicOrderPlantHandle> {
         let gateway = self.gateway.read().await;
         gateway
@@ -438,51 +768,28 @@ impl RithmicExecutionClient {
     /// Set `trailing_stop` to enable trailing stop functionality. The stop price
     /// will trail the market by the specified number of ticks.
     pub async fn submit_order(&self, request: OrderRequest) -> Result<()> {
-        let handle = self.order_handle().await?;
+        self.submit_order_classified(request)
+            .await
+            .map_err(|e| RithmicError::Order(e.to_string()))
+    }
 
-        // Validate quantity is a positive whole number (Rithmic uses i32 for contracts)
-
-        if request.quantity <= 0.0 {
-            return Err(RithmicError::Order(format!(
-                "Quantity must be positive, received: {}",
-                request.quantity
+    pub(crate) async fn submit_order_classified(
+        &self,
+        request: OrderRequest,
+    ) -> std::result::Result<(), OrderCommandError> {
+        validate_order_request(&request)?;
+        let quantity = whole_contracts(request.quantity)?;
+        if self.orders.contains_key(&request.client_order_id) {
+            return Err(OrderCommandError::definitive(format!(
+                "Duplicate client order ID: {}",
+                request.client_order_id
             )));
         }
 
-        if request.quantity.fract() != 0.0 {
-            return Err(RithmicError::Order(format!(
-                "Quantity must be a whole number (contracts), received: {}",
-                request.quantity
-            )));
-        }
-
-        if request.quantity > i32::MAX as f64 {
-            return Err(RithmicError::Order(format!(
-                "Quantity exceeds maximum: {}",
-                request.quantity
-            )));
-        }
-
-        // Validate limit orders have a price
-
-        if (request.order_type == OrderType::Limit || request.order_type == OrderType::StopLimit)
-            && request.price.is_none()
-        {
-            return Err(RithmicError::Order(
-                "Limit/StopLimit order requires price".to_string(),
-            ));
-        }
-
-        // Validate stop orders have a stop price
-
-        if (request.order_type == OrderType::StopMarket
-            || request.order_type == OrderType::StopLimit)
-            && request.stop_price.is_none()
-        {
-            return Err(RithmicError::Order(
-                "Stop order requires stop_price".to_string(),
-            ));
-        }
+        let handle = self
+            .order_handle()
+            .await
+            .map_err(OrderCommandError::from_adapter)?;
 
         // Track order locally
         let order_state = OrderState {
@@ -509,9 +816,9 @@ impl RithmicExecutionClient {
         let price = match request.order_type {
             OrderType::Market | OrderType::StopMarket => 0.0,
             OrderType::Limit | OrderType::StopLimit => request.price.ok_or_else(|| {
-                RithmicError::Order("Limit order price is required for submission".to_string())
+                OrderCommandError::definitive("Limit order price is required for submission")
             })?,
-            _ => request.price.unwrap_or(0.0),
+            _ => return Err(OrderCommandError::definitive("Unsupported order type")),
         };
 
         let trigger_price = match request.order_type {
@@ -544,7 +851,7 @@ impl RithmicExecutionClient {
         let order = RithmicOrder {
             symbol: request.symbol,
             exchange: request.exchange,
-            quantity: request.quantity as i32,
+            quantity,
             price,
             transaction_type: request.side.into(),
             price_type: request.order_type.into(),
@@ -555,14 +862,33 @@ impl RithmicExecutionClient {
         };
 
         // Submit to Rithmic using the new place_order API
-        let responses = handle
-            .place_order(order)
-            .await
-            .map_err(|e| RithmicError::Order(e.to_string()))?;
+        let responses = match handle.place_order(order).await {
+            Ok(responses) => responses,
+            Err(e) => {
+                let failure = OrderCommandError::from_api(e);
+
+                if failure.is_definitive() {
+                    self.mark_submit_rejected(&request.client_order_id);
+                }
+                return Err(failure);
+            }
+        };
 
         let mut submitted_event: Option<ExecutionEvent> = None;
 
         for response in &responses {
+            if let Some(source) = response.error.as_ref().cloned() {
+                let failure = OrderCommandError::from_api(source);
+
+                if failure.is_definitive() {
+                    // The live adapter is the single authority for emitting the rejection.
+                    // This layer only updates its local state so direct command responses cannot
+                    // race or duplicate a gateway notification.
+                    self.mark_submit_rejected(&request.client_order_id);
+                }
+                return Err(failure);
+            }
+
             match &response.message {
                 RithmicMessage::ResponseNewOrder(resp) => {
                     tracing::debug!(
@@ -577,47 +903,26 @@ impl RithmicExecutionClient {
                         "place_order returned response_new_order"
                     );
 
-                    if let Some(e) = &response.error {
-                        let event = ExecutionEvent::Rejected(OrderRejected {
-                            client_order_id: request.client_order_id.clone(),
-                            account_id: self.account_id.clone(),
-                            reason: e.to_string(),
-                            ts_event: rithmic_to_unix_nanos(
-                                resp.ssboe.unwrap_or(0),
-                                resp.usecs.unwrap_or(0),
-                            ),
-                            context: OrderContext {
-                                symbol: Some(tracking_symbol.clone()),
-                                exchange: Some(tracking_exchange.clone()),
-                                side: Some(request.side),
-                                order_type: Some(request.order_type),
-                                time_in_force: Some(request.time_in_force),
-                                quantity: Some(request.quantity),
-                                filled_qty: Some(0.0),
-                                leaves_qty: Some(request.quantity),
-                                price: request.price,
-                                trigger_price: request.stop_price,
-                                avg_price: None,
-                                ..Default::default()
-                            },
-                        });
-                        self.apply_event(&event);
-                        return Err(RithmicError::Order(e.to_string()));
-                    }
-
                     let matches_request =
                         resp.user_tag.as_deref() == Some(request.client_order_id.as_str());
                     let has_venue_identity = resp.basket_id.is_some();
 
                     if matches_request || has_venue_identity {
+                        let Some(ts_event) = checked_rithmic_timestamp(resp.ssboe, resp.usecs)
+                        else {
+                            tracing::warn!(
+                                request_id = %response.request_id,
+                                ssboe = ?resp.ssboe,
+                                usecs = ?resp.usecs,
+                                "ignoring new-order acknowledgement with invalid timestamp"
+                            );
+                            continue;
+                        };
                         submitted_event = Some(ExecutionEvent::Submitted(OrderSubmitted {
                             client_order_id: request.client_order_id.clone(),
                             venue_order_id: resp.basket_id.clone(),
                             account_id: self.account_id.clone(),
-                            ts_event: rithmic_to_unix_nanos(
-                                resp.ssboe.unwrap_or(0),
-                                resp.usecs.unwrap_or(0),
-                            ),
+                            ts_event,
                             context: OrderContext {
                                 symbol: Some(tracking_symbol.clone()),
                                 exchange: Some(tracking_exchange.clone()),
@@ -652,9 +957,13 @@ impl RithmicExecutionClient {
             }
         }
 
-        if let Some(event) = submitted_event {
-            self.apply_event(&event);
-        }
+        let event = submitted_event.ok_or_else(|| {
+            OrderCommandError::unknown(format!(
+                "No matching new-order acknowledgement for {}",
+                request.client_order_id
+            ))
+        })?;
+        self.apply_event(&event);
 
         tracing::debug!("Order submitted: {}", request.client_order_id);
         Ok(())
@@ -674,42 +983,75 @@ impl RithmicExecutionClient {
         new_qty: Option<f64>,
         new_price: Option<f64>,
     ) -> Result<()> {
-        let handle = self.order_handle().await?;
+        self.modify_order_classified(client_order_id, new_qty, new_price)
+            .await
+            .map_err(|e| RithmicError::Order(e.to_string()))
+    }
 
-        // Validate new_qty if provided
-
-        if let Some(qty) = new_qty {
-            if qty <= 0.0 {
-                return Err(RithmicError::Order(format!(
-                    "Quantity must be positive, received: {qty}"
-                )));
-            }
-
-            if qty.fract() != 0.0 {
-                return Err(RithmicError::Order(format!(
-                    "Quantity must be a whole number (contracts), received: {qty}"
-                )));
-            }
+    pub(crate) async fn modify_order_classified(
+        &self,
+        client_order_id: &str,
+        new_qty: Option<f64>,
+        new_price: Option<f64>,
+    ) -> std::result::Result<(), OrderCommandError> {
+        if new_qty.is_none() && new_price.is_none() {
+            return Err(OrderCommandError::definitive(
+                "Modify order requires a new quantity or price",
+            ));
         }
+        if let Some(price) = new_price {
+            validate_command_price(price, "Modified price")?;
+        }
+        let new_contracts = new_qty.map(whole_contracts).transpose()?;
+        let (modify_request, venue_order_id) = {
+            let order = self.orders.get(client_order_id).ok_or_else(|| {
+                OrderCommandError::definitive(format!("Order not found: {client_order_id}"))
+            })?;
+            let venue_order_id = order
+                .venue_order_id
+                .clone()
+                .ok_or_else(|| OrderCommandError::definitive("Order not yet accepted by venue"))?;
+            let quantity = match new_contracts {
+                Some(quantity) => quantity,
+                None => whole_contracts(order.leaves_qty)?,
+            };
+            let price = match order.order_type {
+                OrderType::Limit | OrderType::StopLimit => {
+                    let price = new_price.or(order.price).ok_or_else(|| {
+                        OrderCommandError::definitive(
+                            "Limit/StopLimit order requires a price for modification",
+                        )
+                    })?;
+                    validate_command_price(price, "Modified price")?;
+                    price
+                }
+                OrderType::Market | OrderType::StopMarket => {
+                    if new_price.is_some() {
+                        return Err(OrderCommandError::definitive(
+                            "Price modification is unsupported for Market/StopMarket orders",
+                        ));
+                    }
+                    0.0
+                }
+                _ => return Err(OrderCommandError::definitive("Unsupported order type")),
+            };
 
-        let order = self
-            .orders
-            .get(client_order_id)
-            .ok_or_else(|| RithmicError::Order(format!("Order not found: {client_order_id}")))?;
-
-        let venue_order_id = order
-            .venue_order_id
-            .clone()
-            .ok_or_else(|| RithmicError::Order("Order not yet accepted by venue".to_string()))?;
-
-        let modify_request = RithmicModifyOrder {
-            id: venue_order_id.clone(),
-            exchange: order.exchange.clone(),
-            symbol: order.symbol.clone(),
-            qty: new_qty.map_or(order.leaves_qty as i32, |q| q as i32),
-            price: new_price.unwrap_or(0.0),
-            price_type: order.order_type.into(),
+            (
+                RithmicModifyOrder {
+                    id: venue_order_id.clone(),
+                    exchange: order.exchange.clone(),
+                    symbol: order.symbol.clone(),
+                    qty: quantity,
+                    price,
+                    price_type: order.order_type.into(),
+                },
+                venue_order_id,
+            )
         };
+        let handle = self
+            .order_handle()
+            .await
+            .map_err(OrderCommandError::from_adapter)?;
 
         tracing::debug!(
             "Modifying order: client_id={}, venue_id={}, new_qty={:?}, new_price={:?}",
@@ -722,7 +1064,11 @@ impl RithmicExecutionClient {
         let responses = handle
             .modify_order(modify_request)
             .await
-            .map_err(|e| RithmicError::Order(e.to_string()))?;
+            .map_err(OrderCommandError::from_api)?;
+
+        if let Some(failure) = first_command_response_error(&responses) {
+            return Err(failure);
+        }
 
         for response in &responses {
             match &response.message {
@@ -750,8 +1096,13 @@ impl RithmicExecutionClient {
             }
         }
 
-        if let Some(e) = first_response_error(&responses) {
-            return Err(RithmicError::Order(e));
+        if !responses
+            .iter()
+            .any(|response| matches!(&response.message, RithmicMessage::ResponseModifyOrder(_)))
+        {
+            return Err(OrderCommandError::unknown(format!(
+                "No modify-order acknowledgement for {client_order_id}"
+            )));
         }
 
         Ok(())
@@ -761,16 +1112,28 @@ impl RithmicExecutionClient {
     ///
     /// The order must exist locally and have a venue_order_id (must be accepted).
     pub async fn cancel_order(&self, client_order_id: &str) -> Result<()> {
-        let handle = self.order_handle().await?;
-        let order = self
+        self.cancel_order_classified(client_order_id)
+            .await
+            .map_err(|e| RithmicError::Order(e.to_string()))
+    }
+
+    pub(crate) async fn cancel_order_classified(
+        &self,
+        client_order_id: &str,
+    ) -> std::result::Result<(), OrderCommandError> {
+        let venue_order_id = self
             .orders
             .get(client_order_id)
-            .ok_or_else(|| RithmicError::Order(format!("Order not found: {client_order_id}")))?;
-
-        let venue_order_id = order
+            .ok_or_else(|| {
+                OrderCommandError::definitive(format!("Order not found: {client_order_id}"))
+            })?
             .venue_order_id
             .clone()
-            .ok_or_else(|| RithmicError::Order("Order not yet accepted by venue".to_string()))?;
+            .ok_or_else(|| OrderCommandError::definitive("Order not yet accepted by venue"))?;
+        let handle = self
+            .order_handle()
+            .await
+            .map_err(OrderCommandError::from_adapter)?;
 
         tracing::debug!(
             "Cancelling order: client_id={}, venue_id={}",
@@ -783,7 +1146,11 @@ impl RithmicExecutionClient {
         let responses = handle
             .cancel_order(cancel_request)
             .await
-            .map_err(|e| RithmicError::Order(e.to_string()))?;
+            .map_err(OrderCommandError::from_api)?;
+
+        if let Some(failure) = first_command_response_error(&responses) {
+            return Err(failure);
+        }
 
         for response in &responses {
             match &response.message {
@@ -811,8 +1178,13 @@ impl RithmicExecutionClient {
             }
         }
 
-        if let Some(e) = first_response_error(&responses) {
-            return Err(RithmicError::Order(e));
+        if !responses
+            .iter()
+            .any(|response| matches!(&response.message, RithmicMessage::ResponseCancelOrder(_)))
+        {
+            return Err(OrderCommandError::unknown(format!(
+                "No cancel-order acknowledgement for {client_order_id}"
+            )));
         }
 
         Ok(())
@@ -820,16 +1192,33 @@ impl RithmicExecutionClient {
 
     /// Cancels all open orders.
     pub async fn cancel_all_orders(&self) -> Result<()> {
-        let handle = self.order_handle().await?;
+        self.cancel_all_orders_classified()
+            .await
+            .map_err(|e| RithmicError::Order(e.to_string()))
+    }
+
+    pub(crate) async fn cancel_all_orders_classified(
+        &self,
+    ) -> std::result::Result<(), OrderCommandError> {
+        let handle = self
+            .order_handle()
+            .await
+            .map_err(OrderCommandError::from_adapter)?;
         tracing::debug!("Cancelling all orders");
 
         let response = handle
             .cancel_all_orders()
             .await
-            .map_err(|e| RithmicError::Order(e.to_string()))?;
+            .map_err(OrderCommandError::from_api)?;
 
         if let Some(e) = response.error {
-            return Err(RithmicError::Order(e.to_string()));
+            return Err(OrderCommandError::from_api(e));
+        }
+
+        if !matches!(response.message, RithmicMessage::ResponseCancelAllOrders(_)) {
+            return Err(OrderCommandError::unknown(
+                "No cancel-all acknowledgement from Rithmic",
+            ));
         }
 
         Ok(())
@@ -838,36 +1227,47 @@ impl RithmicExecutionClient {
     /// Cancels a batch of orders by client order ID.
     ///
     /// This iterates through the provided order IDs and cancels each one.
-    /// Orders that don't exist or haven't been accepted are skipped.
+    /// Every child outcome is evaluated; the batch fails if any child fails.
     ///
     /// # Returns
     ///
-    /// Returns the number of orders successfully submitted for cancellation.
-    /// Note: This doesn't guarantee the cancels were accepted by the venue.
+    /// Returns the number of acknowledged cancellations when all children succeed.
     pub async fn batch_cancel_orders(&self, client_order_ids: &[&str]) -> Result<usize> {
         tracing::debug!("Batch cancelling {} orders", client_order_ids.len());
+        let outcomes = self.batch_cancel_orders_classified(client_order_ids).await;
+        let mut failures = Vec::new();
 
-        let mut cancelled = 0;
-
-        for client_order_id in client_order_ids {
-            match self.cancel_order(client_order_id).await {
-                Ok(()) => cancelled += 1,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to cancel order {}: {} (continuing with batch)",
-                        client_order_id,
-                        e
-                    );
-                }
+        for (client_order_id, outcome) in outcomes {
+            if let Err(e) = outcome {
+                failures.push(format!("{client_order_id}: {e}"));
             }
         }
 
-        tracing::debug!(
-            "Batch cancel submitted {} of {} orders",
-            cancelled,
-            client_order_ids.len()
-        );
-        Ok(cancelled)
+        if failures.is_empty() {
+            Ok(client_order_ids.len())
+        } else {
+            Err(RithmicError::Order(format!(
+                "Batch cancellation failed for {} of {} orders: {}",
+                failures.len(),
+                client_order_ids.len(),
+                failures.join("; ")
+            )))
+        }
+    }
+
+    pub(crate) async fn batch_cancel_orders_classified(
+        &self,
+        client_order_ids: &[&str],
+    ) -> Vec<(String, std::result::Result<(), OrderCommandError>)> {
+        let mut outcomes = Vec::with_capacity(client_order_ids.len());
+
+        for client_order_id in client_order_ids {
+            outcomes.push((
+                (*client_order_id).to_string(),
+                self.cancel_order_classified(client_order_id).await,
+            ));
+        }
+        outcomes
     }
 
     /// Queries all open orders from Rithmic.
@@ -1041,7 +1441,12 @@ impl RithmicExecutionClient {
 
     /// Applies an execution event to local order state and re-emits it to any
     /// attached event receiver.
-    pub fn apply_event(&self, event: &ExecutionEvent) {
+    pub fn apply_event(&self, event: &ExecutionEvent) -> bool {
+        if let Err(e) = validate_execution_event(event) {
+            tracing::warn!("Dropping invalid Rithmic execution event: {e}");
+            return false;
+        }
+
         let mut emit_downstream = true;
 
         match event {
@@ -1128,20 +1533,21 @@ impl RithmicExecutionClient {
             }
             ExecutionEvent::Filled(e) => {
                 if !self.orders.contains_key(&e.client_order_id)
-                    && let Some(order_state) = order_state_from_context(
+                    && let Some(mut order_state) = order_state_from_context(
                         &e.client_order_id,
                         Some(&e.venue_order_id),
-                        if e.leaves_qty > 0.0 {
-                            OrderStatus::Partial
-                        } else {
-                            OrderStatus::Complete
-                        },
+                        OrderStatus::Partial,
                         &e.context,
                         Some(e.fill_qty),
-                        Some(e.leaves_qty),
+                        e.leaves_qty,
                         e.context.avg_price,
                     )
                 {
+                    order_state.status = if order_state.leaves_qty > 0.0 {
+                        OrderStatus::Partial
+                    } else {
+                        OrderStatus::Complete
+                    };
                     self.venue_to_client
                         .insert(e.venue_order_id.clone(), e.client_order_id.clone());
                     self.orders.insert(e.client_order_id.clone(), order_state);
@@ -1157,20 +1563,25 @@ impl RithmicExecutionClient {
                         .max(prev_filled)
                         .min(base_quantity);
                     let incremental_fill = (new_filled - prev_filled).max(0.0);
+                    let leaves_qty = e
+                        .context
+                        .leaves_qty
+                        .or(e.leaves_qty)
+                        .unwrap_or_else(|| (order.quantity - new_filled).max(0.0));
+                    let event_status = if leaves_qty > 0.0 {
+                        OrderStatus::Partial
+                    } else {
+                        OrderStatus::Complete
+                    };
 
                     if incremental_fill == 0.0
-                        && status_rank(order.status)
-                            >= status_rank(if e.leaves_qty > 0.0 {
-                                OrderStatus::Partial
-                            } else {
-                                OrderStatus::Complete
-                            })
+                        && status_rank(order.status) >= status_rank(event_status)
                     {
                         emit_downstream = false;
                     }
 
                     order.filled_qty = new_filled;
-                    order.leaves_qty = e.context.leaves_qty.unwrap_or(e.leaves_qty);
+                    order.leaves_qty = leaves_qty;
 
                     if let Some(avg_price) = e.context.avg_price.filter(|value| *value > 0.0) {
                         order.avg_price = avg_price;
@@ -1180,14 +1591,8 @@ impl RithmicExecutionClient {
                         order.avg_price = new_notional / new_filled;
                     }
 
-                    let new_status = if order.leaves_qty > 0.0 {
-                        OrderStatus::Partial
-                    } else {
-                        OrderStatus::Complete
-                    };
-
-                    if status_rank(new_status) >= status_rank(order.status) {
-                        order.status = new_status;
+                    if status_rank(event_status) >= status_rank(order.status) {
+                        order.status = event_status;
                     }
 
                     if order.venue_order_id.is_none() {
@@ -1270,6 +1675,7 @@ impl RithmicExecutionClient {
         if emit_downstream {
             self.emit_event(event.clone());
         }
+        emit_downstream
     }
 
     /// Consumes execution events from a channel, applying them to local state
@@ -1283,7 +1689,9 @@ impl RithmicExecutionClient {
     ) {
         loop {
             match rx.recv().await {
-                Ok(event) => self.apply_event(&event),
+                Ok(event) => {
+                    self.apply_event(&event);
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     log::warn!("Rithmic execution client lagged by {skipped} events");
                 }
@@ -1310,5 +1718,380 @@ impl Debug for RithmicExecutionClient {
             .field("account_id", &self.account_id)
             .field("open_orders", &self.open_orders_count())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+
+    use rstest::rstest;
+
+    use super::*;
+    use crate::{config::RithmicEnv, gateway::GatewayConfig};
+
+    fn sample_order_request() -> OrderRequest {
+        OrderRequest {
+            client_order_id: "O-1".to_string(),
+            symbol: "ESM6".to_string(),
+            exchange: "CME".to_string(),
+            side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Day,
+            quantity: 1.0,
+            price: Some(5000.0),
+            stop_price: None,
+            trailing_stop: None,
+        }
+    }
+
+    #[rstest]
+    #[case(
+        RithmicApiError::InvalidArgument("bad quantity".to_string()),
+        CommandFailureKind::Definitive
+    )]
+    #[case(RithmicApiError::SendFailed, CommandFailureKind::Unknown)]
+    #[case(RithmicApiError::ConnectionClosed, CommandFailureKind::Unknown)]
+    #[case(RithmicApiError::EmptyResponse, CommandFailureKind::Unknown)]
+    #[case(
+        RithmicApiError::ProtocolError("malformed acknowledgement".to_string()),
+        CommandFailureKind::Unknown
+    )]
+    fn classifies_order_command_outcome(
+        #[case] e: RithmicApiError,
+        #[case] expected: CommandFailureKind,
+    ) {
+        assert_eq!(classify_api_error(&e), expected);
+    }
+
+    #[rstest]
+    #[case(1.0, Ok(1))]
+    #[case(f64::from(i32::MAX), Ok(i32::MAX))]
+    #[case(0.0, Err("positive"))]
+    #[case(-1.0, Err("positive"))]
+    #[case(1.5, Err("whole number"))]
+    #[case(f64::INFINITY, Err("finite"))]
+    #[case(f64::NAN, Err("finite"))]
+    #[case(f64::from(i32::MAX) + 1.0, Err("maximum"))]
+    fn converts_contract_quantity_with_checked_bounds(
+        #[case] quantity: f64,
+        #[case] expected: std::result::Result<i32, &str>,
+    ) {
+        match expected {
+            Ok(expected) => assert_eq!(whole_contracts(quantity).unwrap(), expected),
+            Err(expected_message) => {
+                assert!(
+                    whole_contracts(quantity)
+                        .unwrap_err()
+                        .to_string()
+                        .contains(expected_message)
+                );
+            }
+        }
+    }
+
+    #[rstest]
+    #[case(Some(1), Some(500_000), Some(1_500_000_000))]
+    #[case(None, Some(0), None)]
+    #[case(Some(1), None, None)]
+    #[case(Some(-1), Some(0), None)]
+    #[case(Some(1), Some(-1), None)]
+    #[case(Some(1), Some(1_000_000), None)]
+    fn validates_rithmic_ack_timestamp(
+        #[case] ssboe: Option<i32>,
+        #[case] usecs: Option<i32>,
+        #[case] expected: Option<u64>,
+    ) {
+        assert_eq!(checked_rithmic_timestamp(ssboe, usecs), expected);
+    }
+
+    #[rstest]
+    fn classified_error_preserves_typed_source() {
+        let e = OrderCommandError::from_api(RithmicApiError::InvalidArgument(
+            "bad quantity".to_string(),
+        ));
+
+        assert!(e.is_definitive());
+        assert!(e.source().is_some());
+    }
+
+    #[rstest]
+    fn validates_low_level_order_request_before_transport() {
+        assert!(validate_order_request(&sample_order_request()).is_ok());
+
+        let mut request = sample_order_request();
+        request.price = Some(f64::NAN);
+        assert!(validate_order_request(&request).is_err());
+
+        let mut request = sample_order_request();
+        request.price = Some(f64::MAX);
+        assert!(validate_order_request(&request).is_err());
+
+        let mut request = sample_order_request();
+        request.price = Some(f64::MIN_POSITIVE);
+        assert!(validate_order_request(&request).is_err());
+
+        let mut request = sample_order_request();
+        request.quantity = 1.5;
+        assert!(validate_order_request(&request).is_err());
+
+        let mut request = sample_order_request();
+        request.order_type = OrderType::StopMarket;
+        request.price = None;
+        request.trailing_stop = Some(TrailingStopConfig { trail_by_ticks: 0 });
+        assert!(validate_order_request(&request).is_err());
+
+        let mut request = sample_order_request();
+        request.symbol.clear();
+        assert!(validate_order_request(&request).is_err());
+    }
+
+    #[rstest]
+    fn command_response_rejection_updates_state_without_emitting_duplicate_event() {
+        let config = GatewayConfig::new(
+            RithmicEnv::Demo,
+            "user",
+            "pass",
+            "system",
+            "TestApp",
+            "fcm",
+            "ib",
+            "account",
+        )
+        .expect("valid gateway config");
+        let gateway = Arc::new(RwLock::new(RithmicGateway::new(config)));
+        let mut client =
+            RithmicExecutionClient::new(gateway, RithmicAccount::new("fcm", "ib", "account"));
+        let mut receiver = client.event_receiver();
+        client.orders.insert(
+            "O-1".to_string(),
+            OrderState {
+                client_order_id: "O-1".to_string(),
+                venue_order_id: None,
+                symbol: "ESM6".to_string(),
+                exchange: "CME".to_string(),
+                side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::Day,
+                price: Some(5000.0),
+                trigger_price: None,
+                status: OrderStatus::Pending,
+                quantity: 1.0,
+                filled_qty: 0.0,
+                leaves_qty: 1.0,
+                avg_price: 0.0,
+            },
+        );
+
+        client.mark_submit_rejected("O-1");
+
+        assert_eq!(
+            client.get_order("O-1").unwrap().status,
+            OrderStatus::Rejected
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_submit_and_invalid_modify_preserve_existing_order() {
+        let config = GatewayConfig::new(
+            RithmicEnv::Demo,
+            "user",
+            "pass",
+            "system",
+            "TestApp",
+            "fcm",
+            "ib",
+            "account",
+        )
+        .expect("valid gateway config");
+        let gateway = Arc::new(RwLock::new(RithmicGateway::new(config)));
+        let client =
+            RithmicExecutionClient::new(gateway, RithmicAccount::new("fcm", "ib", "account"));
+        client.orders.insert(
+            "O-1".to_string(),
+            OrderState {
+                client_order_id: "O-1".to_string(),
+                venue_order_id: Some("V-1".to_string()),
+                symbol: "ESM6".to_string(),
+                exchange: "CME".to_string(),
+                side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::Day,
+                price: Some(5000.0),
+                trigger_price: None,
+                status: OrderStatus::Open,
+                quantity: 1.0,
+                filled_qty: 0.0,
+                leaves_qty: 1.0,
+                avg_price: 0.0,
+            },
+        );
+
+        let duplicate = client
+            .submit_order_classified(sample_order_request())
+            .await
+            .expect_err("duplicate ID should fail before transport");
+        assert!(duplicate.is_definitive());
+        assert_eq!(
+            client
+                .get_order("O-1")
+                .expect("order should remain")
+                .quantity,
+            1.0
+        );
+
+        let invalid_price = client
+            .modify_order_classified("O-1", None, Some(f64::INFINITY))
+            .await
+            .expect_err("invalid price should fail before transport");
+        assert!(invalid_price.is_definitive());
+
+        client
+            .orders
+            .get_mut("O-1")
+            .expect("order should remain")
+            .price = None;
+        let missing_required_price = client
+            .modify_order_classified("O-1", Some(2.0), None)
+            .await
+            .expect_err("limit modify cannot default a missing price to zero");
+        assert!(missing_required_price.is_definitive());
+    }
+
+    #[rstest]
+    fn missing_fill_leaves_is_derived_only_from_known_quantity() {
+        let config = GatewayConfig::new(
+            RithmicEnv::Demo,
+            "user",
+            "pass",
+            "system",
+            "TestApp",
+            "fcm",
+            "ib",
+            "account",
+        )
+        .expect("valid gateway config");
+        let gateway = Arc::new(RwLock::new(RithmicGateway::new(config)));
+        let client =
+            RithmicExecutionClient::new(gateway, RithmicAccount::new("fcm", "ib", "account"));
+        client.orders.insert(
+            "KNOWN".to_string(),
+            OrderState {
+                client_order_id: "KNOWN".to_string(),
+                venue_order_id: Some("VENUE-KNOWN".to_string()),
+                symbol: "ESM6".to_string(),
+                exchange: "CME".to_string(),
+                side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::Day,
+                price: Some(5000.0),
+                trigger_price: None,
+                status: OrderStatus::Open,
+                quantity: 5.0,
+                filled_qty: 0.0,
+                leaves_qty: 5.0,
+                avg_price: 0.0,
+            },
+        );
+
+        client.apply_event(&ExecutionEvent::Filled(OrderFilled {
+            client_order_id: "KNOWN".to_string(),
+            account_id: "account".to_string(),
+            venue_order_id: "VENUE-KNOWN".to_string(),
+            fill_price: 5000.0,
+            fill_qty: 2.0,
+            leaves_qty: None,
+            commission: 0.0,
+            ts_event: 1,
+            trade_id: Some("TRADE-KNOWN".to_string()),
+            currency: Some("USD".to_string()),
+            context: OrderContext::default(),
+        }));
+
+        let known = client
+            .get_order("KNOWN")
+            .expect("known order should remain");
+        assert_eq!(known.leaves_qty, 3.0);
+        assert_eq!(known.status, OrderStatus::Partial);
+        drop(known);
+
+        assert!(!client.apply_event(&ExecutionEvent::Filled(OrderFilled {
+            client_order_id: "KNOWN".to_string(),
+            account_id: "account".to_string(),
+            venue_order_id: "VENUE-KNOWN".to_string(),
+            fill_price: f64::NAN,
+            fill_qty: -1.0,
+            leaves_qty: Some(-1.0),
+            commission: 0.0,
+            ts_event: 2,
+            trade_id: Some("TRADE-INVALID".to_string()),
+            currency: Some("USD".to_string()),
+            context: OrderContext::default(),
+        })));
+        assert!(!client.apply_event(&ExecutionEvent::Filled(OrderFilled {
+            client_order_id: "KNOWN".to_string(),
+            account_id: "account".to_string(),
+            venue_order_id: "VENUE-KNOWN".to_string(),
+            fill_price: f64::MAX,
+            fill_qty: 1.0,
+            leaves_qty: Some(2.0),
+            commission: 0.0,
+            ts_event: 3,
+            trade_id: Some("TRADE-UNREPRESENTABLE".to_string()),
+            currency: Some("USD".to_string()),
+            context: OrderContext::default(),
+        })));
+        let preserved = client
+            .get_order("KNOWN")
+            .expect("invalid fill must not remove known order");
+        assert_eq!(preserved.filled_qty, 2.0);
+        assert_eq!(preserved.leaves_qty, 3.0);
+        assert_eq!(preserved.status, OrderStatus::Partial);
+        drop(preserved);
+
+        assert!(
+            !client.apply_event(&ExecutionEvent::Modified(OrderModified {
+                client_order_id: "KNOWN".to_string(),
+                account_id: "account".to_string(),
+                venue_order_id: "VENUE-KNOWN".to_string(),
+                new_price: Some(f64::INFINITY),
+                new_qty: Some(0.0),
+                ts_event: 4,
+                context: OrderContext::default(),
+            }))
+        );
+        let preserved = client
+            .get_order("KNOWN")
+            .expect("invalid modify must not remove known order");
+        assert_eq!(preserved.quantity, 5.0);
+        assert_eq!(preserved.price, Some(5000.0));
+        drop(preserved);
+
+        client.apply_event(&ExecutionEvent::Filled(OrderFilled {
+            client_order_id: "UNKNOWN".to_string(),
+            account_id: "account".to_string(),
+            venue_order_id: "VENUE-UNKNOWN".to_string(),
+            fill_price: 5000.0,
+            fill_qty: 2.0,
+            leaves_qty: None,
+            commission: 0.0,
+            ts_event: 4,
+            trade_id: Some("TRADE-UNKNOWN".to_string()),
+            currency: Some("USD".to_string()),
+            context: OrderContext {
+                symbol: Some("ESM6".to_string()),
+                exchange: Some("CME".to_string()),
+                side: Some(OrderSide::Buy),
+                order_type: Some(OrderType::Limit),
+                time_in_force: Some(TimeInForce::Day),
+                filled_qty: Some(2.0),
+                ..OrderContext::default()
+            },
+        }));
+        assert!(client.get_order("UNKNOWN").is_none());
     }
 }

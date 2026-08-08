@@ -58,6 +58,23 @@ pub(crate) struct PyRithmicGateway {
 }
 
 #[cfg(feature = "python")]
+impl PyRithmicGateway {
+    fn from_checked_config(config: GatewayConfig) -> PyResult<Self> {
+        config
+            .to_rithmic_config()
+            .map_err(|e| to_pyvalue_err(e.to_string()))?;
+
+        Ok(Self {
+            inner: Arc::new(tokio::sync::RwLock::new(RithmicGateway::new(config))),
+            pnl_task: Arc::new(parking_lot::Mutex::new(None)),
+            pnl_shutdown: Arc::new(parking_lot::Mutex::new(None)),
+            balances: Arc::new(parking_lot::RwLock::new(AHashMap::new())),
+            positions: Arc::new(parking_lot::RwLock::new(AHashMap::new())),
+        })
+    }
+}
+
+#[cfg(feature = "python")]
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyRithmicGateway {
@@ -71,9 +88,9 @@ impl PyRithmicGateway {
         fcm_id,
         ib_id,
         account_id,
+        app_name,
         server=None,
         alt_server=None,
-        app_name="",
         app_version="1.0",
         enable_ticker=true,
         enable_order=true,
@@ -89,25 +106,26 @@ impl PyRithmicGateway {
         fcm_id: String,
         ib_id: String,
         account_id: String,
+        app_name: &str,
         server: Option<String>,
         alt_server: Option<String>,
-        app_name: &str,
         app_version: &str,
         enable_ticker: bool,
         enable_order: bool,
         enable_pnl: bool,
         enable_history: bool,
-    ) -> Self {
+    ) -> PyResult<Self> {
         let mut config = GatewayConfig::new(
             environment.into(),
             username,
             password,
             system_name,
+            app_name,
             fcm_id,
             ib_id,
             account_id,
         )
-        .with_app_name(app_name)
+        .map_err(|e| to_pyvalue_err(e.to_string()))?
         .with_app_version(app_version)
         .with_ticker(enable_ticker)
         .with_order(enable_order)
@@ -122,13 +140,7 @@ impl PyRithmicGateway {
             config = config.with_alt_server(alt_server);
         }
 
-        Self {
-            inner: Arc::new(tokio::sync::RwLock::new(RithmicGateway::new(config))),
-            pnl_task: Arc::new(parking_lot::Mutex::new(None)),
-            pnl_shutdown: Arc::new(parking_lot::Mutex::new(None)),
-            balances: Arc::new(parking_lot::RwLock::new(AHashMap::new())),
-            positions: Arc::new(parking_lot::RwLock::new(AHashMap::new())),
-        }
+        Self::from_checked_config(config)
     }
 
     /// Creates a gateway from environment variables.
@@ -138,13 +150,7 @@ impl PyRithmicGateway {
     fn py_from_env(profile: Option<String>) -> PyResult<Self> {
         let config = GatewayConfig::from_env_with_profile(profile.as_deref())
             .map_err(|e| to_pyvalue_err(e.to_string()))?;
-        Ok(Self {
-            inner: Arc::new(tokio::sync::RwLock::new(RithmicGateway::new(config))),
-            pnl_task: Arc::new(parking_lot::Mutex::new(None)),
-            pnl_shutdown: Arc::new(parking_lot::Mutex::new(None)),
-            balances: Arc::new(parking_lot::RwLock::new(AHashMap::new())),
-            positions: Arc::new(parking_lot::RwLock::new(AHashMap::new())),
-        })
+        Self::from_checked_config(config)
     }
 
     /// Returns true if the gateway is connected.
@@ -334,29 +340,27 @@ impl PyRithmicGateway {
     /// `PyPositionEvent` instances.
     #[pyo3(name = "start_pnl_loop")]
     fn py_start_pnl_loop(&self, _py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
-        // Prevent double-start
-
-        if self.pnl_task.lock().is_some() {
-            return Err(to_pyruntime_err("PnL loop already running"));
+        {
+            let mut task = self.pnl_task.lock();
+            if task.as_ref().is_some_and(|handle| !handle.is_finished()) {
+                return Err(to_pyruntime_err("PnL loop already running"));
+            }
+            task.take();
         }
+        self.pnl_shutdown.lock().take();
 
         let inner = Arc::clone(&self.inner);
-        let callback = callback;
         let shutdown = Arc::clone(&self.pnl_shutdown);
-        let task_slot = Arc::clone(&self.pnl_task);
         let balances = Arc::clone(&self.balances);
         let positions = Arc::clone(&self.positions);
-
-        // Spawn async task
+        let (tx, mut rx_shutdown) = tokio::sync::oneshot::channel();
+        *self.pnl_shutdown.lock() = Some(tx);
 
         let handle = get_runtime().spawn(async move {
             let mut rx = {
                 let gw = inner.read().await;
                 gw.subscribe_pnl_events()
             };
-
-            let (tx, mut rx_shutdown) = tokio::sync::oneshot::channel();
-            *shutdown.lock() = Some(tx);
 
             loop {
                 tokio::select! {
@@ -368,15 +372,18 @@ impl PyRithmicGateway {
                             Ok(event) => {
                                 Self::sync_pnl_state(&balances, &positions, &event);
                                 Python::attach(|py| {
-                                    match event {
+                                    let result = match event {
                                         PnlEvent::Account(ae) => {
                                             let py_event = PyAccountEvent::from(ae);
-                                            let _ = callback.call1(py, (py_event,));
+                                            callback.call1(py, (py_event,))
                                         }
                                         PnlEvent::Position(pe) => {
                                             let py_event = PyPositionEvent::from(pe);
-                                            let _ = callback.call1(py, (py_event,));
+                                            callback.call1(py, (py_event,))
                                         }
+                                    };
+                                    if let Err(e) = result {
+                                        tracing::error!("Error in Python PnL callback: {e}");
                                     }
                                 });
                             }
@@ -389,7 +396,6 @@ impl PyRithmicGateway {
                 }
             }
             *shutdown.lock() = None;
-            *task_slot.lock() = None;
         });
 
         *self.pnl_task.lock() = Some(handle);
@@ -506,6 +512,19 @@ impl PyRithmicGateway {
                 positions.write().remove(&key);
             }
             PnlEvent::Position(ProviderPositionEvent::Error(_)) => {}
+        }
+    }
+}
+
+#[cfg(feature = "python")]
+impl Drop for PyRithmicGateway {
+    fn drop(&mut self) {
+        if let Some(tx) = self.pnl_shutdown.lock().take() {
+            let _ = tx.send(());
+        }
+
+        if let Some(handle) = self.pnl_task.lock().take() {
+            handle.abort();
         }
     }
 }

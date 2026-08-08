@@ -2,6 +2,8 @@
 Tests for Rithmic instrument symbol/product helpers and the PyO3 provider.
 """
 
+import pytest
+
 from nautilus_trader.adapters.rithmic.providers import RITHMIC_VENUE
 from nautilus_trader.adapters.rithmic.providers import candidate_exchanges_for_symbol
 from nautilus_trader.adapters.rithmic.providers import front_month_products_for_exchange
@@ -18,7 +20,16 @@ class TestSymbolHelpers:
 
     def test_split_exchange_from_symbol(self):
         assert split_exchange_from_symbol("MNQM6.CME") == ("MNQM6", "CME")
+        assert split_exchange_from_symbol("mnqm6.cme") == ("MNQM6", "CME")
         assert split_exchange_from_symbol("MNQM6") == ("MNQM6", None)
+
+    @pytest.mark.parametrize(
+        "symbol",
+        ["MNQM6..CME", "MNQM6.CME.EXTRA", "MNQM6:CME:EXTRA", ".CME", "MNQM6.FOO"],
+    )
+    def test_split_exchange_from_symbol_rejects_malformed_components(self, symbol):
+        with pytest.raises(ValueError, match="Malformed"):
+            split_exchange_from_symbol(symbol)
 
     def test_supported_product_for_symbol(self):
         assert supported_product_for_symbol("MNQM6") == "MNQ"
@@ -30,7 +41,11 @@ class TestSymbolHelpers:
         assert "CME" in exchanges
 
         preferred = candidate_exchanges_for_symbol("MNQ", preferred_exchange="CME")
-        assert preferred[0] == "CME"
+        assert preferred == ("CME",)
+
+    def test_explicit_exchange_never_falls_back_to_another_exchange(self):
+        assert candidate_exchanges_for_symbol("MNQ", preferred_exchange="CBOT") == ()
+        assert candidate_exchanges_for_symbol("MNQ", preferred_exchange="FOO") == ()
 
     def test_front_month_products_for_exchange(self):
         products = front_month_products_for_exchange("CME")

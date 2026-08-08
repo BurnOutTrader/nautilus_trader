@@ -36,6 +36,7 @@ from nautilus_trader.adapters.rithmic.config import to_binding_environment
 from nautilus_trader.adapters.rithmic.constants import RITHMIC
 from nautilus_trader.adapters.rithmic.providers import candidate_exchanges_for_symbol
 from nautilus_trader.adapters.rithmic.providers import normalize_rithmic_symbol
+from nautilus_trader.adapters.rithmic.providers import split_exchange_from_symbol
 from nautilus_trader.adapters.rithmic.providers import supported_product_for_symbol
 from nautilus_trader.model import BarAggregation
 from nautilus_trader.model import BarType
@@ -176,14 +177,14 @@ async def resolve_front_month_instrument_id_async(
     contract_id = getattr(contract, "id", None)
 
     if contract_id is not None:
-        return canonical_rithmic_instrument_id(contract_id)
+        return canonical_rithmic_instrument_id(contract_id, candidate_exchange)
 
     symbol = getattr(contract, "symbol", None)
 
     if symbol is None:
         raise RuntimeError("Front-month lookup returned no symbol")
 
-    return InstrumentId.from_str(f"{symbol}.{RITHMIC}")
+    return InstrumentId.from_str(f"{symbol}.{candidate_exchange}.{RITHMIC}")
 
 
 def resolve_front_month_instrument_id(
@@ -204,13 +205,42 @@ def resolve_front_month_instrument_id(
     )
 
 
-def canonical_rithmic_instrument_id(instrument_id: str | InstrumentId) -> InstrumentId:
+def canonical_rithmic_instrument_id(
+    instrument_id: str | InstrumentId,
+    exchange: str | None = None,
+) -> InstrumentId:
+    """
+    Return an exchange-qualified live Rithmic ID when exchange metadata is available.
+
+    Legacy ``{contract}.RITHMIC`` input remains accepted for compatibility, but it
+    cannot be made canonical until an exchange is supplied or resolved by the live provider.
+    """
     resolved = (
         instrument_id
         if isinstance(instrument_id, InstrumentId)
         else InstrumentId.from_str(str(instrument_id))
     )
-    symbol = normalize_rithmic_symbol(resolved.symbol.value)
+    if resolved.venue.value.upper() != RITHMIC:
+        raise ValueError(f"Expected a Rithmic instrument ID, received {resolved}")
+
+    symbol, encoded_exchange = split_exchange_from_symbol(resolved.symbol.value)
+    requested_exchange = exchange.strip().upper() if exchange is not None else None
+    if requested_exchange == "":
+        raise ValueError("Rithmic exchange cannot be empty")
+    if (
+        requested_exchange is not None
+        and encoded_exchange is not None
+        and requested_exchange != encoded_exchange
+    ):
+        raise ValueError(
+            f"Rithmic exchange {requested_exchange!r} conflicts with encoded exchange "
+            f"{encoded_exchange!r} in {resolved}",
+        )
+    resolved_exchange = requested_exchange or encoded_exchange
+
+    if resolved_exchange:
+        return InstrumentId.from_str(f"{symbol}.{resolved_exchange}.{RITHMIC}")
+
     return InstrumentId.from_str(f"{symbol}.{RITHMIC}")
 
 
@@ -222,7 +252,7 @@ def resolve_download_instrument_id(
     exchange: str | None = None,
 ) -> InstrumentId:
     if instrument_id is not None:
-        resolved = canonical_rithmic_instrument_id(instrument_id)
+        resolved = canonical_rithmic_instrument_id(instrument_id, exchange)
 
         if resolved.venue.value != RITHMIC:
             raise ValueError(f"Expected a Rithmic instrument ID, received {resolved}")
@@ -233,14 +263,14 @@ def resolve_download_instrument_id(
         if product is not None and symbol.upper() == product:
             raise ValueError(
                 "Resolve the current front month first, then use the exact contract "
-                "instrument ID such as `MNQM6.RITHMIC`.",
+                "instrument ID such as `MNQM6.CME.RITHMIC`.",
             )
         return resolved
 
     if not product_code:
         raise ValueError(
             "Set `instrument_id` to a direct Rithmic instrument ID such as "
-            "`MNQM6.RITHMIC`, or provide `product_code` plus `exchange` "
+            "`MNQM6.CME.RITHMIC`, or provide `product_code` plus `exchange` "
             "to resolve the current front month.",
         )
 
@@ -280,19 +310,33 @@ async def _close_historical_session(session: _HistoricalSession) -> None:
     await session.gateway.disconnect()
 
 
-def _resolved_contract_metadata(instrument: Any) -> _ResolvedDownloadContract:
+def _resolved_contract_metadata(
+    instrument: Any,
+    exchange_hint: str | None = None,
+) -> _ResolvedDownloadContract:
     contract_id = getattr(instrument, "id", None)
 
     if contract_id is None:
         raise RuntimeError("Rithmic contract lookup returned no instrument ID")
 
-    instrument_id = canonical_rithmic_instrument_id(contract_id)
-    raw_symbol = getattr(getattr(instrument, "raw_symbol", None), "value", None)
-    symbol = raw_symbol or instrument_id.symbol.value
-    exchange = getattr(instrument, "exchange", None)
+    resolved_contract_id = (
+        contract_id
+        if isinstance(contract_id, InstrumentId)
+        else InstrumentId.from_str(str(contract_id))
+    )
+    _, encoded_exchange = split_exchange_from_symbol(resolved_contract_id.symbol.value)
+    info = getattr(instrument, "info", None)
+    info_exchange = info.get("exchange") if isinstance(info, dict) else None
+    exchange = (
+        exchange_hint or getattr(instrument, "exchange", None) or encoded_exchange or info_exchange
+    )
 
     if not isinstance(exchange, str) or not exchange:
-        raise RuntimeError(f"Missing exchange on Rithmic contract {instrument_id}")
+        raise RuntimeError(f"Missing exchange on Rithmic contract {contract_id}")
+
+    instrument_id = canonical_rithmic_instrument_id(resolved_contract_id, exchange)
+    raw_symbol = getattr(getattr(instrument, "raw_symbol", None), "value", None)
+    symbol = raw_symbol or normalize_rithmic_symbol(instrument_id.symbol.value)
 
     return _ResolvedDownloadContract(
         instrument=instrument,
@@ -316,19 +360,20 @@ async def _resolve_download_contract_async(
             product_code=None,
             exchange=exchange,
         )
-        symbol = normalize_rithmic_symbol(resolved_id.symbol.value)
-        target_exchange = exchange or ""
+        symbol, encoded_exchange = split_exchange_from_symbol(resolved_id.symbol.value)
+        target_exchange = exchange or encoded_exchange or ""
 
         instrument = await session.provider.load_instrument_async(symbol, target_exchange)
 
         if instrument is None:
             raise RuntimeError(f"Unable to load Rithmic instrument {resolved_id}")
 
-        return _resolved_contract_metadata(instrument)
+        return _resolved_contract_metadata(instrument, target_exchange)
 
     if not product_code:
         raise ValueError(
-            "Set `instrument_id` to a direct Rithmic instrument ID such as `MNQM6.RITHMIC`, "
+            "Set `instrument_id` to a direct Rithmic instrument ID such as "
+            "`MNQM6.CME.RITHMIC`, "
             "or provide `product_code` to resolve the current front month.",
         )
 
@@ -357,7 +402,7 @@ async def _resolve_download_contract_async(
     for candidate_exchange in exchange_candidates:
         try:
             instrument = await session.provider.load_front_month_async(product, candidate_exchange)
-            return _resolved_contract_metadata(instrument)
+            return _resolved_contract_metadata(instrument, candidate_exchange)
         except Exception as exc:
             last_error = exc
 
@@ -713,8 +758,18 @@ def resolve_catalog_instrument_id(
     product_code: str | None = None,
     exchange: str | None = None,
 ) -> InstrumentId:
+    """
+    Resolve an identifier already stored in a backtest catalog without rewriting it.
+
+    Catalogs may intentionally contain historical or synthetic identifier schemes. Live Rithmic
+    requests, by contrast, use exchange-qualified IDs such as ``MNQM6.CME.RITHMIC``.
+    """
     if instrument_id is not None:
-        return canonical_rithmic_instrument_id(instrument_id)
+        return (
+            instrument_id
+            if isinstance(instrument_id, InstrumentId)
+            else InstrumentId.from_str(str(instrument_id))
+        )
 
     instruments = catalog.instruments()
 
@@ -745,7 +800,8 @@ def resolve_catalog_instrument_id(
     raise RuntimeError(
         "Could not resolve a unique Rithmic instrument from the catalog. "
         "Set `RITHMIC_INSTRUMENT_ID` explicitly to a concrete Rithmic instrument ID "
-        "such as `MNQM6.RITHMIC` for the backtest run.",
+        "stored in that catalog (for live data the canonical form is "
+        "`MNQM6.CME.RITHMIC`).",
     )
 
 

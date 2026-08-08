@@ -10,19 +10,49 @@ import pytest
 from nautilus_trader.adapters.rithmic import RithmicDataClientConfig
 from nautilus_trader.adapters.rithmic import RithmicDataClientConfig as PackageDataClientConfig
 from nautilus_trader.adapters.rithmic import RithmicEnv
+from nautilus_trader.adapters.rithmic import RithmicEnvironment
 from nautilus_trader.adapters.rithmic import RithmicExecClientConfig
 from nautilus_trader.adapters.rithmic import RithmicExecClientConfig as PackageExecClientConfig
+from nautilus_trader.adapters.rithmic.config import get_rithmic_adapter_account_id
+from nautilus_trader.adapters.rithmic.config import get_rithmic_data_client_id
+from nautilus_trader.adapters.rithmic.config import get_rithmic_exec_client_id
 from nautilus_trader.adapters.rithmic.config import get_rithmic_profiles_from_env
+from nautilus_trader.adapters.rithmic.config import load_rithmic_env_file
+from nautilus_trader.adapters.rithmic.config import normalize_rithmic_client_component
 from nautilus_trader.adapters.rithmic.config import parse_rithmic_env
 
 
 def _assert_binding_environment(actual, expected) -> None:
-    assert repr(actual) == repr(expected)
+    assert actual == expected
 
 
 def test_public_generic_config_exports_are_binding_classes():
     assert PackageDataClientConfig is RithmicDataClientConfig
     assert PackageExecClientConfig is RithmicExecClientConfig
+
+
+def test_deprecated_environment_name_is_a_compatible_alias():
+    assert RithmicEnvironment is RithmicEnv
+    config = RithmicDataClientConfig(
+        environment=RithmicEnvironment.DEMO,
+        username="test_user",
+        password="test_pass",
+        system_name="test_system",
+        app_name="TestApp",
+    )
+    assert config.environment == RithmicEnv.DEMO
+
+
+def test_checked_identity_helpers_match_factory_ids():
+    assert get_rithmic_data_client_id("Rithmic Paper Trading") == "RITHMIC_PAPER_TRADING"
+    assert get_rithmic_exec_client_id("Apex", "PA-123456") == "APEX_PA_123456"
+    assert get_rithmic_adapter_account_id("Apex", "PA-123456") == "RITHMIC-APEX_PA_123456-PA-123456"
+
+
+def test_identity_normalization_is_ascii_only():
+    assert normalize_rithmic_client_component("ÅPEX") == "PEX"
+    with pytest.raises(ValueError, match="cannot be empty"):
+        normalize_rithmic_client_component("東京")
 
 
 class TestParseRithmicEnv:
@@ -54,13 +84,14 @@ class TestRithmicDataClientConfig:
             username="test_user",
             password="test_pass",
             system_name="test_system",
+            app_name="TestApp",
         )
 
         _assert_binding_environment(config.environment, RithmicEnv.DEMO)
         assert config.username == "test_user"
         assert config.password == "test_pass"
         assert config.system_name == "test_system"
-        assert config.app_name == ""
+        assert config.app_name == "TestApp"
         assert config.app_version == "1.0"
         assert config.fcm_id is None
         assert config.ib_id is None
@@ -117,6 +148,7 @@ class TestRithmicExecClientConfig:
             password="test_pass",
             system_name="test_system",
             account_id="ACCOUNT123",
+            app_name="TestApp",
         )
 
         _assert_binding_environment(config.environment, RithmicEnv.DEMO)
@@ -146,6 +178,34 @@ class TestRithmicExecClientConfig:
             assert config.alt_server == "Sydney"
             assert config.execution_replay_lookback_secs == 7200
 
+    def test_invalid_trader_id_returns_value_error(self):
+        with pytest.raises(ValueError, match="hyphen"):
+            RithmicExecClientConfig(
+                environment=RithmicEnv.DEMO,
+                username="test_user",
+                password="test_pass",
+                system_name="test_system",
+                account_id="ACCOUNT123",
+                app_name="TestApp",
+                trader_id="INVALID",
+            )
+
+    def test_from_env_accepts_account_and_trader_overrides_without_identity_env(self):
+        env_vars = {
+            "RITHMIC_USERNAME": "test_user",
+            "RITHMIC_PASSWORD": "test_pass",
+            "RITHMIC_SYSTEM_NAME": "test_system",
+            "RITHMIC_APP_NAME": "TestApp",
+        }
+        with patch.dict(os.environ, env_vars, clear=True):
+            config = RithmicExecClientConfig.from_env(
+                account_id="ACCOUNT123",
+                trader_id="TESTER-001",
+            )
+
+        assert config.account_id == "ACCOUNT123"
+        assert config.trader_id == "TESTER-001"
+
 
 def test_get_rithmic_profiles_from_env():
     env_vars = {
@@ -153,3 +213,13 @@ def test_get_rithmic_profiles_from_env():
     }
     with patch.dict(os.environ, env_vars, clear=True):
         assert get_rithmic_profiles_from_env() == ["Apex", "Paper", "paper-live"]
+
+
+def test_get_rithmic_profiles_from_adapter_dotenv_cache(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("RITHMIC_PROFILES=CachedOne,CachedTwo\n")
+
+    with patch.dict(os.environ, {}, clear=True):
+        assert load_rithmic_env_file(str(env_file)) == 1
+        assert "RITHMIC_PROFILES" not in os.environ
+        assert get_rithmic_profiles_from_env() == ["CachedOne", "CachedTwo"]

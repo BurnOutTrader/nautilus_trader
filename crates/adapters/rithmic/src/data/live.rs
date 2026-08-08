@@ -27,8 +27,9 @@
 use std::{
     collections::HashMap,
     fmt::Debug,
+    hash::{Hash, Hasher},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -38,7 +39,7 @@ use async_trait::async_trait;
 use futures_util::stream::{self, StreamExt};
 use nautilus_common::{
     clients::DataClient,
-    live::{get_runtime, runner::get_data_event_sender},
+    live::{get_runtime, runner::get_data_event_sender, task::TaskHandles},
     messages::{
         DataEvent,
         data::{
@@ -87,7 +88,7 @@ use crate::{
         VOLUME_AT_PRICE_TYPE_NAME,
         volume_profile::{RithmicMinuteVolumeProfileBar, VOLUME_PROFILE_TYPE_NAME},
     },
-    gateway::{GatewayConfig, RithmicGateway},
+    gateway::{GatewayConfig, InstrumentInfo, RithmicGateway},
     instruments::{
         discovery::enabled_exchange_names,
         front_month::load_supported_front_months_with_handle,
@@ -102,11 +103,19 @@ use crate::{
 const RITHMIC_VENUE: &str = "RITHMIC";
 const REQUEST_INSTRUMENTS_EXCHANGE_CONCURRENCY: usize = 4;
 const CONTRACT_EXCHANGE_RESOLUTION_TIMEOUT_SECS: u64 = 5;
+const EVENT_TASK_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 
-fn rithmic_timestamp_to_unix_nanos(ssboe: Option<i32>, usecs: Option<i32>) -> UnixNanos {
-    let secs = ssboe.unwrap_or_default().max(0) as u64;
-    let micros = usecs.unwrap_or_default().max(0) as u64;
-    UnixNanos::from(secs.saturating_mul(1_000_000_000) + micros.saturating_mul(1_000))
+fn rithmic_timestamp_to_unix_nanos(ssboe: Option<i32>, usecs: Option<i32>) -> Option<UnixNanos> {
+    let secs = u64::try_from(ssboe?).ok()?;
+    let micros = u64::try_from(usecs.unwrap_or_default()).ok()?;
+    if micros >= 1_000_000 {
+        return None;
+    }
+
+    Some(UnixNanos::from(
+        secs.checked_mul(1_000_000_000)?
+            .checked_add(micros.checked_mul(1_000)?)?,
+    ))
 }
 
 fn normalize_history_request_end(start_sec: i32, end_sec: i32, now_sec: i32) -> i32 {
@@ -117,18 +126,72 @@ fn normalize_history_request_end(start_sec: i32, end_sec: i32, now_sec: i32) -> 
     }
 }
 
-fn live_trade_id(tick: &crate::data::TradeTick) -> TradeId {
-    let trade_id = tick.trade_id.trim();
-    if !trade_id.is_empty() {
-        return TradeId::new(trade_id);
-    }
-
-    let symbol = tick.symbol.chars().take(8).collect::<String>();
-    TradeId::from(format!("live:{}:{symbol}", tick.ts_event).as_str())
+fn checked_price(value: f64, precision: u8, context: &str) -> Option<Price> {
+    Price::new_checked(value, precision)
+        .map_err(|e| log::warn!("Dropping {context} with invalid price {value}: {e}"))
+        .ok()
 }
 
-fn resolved_symbol_key(symbol: &str) -> String {
-    symbol.to_ascii_uppercase()
+fn checked_quantity(value: f64, precision: u8, context: &str) -> Option<Quantity> {
+    Quantity::new_checked(value, precision)
+        .map_err(|e| log::warn!("Dropping {context} with invalid quantity {value}: {e}"))
+        .ok()
+}
+
+fn checked_integer_quantity(value: u64, precision: u8, context: &str) -> Option<Quantity> {
+    Quantity::from_mantissa_exponent_checked(value, 0, precision)
+        .map_err(|e| log::warn!("Dropping {context} with invalid quantity {value}: {e}"))
+        .ok()
+}
+
+fn checked_instrument_precisions(
+    instrument: Option<&InstrumentInfo>,
+    key: &str,
+) -> anyhow::Result<(u8, u8)> {
+    let tick_size = instrument
+        .and_then(|info| info.tick_size)
+        .ok_or_else(|| anyhow::anyhow!("Instrument precision is not available for {key}"))?;
+    if !tick_size.is_finite() || tick_size <= 0.0 {
+        anyhow::bail!("Instrument tick size is invalid for {key}: {tick_size}");
+    }
+
+    let price_precision = tick_size_to_precision(tick_size)
+        .map_err(|e| anyhow::anyhow!("Instrument tick size is invalid for {key}: {e}"))?;
+    Price::new_checked(tick_size, price_precision)
+        .map_err(|e| anyhow::anyhow!("Instrument tick size is invalid for {key}: {e}"))?;
+    // Rithmic market-data quantities are integer contract counts.
+    Ok((price_precision, 0))
+}
+
+fn live_trade_id(tick: &crate::data::TradeTick) -> Option<TradeId> {
+    let trade_id = tick.trade_id.trim();
+    if !trade_id.is_empty() {
+        return TradeId::new_checked(trade_id)
+            .map_err(|e| log::warn!("Dropping trade with invalid venue trade ID: {e}"))
+            .ok();
+    }
+
+    // Rithmic can omit both exchange order IDs. Hash every available immutable
+    // trade field into a bounded deterministic fallback. Identical executions
+    // with identical fields and timestamps remain indistinguishable.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tick.exchange.hash(&mut hasher);
+    tick.symbol.hash(&mut hasher);
+    tick.ts_event.hash(&mut hasher);
+    tick.price.to_bits().hash(&mut hasher);
+    tick.size.to_bits().hash(&mut hasher);
+    let fallback = format!("R{:016x}{:016x}", tick.ts_event, hasher.finish());
+    TradeId::new_checked(fallback)
+        .map_err(|e| log::warn!("Dropping trade with invalid fallback trade ID: {e}"))
+        .ok()
+}
+
+fn resolved_contract_key(symbol: &str, exchange: &str) -> String {
+    format!(
+        "{}:{}",
+        exchange.trim().to_ascii_uppercase(),
+        symbol.trim().to_ascii_uppercase()
+    )
 }
 
 fn cache_resolved_exchange(
@@ -136,19 +199,38 @@ fn cache_resolved_exchange(
     symbol: &str,
     exchange: &str,
 ) {
-    resolved_exchanges
-        .write()
-        .insert(resolved_symbol_key(symbol), exchange.to_string());
+    resolved_exchanges.write().insert(
+        resolved_contract_key(symbol, exchange),
+        exchange.trim().to_ascii_uppercase(),
+    );
 }
 
 fn get_cached_exchange(
     resolved_exchanges: &Arc<ParkingRwLock<AHashMap<String, String>>>,
     symbol: &str,
 ) -> Option<String> {
-    resolved_exchanges
-        .read()
-        .get(&resolved_symbol_key(symbol))
-        .cloned()
+    let symbol_suffix = format!(":{}", symbol.trim().to_ascii_uppercase());
+    let resolved = resolved_exchanges.read();
+    let mut matches = resolved
+        .iter()
+        .filter(|(key, _)| key.ends_with(&symbol_suffix))
+        .map(|(_, exchange)| exchange.clone());
+    let first = matches.next()?;
+    matches.all(|exchange| exchange == first).then_some(first)
+}
+
+fn select_unique_resolved_exchange(
+    instrument_id: &InstrumentId,
+    matches: &[String],
+) -> anyhow::Result<String> {
+    match matches {
+        [exchange] => Ok(exchange.clone()),
+        [] => anyhow::bail!("Unable to resolve exchange for Rithmic contract {instrument_id}"),
+        _ => anyhow::bail!(
+            "Ambiguous exchange for Rithmic contract {instrument_id}; matched {}",
+            matches.join(", ")
+        ),
+    }
 }
 
 pub(crate) async fn resolve_contract_exchange(
@@ -159,6 +241,8 @@ pub(crate) async fn resolve_contract_exchange(
     let (symbol, explicit_exchange) = parse_rithmic_instrument(instrument_id);
 
     if !explicit_exchange.is_empty() {
+        crate::common::converters::rithmic_instrument_id(&symbol, &explicit_exchange)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         cache_resolved_exchange(resolved_exchanges, &symbol, &explicit_exchange);
         return Ok((symbol, explicit_exchange));
     }
@@ -176,9 +260,12 @@ pub(crate) async fn resolve_contract_exchange(
         );
     }
 
-    let exchange_candidates = candidate_exchanges_for_symbol(&symbol, None);
+    let exchange_candidates = candidate_exchanges_for_symbol(&symbol, None)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     if exchange_candidates.len() == 1 {
-        let exchange = exchange_candidates[0].to_string();
+        let exchange = exchange_candidates[0].clone();
         cache_resolved_exchange(resolved_exchanges, &symbol, &exchange);
         return Ok((symbol, exchange));
     }
@@ -190,29 +277,33 @@ pub(crate) async fn resolve_contract_exchange(
         })?
     };
 
-    for candidate_exchange in exchange_candidates {
-        let response = timeout(
-            std::time::Duration::from_secs(CONTRACT_EXCHANGE_RESOLUTION_TIMEOUT_SECS),
-            ticker.get_reference_data(&symbol, candidate_exchange),
-        )
-        .await;
-
-        let Ok(Ok(response)) = response else {
-            continue;
-        };
-
-        if response.error.is_some() {
-            continue;
-        }
-
-        if matches!(response.message, RithmicMessage::ResponseReferenceData(_)) {
-            let exchange = candidate_exchange.to_string();
-            cache_resolved_exchange(resolved_exchanges, &symbol, &exchange);
-            return Ok((symbol, exchange));
-        }
-    }
-
-    anyhow::bail!("Unable to resolve exchange for Rithmic contract {instrument_id}")
+    let matches = stream::iter(exchange_candidates)
+        .map(|candidate_exchange| {
+            let ticker = ticker.clone();
+            let symbol = symbol.clone();
+            async move {
+                let response = timeout(
+                    std::time::Duration::from_secs(CONTRACT_EXCHANGE_RESOLUTION_TIMEOUT_SECS),
+                    ticker.get_reference_data(&symbol, &candidate_exchange),
+                )
+                .await;
+                let Ok(Ok(response)) = response else {
+                    return None;
+                };
+                (response.error.is_none()
+                    && matches!(response.message, RithmicMessage::ResponseReferenceData(_)))
+                .then_some(candidate_exchange)
+            }
+        })
+        .buffer_unordered(REQUEST_INSTRUMENTS_EXCHANGE_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let exchange = select_unique_resolved_exchange(instrument_id, &matches)?;
+    cache_resolved_exchange(resolved_exchanges, &symbol, &exchange);
+    Ok((symbol, exchange))
 }
 
 fn request_instruments_tradeable_only(params: &Option<Params>) -> bool {
@@ -304,13 +395,8 @@ async fn request_instruments_exchange_scope(
 }
 
 fn time_bar_marker_to_unix_nanos(marker: Option<i32>) -> Option<UnixNanos> {
-    marker.and_then(|value| {
-        if value > 0 {
-            Some(UnixNanos::from(value as u64 * 1_000_000_000))
-        } else {
-            None
-        }
-    })
+    let seconds = u64::try_from(marker.filter(|value| *value > 0)?).ok()?;
+    seconds.checked_mul(1_000_000_000).map(UnixNanos::from)
 }
 
 fn historical_time_bar_to_bar(
@@ -324,30 +410,34 @@ fn historical_time_bar_to_bar(
         RithmicMessage::ResponseTimeBarReplay(bar) => {
             let ts_event = time_bar_marker_to_unix_nanos(bar.marker)?;
 
-            Some(Bar::new(
+            Bar::new_checked(
                 bar_type,
-                Price::new(bar.open_price.unwrap_or(0.0), price_prec),
-                Price::new(bar.high_price.unwrap_or(0.0), price_prec),
-                Price::new(bar.low_price.unwrap_or(0.0), price_prec),
-                Price::new(bar.close_price.unwrap_or(0.0), price_prec),
-                Quantity::new(bar.volume.unwrap_or(0) as f64, size_prec),
+                checked_price(bar.open_price?, price_prec, "historical time bar")?,
+                checked_price(bar.high_price?, price_prec, "historical time bar")?,
+                checked_price(bar.low_price?, price_prec, "historical time bar")?,
+                checked_price(bar.close_price?, price_prec, "historical time bar")?,
+                checked_integer_quantity(bar.volume?, size_prec, "historical time bar")?,
                 ts_event,
                 ts_init,
-            ))
+            )
+            .map_err(|e| log::warn!("Dropping invalid historical time bar: {e}"))
+            .ok()
         }
         RithmicMessage::TimeBar(bar) => {
             let ts_event = time_bar_marker_to_unix_nanos(bar.marker)?;
 
-            Some(Bar::new(
+            Bar::new_checked(
                 bar_type,
-                Price::new(bar.open_price.unwrap_or(0.0), price_prec),
-                Price::new(bar.high_price.unwrap_or(0.0), price_prec),
-                Price::new(bar.low_price.unwrap_or(0.0), price_prec),
-                Price::new(bar.close_price.unwrap_or(0.0), price_prec),
-                Quantity::new(bar.volume.unwrap_or(0) as f64, size_prec),
+                checked_price(bar.open_price?, price_prec, "live time bar")?,
+                checked_price(bar.high_price?, price_prec, "live time bar")?,
+                checked_price(bar.low_price?, price_prec, "live time bar")?,
+                checked_price(bar.close_price?, price_prec, "live time bar")?,
+                checked_integer_quantity(bar.volume?, size_prec, "live time bar")?,
                 ts_event,
                 ts_init,
-            ))
+            )
+            .map_err(|e| log::warn!("Dropping invalid live time bar: {e}"))
+            .ok()
         }
         _ => None,
     }
@@ -373,44 +463,170 @@ fn historical_tick_bar_to_trade(
     let ts_event = rithmic_timestamp_to_unix_nanos(
         bar.data_bar_ssboe.last().copied(),
         bar.data_bar_usecs.last().copied(),
-    );
-    if ts_event.as_u64() == 0 {
+    )?;
+    let price = bar.close_price?;
+
+    let sequence = u64::try_from(sequence).ok()?;
+    let trade_id =
+        TradeId::new_checked(format!("R{:016x}{:016x}", ts_event.as_u64(), sequence)).ok()?;
+    TradeTick::new_checked(
+        instrument_id,
+        checked_price(price, price_prec, "historical tick bar")?,
+        checked_integer_quantity(bar.volume?, size_prec, "historical tick bar")?,
+        AggressorSide::NoAggressor,
+        trade_id,
+        ts_event,
+        ts_event,
+    )
+    .map_err(|e| log::warn!("Dropping invalid historical tick bar trade: {e}"))
+    .ok()
+}
+
+fn historical_tick_bar_to_bar(
+    response: &rithmic_rs::rti::ResponseTickBarReplay,
+    bar_type: BarType,
+    expected_period: u32,
+    price_precision: u8,
+    size_precision: u8,
+    ts_init: UnixNanos,
+) -> Option<Bar> {
+    let period = response
+        .type_specifier
+        .as_deref()
+        .and_then(|value| value.parse::<u32>().ok())?;
+    if period != expected_period {
         return None;
     }
-    let price = bar
-        .close_price
-        .or(bar.open_price)
-        .or(bar.high_price)
-        .or(bar.low_price)
-        .unwrap_or(0.0);
+    let ts_event = rithmic_timestamp_to_unix_nanos(
+        response.data_bar_ssboe.first().copied(),
+        response.data_bar_usecs.first().copied(),
+    )?;
 
-    Some(TradeTick::new(
+    Bar::new_checked(
+        bar_type,
+        checked_price(response.open_price?, price_precision, "historical tick bar")?,
+        checked_price(response.high_price?, price_precision, "historical tick bar")?,
+        checked_price(response.low_price?, price_precision, "historical tick bar")?,
+        checked_price(
+            response.close_price?,
+            price_precision,
+            "historical tick bar",
+        )?,
+        checked_integer_quantity(response.volume?, size_precision, "historical tick bar")?,
+        ts_event,
+        ts_init,
+    )
+    .map_err(|e| log::warn!("Dropping invalid historical tick bar: {e}"))
+    .ok()
+}
+
+fn volume_profile_bar_from_response(
+    response: &rithmic_rs::rti::ResponseVolumeProfileMinuteBars,
+    instrument_id: InstrumentId,
+    ts_init: UnixNanos,
+) -> Option<RithmicMinuteVolumeProfileBar> {
+    let ts_event = time_bar_marker_to_unix_nanos(response.marker)?;
+    let open_price = response.open_price.filter(|value| value.is_finite())?;
+    let high_price = response.high_price.filter(|value| value.is_finite())?;
+    let low_price = response.low_price.filter(|value| value.is_finite())?;
+    let close_price = response.close_price.filter(|value| value.is_finite())?;
+    let volume = response.volume?;
+    let bid_volume = response.bid_volume?;
+    let ask_volume = response.ask_volume?;
+    let num_trades = response.num_trades?;
+    if response.profile_price.len() != response.profile_bid_volume.len()
+        || response.profile_price.len() != response.profile_ask_volume.len()
+        || response
+            .profile_price
+            .iter()
+            .any(|price| !price.is_finite())
+        || response.profile_bid_volume.iter().any(|volume| *volume < 0)
+        || response.profile_ask_volume.iter().any(|volume| *volume < 0)
+    {
+        return None;
+    }
+
+    let poc_price = response
+        .profile_price
+        .iter()
+        .zip(
+            response
+                .profile_bid_volume
+                .iter()
+                .zip(response.profile_ask_volume.iter()),
+        )
+        .max_by_key(|(_, (bid, ask))| i64::from(**bid) + i64::from(**ask))
+        .map(|(price, _)| *price);
+
+    Some(RithmicMinuteVolumeProfileBar {
         instrument_id,
-        Price::new(price, price_prec),
-        Quantity::new(bar.volume.unwrap_or(0) as f64, size_prec),
-        AggressorSide::NoAggressor,
-        TradeId::from(format!("replay:{}:{sequence}", ts_event.as_u64()).as_str()),
+        open_price,
+        high_price,
+        low_price,
+        close_price,
+        volume,
+        bid_volume,
+        ask_volume,
+        num_trades,
+        poc_price,
+        profile_price: response.profile_price.clone(),
+        profile_bid_volume: response.profile_bid_volume.clone(),
+        profile_ask_volume: response.profile_ask_volume.clone(),
         ts_event,
-        ts_event,
-    ))
+        ts_init,
+    })
+}
+
+fn append_volume_at_price_response(
+    response: &rithmic_rs::rti::ResponseGetVolumeAtPrice,
+    trade_prices: &mut Vec<f64>,
+    volumes: &mut Vec<i32>,
+) -> anyhow::Result<Option<UnixNanos>> {
+    if response.trade_price.len() != response.volume_at_price.len()
+        || response
+            .trade_price
+            .iter()
+            .any(|price| !price.is_finite() || *price <= 0.0)
+        || response.volume_at_price.iter().any(|volume| *volume < 0)
+    {
+        anyhow::bail!("Malformed VolumeAtPrice response");
+    }
+    if response.trade_price.is_empty() {
+        return Ok(None);
+    }
+    let timestamp = rithmic_timestamp_to_unix_nanos(response.ssboe, response.usecs)
+        .ok_or_else(|| anyhow::anyhow!("VolumeAtPrice response has no valid venue timestamp"))?;
+    trade_prices.extend_from_slice(&response.trade_price);
+    volumes.extend_from_slice(&response.volume_at_price);
+    Ok(Some(timestamp))
 }
 
 /// Converts a Rithmic `InstrumentId` string back to Nautilus format.
 ///
-/// `"ESH5"`, `"CME"` → `InstrumentId { symbol: "ESH5", venue: "RITHMIC" }`
-fn make_instrument_id(symbol: &str, _exchange: &str) -> InstrumentId {
-    crate::common::converters::rithmic_instrument_id(symbol)
+/// `"ESH5"`, `"CME"` → `InstrumentId { symbol: "ESH5.CME", venue: "RITHMIC" }`
+fn make_instrument_id(symbol: &str, exchange: &str) -> Option<InstrumentId> {
+    match crate::common::converters::rithmic_instrument_id(symbol, exchange) {
+        Ok(instrument_id) => Some(instrument_id),
+        Err(e) => {
+            log::warn!("Dropping invalid Rithmic instrument identity {symbol:?}/{exchange:?}: {e}");
+            None
+        }
+    }
 }
 
 /// Parses a Nautilus `InstrumentId` into `(symbol, exchange)` for Rithmic.
 ///
-/// - `ESH5.RITHMIC`     → `("ESH5", "")`
-/// - `ESH5.RITHMIC` → `("ESH5", "CME")`
+/// - `ESH5.RITHMIC`     → `("ESH5", "")` (legacy input alias)
+/// - `ESH5.CME.RITHMIC` → `("ESH5", "CME")`
 pub(crate) fn parse_rithmic_instrument(instrument_id: &InstrumentId) -> (String, String) {
     let symbol_str = instrument_id.symbol.as_str();
     let mut parts = symbol_str.splitn(2, '.');
-    let symbol = parts.next().unwrap_or(symbol_str).to_string();
-    let exchange = parts.next().unwrap_or("").to_string();
+    let symbol = parts
+        .next()
+        .unwrap_or(symbol_str)
+        .trim()
+        .to_ascii_uppercase();
+    let exchange = parts.next().unwrap_or("").trim().to_ascii_uppercase();
     (symbol, exchange)
 }
 
@@ -481,7 +697,7 @@ impl BookSubscriptionView for Arc<RithmicDataClient> {
 }
 
 fn convert_book_delta_event(d: &crate::data::BookDelta) -> Option<OrderBookDelta> {
-    let instrument_id = make_instrument_id(&d.symbol, &d.exchange);
+    let instrument_id = make_instrument_id(&d.symbol, &d.exchange)?;
     let action = match d.action.as_str() {
         "ADD" => BookAction::Add,
         "UPDATE" => BookAction::Update,
@@ -501,20 +717,10 @@ fn convert_book_delta_event(d: &crate::data::BookDelta) -> Option<OrderBookDelta
         "SELL" => OrderSide::Sell,
         _ => return None,
     };
-    let price_prec = if d.price_precision > 0 {
-        d.price_precision
-    } else {
-        2
-    };
-    let size_prec = if d.size_precision > 0 {
-        d.size_precision
-    } else {
-        0
-    };
     let order = BookOrder::new(
         side,
-        Price::new(d.price, price_prec),
-        Quantity::new(d.size, size_prec),
+        checked_price(d.price, d.price_precision, "order-book delta")?,
+        checked_quantity(d.size, d.size_precision, "order-book delta")?,
         d.order_id,
     );
     OrderBookDelta::new_checked(
@@ -551,22 +757,18 @@ pub(crate) fn depth10_from_order_book(
     let mut ask_counts = [0_u32; 10];
 
     for (i, level) in book.bids(Some(10)).enumerate() {
-        bids[i] = BookOrder::new(
-            OrderSide::Buy,
-            level.price.value,
-            Quantity::new(level.size(), 0),
-            0,
-        );
+        let Some(size) = checked_quantity(level.size(), 0, "aggregated bid level") else {
+            continue;
+        };
+        bids[i] = BookOrder::new(OrderSide::Buy, level.price.value, size, 0);
         bid_counts[i] = level.len() as u32;
     }
 
     for (i, level) in book.asks(Some(10)).enumerate() {
-        asks[i] = BookOrder::new(
-            OrderSide::Sell,
-            level.price.value,
-            Quantity::new(level.size(), 0),
-            0,
-        );
+        let Some(size) = checked_quantity(level.size(), 0, "aggregated ask level") else {
+            continue;
+        };
+        asks[i] = BookOrder::new(OrderSide::Sell, level.price.value, size, 0);
         ask_counts[i] = level.len() as u32;
     }
 
@@ -589,7 +791,13 @@ pub(crate) fn order_book_from_snapshot(
     price_precision: u8,
     size_precision: u8,
     ts_init: UnixNanos,
-) -> OrderBook {
+) -> anyhow::Result<OrderBook> {
+    if let Some(e) = responses
+        .iter()
+        .find_map(|response| response.error.as_ref())
+    {
+        anyhow::bail!("Order book snapshot response error: {e}");
+    }
     let snapshot_rows: Vec<&rithmic_rs::rti::ResponseDepthByOrderSnapshot> = responses
         .iter()
         .filter_map(|response| match &response.message {
@@ -613,19 +821,49 @@ fn order_book_from_snapshot_rows(
     price_precision: u8,
     size_precision: u8,
     ts_init: UnixNanos,
-) -> OrderBook {
+) -> anyhow::Result<OrderBook> {
     use rithmic_rs::rti::response_depth_by_order_snapshot::TransactionType;
 
     let mut book = OrderBook::new(instrument_id, BookType::L3_MBO);
     let mut saw_snapshot = false;
 
+    if snapshot_rows.is_empty() {
+        anyhow::bail!("Order book snapshot contained no snapshot rows");
+    }
+
     for snapshot in snapshot_rows {
-        let sequence = snapshot.sequence_number.unwrap_or(0);
+        let symbol = snapshot
+            .symbol
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Order book snapshot row is missing symbol"))?;
+        let exchange = snapshot
+            .exchange
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Order book snapshot row is missing exchange"))?;
+        let row_instrument = crate::common::converters::rithmic_instrument_id(symbol, exchange)
+            .map_err(|e| anyhow::anyhow!("Invalid snapshot instrument identity: {e}"))?;
+        if row_instrument != instrument_id {
+            anyhow::bail!(
+                "Order book snapshot row identity {row_instrument} does not match {instrument_id}"
+            );
+        }
+        let sequence = snapshot
+            .sequence_number
+            .ok_or_else(|| anyhow::anyhow!("Order book snapshot row is missing sequence"))?;
         let ts_event = ts_init;
 
-        if !saw_snapshot {
-            book.clear(sequence, ts_event);
-            saw_snapshot = true;
+        // Rithmic snapshot rows have no venue timestamp. Receipt/init time is
+        // therefore the only protocol-available event-time anchor.
+        if snapshot.depth_order_priority.is_empty()
+            && snapshot.depth_size.is_empty()
+            && snapshot.depth_side.is_none()
+            && snapshot.depth_price.is_none()
+        {
+            if !saw_snapshot {
+                book.clear(sequence, ts_event);
+                saw_snapshot = true;
+            }
+            continue;
         }
 
         let side = match snapshot
@@ -634,27 +872,45 @@ fn order_book_from_snapshot_rows(
         {
             Some(TransactionType::Buy) => OrderSide::Buy,
             Some(TransactionType::Sell) => OrderSide::Sell,
-            None => continue,
+            None => anyhow::bail!("Order book snapshot row has invalid side"),
         };
-        let price = snapshot.depth_price.unwrap_or_default();
+        let Some(price) = snapshot
+            .depth_price
+            .and_then(|value| checked_price(value, price_precision, "order-book snapshot"))
+        else {
+            anyhow::bail!("Order book snapshot row has invalid price");
+        };
+        if snapshot.depth_order_priority.len() != snapshot.depth_size.len() {
+            anyhow::bail!("Order book snapshot row has misaligned order vectors");
+        }
+
+        if !saw_snapshot {
+            book.clear(sequence, ts_event);
+            saw_snapshot = true;
+        }
 
         for (i, depth_order_priority) in snapshot.depth_order_priority.iter().enumerate() {
-            let size = snapshot.depth_size.get(i).copied().unwrap_or_default();
+            let size = snapshot.depth_size[i];
 
-            if size <= 0 {
+            if size < 0 {
+                anyhow::bail!("Order book snapshot row has negative order size");
+            }
+            if size == 0 {
                 continue;
             }
             let order_id = rithmic_depth_order_id(
                 snapshot.exchange_order_id.get(i).map(String::as_str),
                 *depth_order_priority,
             );
+            let Some(quantity) = checked_integer_quantity(
+                size.cast_unsigned().into(),
+                size_precision,
+                "order-book snapshot",
+            ) else {
+                anyhow::bail!("Order book snapshot row has invalid order size");
+            };
             book.add(
-                BookOrder::new(
-                    side,
-                    Price::new(price, price_precision),
-                    Quantity::new(size as f64, size_precision),
-                    order_id,
-                ),
+                BookOrder::new(side, price, quantity, order_id),
                 RecordFlag::F_SNAPSHOT as u8,
                 sequence,
                 ts_event,
@@ -662,7 +918,10 @@ fn order_book_from_snapshot_rows(
         }
     }
 
-    book
+    if !saw_snapshot {
+        anyhow::bail!("Order book snapshot contained no valid rows");
+    }
+    Ok(book)
 }
 
 fn custom_data_to_nautilus(custom: RithmicCustomData) -> Data {
@@ -730,7 +989,9 @@ fn process_market_data_event(
 
     match event {
         MarketDataEvent::Quote(q) => {
-            let instrument_id = make_instrument_id(&q.symbol, &q.exchange);
+            let Some(instrument_id) = make_instrument_id(&q.symbol, &q.exchange) else {
+                return Vec::new();
+            };
             let price_prec = if q.price_precision > 0 {
                 q.price_precision
             } else {
@@ -741,18 +1002,37 @@ fn process_market_data_event(
             } else {
                 0
             };
-            vec![DataEvent::Data(Data::Quote(QuoteTick {
+            let quote = QuoteTick::new_checked(
                 instrument_id,
-                bid_price: Price::new(q.bid_price, price_prec),
-                ask_price: Price::new(q.ask_price, price_prec),
-                bid_size: Quantity::new(q.bid_size, size_prec),
-                ask_size: Quantity::new(q.ask_size, size_prec),
-                ts_event: q.ts_event.into(),
-                ts_init: q.ts_init.into(),
-            }))]
+                match checked_price(q.bid_price, price_prec, "quote") {
+                    Some(value) => value,
+                    None => return Vec::new(),
+                },
+                match checked_price(q.ask_price, price_prec, "quote") {
+                    Some(value) => value,
+                    None => return Vec::new(),
+                },
+                match checked_quantity(q.bid_size, size_prec, "quote") {
+                    Some(value) => value,
+                    None => return Vec::new(),
+                },
+                match checked_quantity(q.ask_size, size_prec, "quote") {
+                    Some(value) => value,
+                    None => return Vec::new(),
+                },
+                q.ts_event.into(),
+                q.ts_init.into(),
+            )
+            .map_err(|e| log::warn!("Dropping invalid Rithmic quote: {e}"));
+            match quote {
+                Ok(quote) => vec![DataEvent::Data(Data::Quote(quote))],
+                Err(()) => Vec::new(),
+            }
         }
         MarketDataEvent::Trade(t) => {
-            let instrument_id = make_instrument_id(&t.symbol, &t.exchange);
+            let Some(instrument_id) = make_instrument_id(&t.symbol, &t.exchange) else {
+                return Vec::new();
+            };
             let price_prec = if t.price_precision > 0 {
                 t.price_precision
             } else {
@@ -763,15 +1043,29 @@ fn process_market_data_event(
             } else {
                 0
             };
-            vec![DataEvent::Data(Data::Trade(TradeTick {
+            let Some(trade_id) = live_trade_id(&t) else {
+                return Vec::new();
+            };
+            let trade = TradeTick::new_checked(
                 instrument_id,
-                price: Price::new(t.price, price_prec),
-                size: Quantity::new(t.size, size_prec),
-                aggressor_side: convert_trade_aggressor(&t.aggressor_side),
-                trade_id: live_trade_id(&t),
-                ts_event: t.ts_event.into(),
-                ts_init: t.ts_init.into(),
-            }))]
+                match checked_price(t.price, price_prec, "trade") {
+                    Some(value) => value,
+                    None => return Vec::new(),
+                },
+                match checked_quantity(t.size, size_prec, "trade") {
+                    Some(value) => value,
+                    None => return Vec::new(),
+                },
+                convert_trade_aggressor(&t.aggressor_side),
+                trade_id,
+                t.ts_event.into(),
+                t.ts_init.into(),
+            )
+            .map_err(|e| log::warn!("Dropping invalid Rithmic trade: {e}"));
+            match trade {
+                Ok(trade) => vec![DataEvent::Data(Data::Trade(trade))],
+                Err(()) => Vec::new(),
+            }
         }
         MarketDataEvent::Bar(b) => {
             let key = format!(
@@ -798,16 +1092,36 @@ fn process_market_data_event(
             } else {
                 0
             };
-            vec![DataEvent::Data(Data::Bar(Bar::new(
+            let bar = Bar::new_checked(
                 bar_type,
-                Price::new(b.open_price, price_prec),
-                Price::new(b.high_price, price_prec),
-                Price::new(b.low_price, price_prec),
-                Price::new(b.close_price, price_prec),
-                Quantity::new(b.volume, size_prec),
+                match checked_price(b.open_price, price_prec, "live bar") {
+                    Some(value) => value,
+                    None => return Vec::new(),
+                },
+                match checked_price(b.high_price, price_prec, "live bar") {
+                    Some(value) => value,
+                    None => return Vec::new(),
+                },
+                match checked_price(b.low_price, price_prec, "live bar") {
+                    Some(value) => value,
+                    None => return Vec::new(),
+                },
+                match checked_price(b.close_price, price_prec, "live bar") {
+                    Some(value) => value,
+                    None => return Vec::new(),
+                },
+                match checked_quantity(b.volume, size_prec, "live bar") {
+                    Some(value) => value,
+                    None => return Vec::new(),
+                },
                 b.ts_event.into(),
                 now,
-            )))]
+            )
+            .map_err(|e| log::warn!("Dropping invalid Rithmic bar: {e}"));
+            match bar {
+                Ok(bar) => vec![DataEvent::Data(Data::Bar(bar))],
+                Err(()) => Vec::new(),
+            }
         }
         MarketDataEvent::BookDelta(d) => {
             let mut output = Vec::new();
@@ -816,7 +1130,9 @@ fn process_market_data_event(
             let Some(delta) = convert_book_delta_event(&d) else {
                 return output;
             };
-            let instrument_id = make_instrument_id(&d.symbol, &d.exchange);
+            let Some(instrument_id) = make_instrument_id(&d.symbol, &d.exchange) else {
+                return output;
+            };
 
             if wants_deltas {
                 let batch = order_book_delta_batches.entry(instrument_id).or_default();
@@ -880,7 +1196,7 @@ pub struct RithmicLiveDataClient {
     event_task: Option<JoinHandle<()>>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     is_connected: Arc<AtomicBool>,
-    pending_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    pending_tasks: TaskHandles,
     resolved_exchanges: Arc<ParkingRwLock<AHashMap<String, String>>>,
 }
 
@@ -888,7 +1204,7 @@ impl Debug for RithmicLiveDataClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(RithmicLiveDataClient))
             .field("client_id", &self.client_id)
-            .field("is_connected", &self.is_connected.load(Ordering::Relaxed))
+            .field("is_connected", &self.is_connected.load(Ordering::Acquire))
             .finish()
     }
 }
@@ -910,7 +1226,7 @@ impl RithmicLiveDataClient {
             event_task: None,
             shutdown_tx: None,
             is_connected: Arc::new(AtomicBool::new(false)),
-            pending_tasks: Arc::new(Mutex::new(Vec::new())),
+            pending_tasks: TaskHandles::default(),
             resolved_exchanges: Arc::new(ParkingRwLock::new(AHashMap::new())),
         }
     }
@@ -939,27 +1255,72 @@ impl RithmicLiveDataClient {
                 log::warn!("{context}: {e:?}");
             }
         });
-        let mut tasks = self
-            .pending_tasks
-            .lock()
-            .expect("pending_tasks mutex poisoned");
-        tasks.retain(|h| !h.is_finished());
-        tasks.push(handle);
+        self.pending_tasks.push(handle);
+    }
+
+    fn signal_event_shutdown(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+
+    fn abort_tasks(&mut self) {
+        self.signal_event_shutdown();
+        if let Some(task) = self.event_task.take() {
+            task.abort();
+        }
+        self.pending_tasks.abort_all();
+    }
+
+    async fn shutdown_tasks(&mut self) {
+        self.signal_event_shutdown();
+
+        let pending = self.pending_tasks.take_all();
+        for task in &pending {
+            task.abort();
+        }
+        for task in pending {
+            let _ = task.await;
+        }
+
+        let Some(mut event_task) = self.event_task.take() else {
+            return;
+        };
+        if timeout(
+            std::time::Duration::from_secs(EVENT_TASK_SHUTDOWN_TIMEOUT_SECS),
+            &mut event_task,
+        )
+        .await
+        .is_err()
+        {
+            log::warn!("Timed out waiting for Rithmic data event loop shutdown; aborting task");
+            event_task.abort();
+            let _ = event_task.await;
+        }
+    }
+
+    fn clear_local_state(&mut self) {
+        self.inner = None;
+        self.data_sender = None;
+        self.bar_type_map.write().clear();
+        self.resolved_exchanges.write().clear();
+        self.is_connected.store(false, Ordering::Release);
     }
 
     /// Builds a `GatewayConfig` for the data client (ticker plant only).
-    fn gateway_config(&self) -> GatewayConfig {
+    fn gateway_config(&self) -> anyhow::Result<GatewayConfig> {
         let c = &self.config;
         let mut cfg = GatewayConfig::new(
             c.environment,
             c.username.as_str(),
             c.password.as_str(),
             c.system_name.as_str(),
+            c.app_name.as_str(),
             c.fcm_id.as_deref().unwrap_or(""),
             c.ib_id.as_deref().unwrap_or(""),
             "", // data client has no account_id
-        );
-        cfg.app_name = c.app_name.clone();
+        )
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         cfg.app_version = c.app_version.clone();
         cfg.server = c.server.clone();
         cfg.alt_server = c.alt_server.clone();
@@ -967,7 +1328,7 @@ impl RithmicLiveDataClient {
         cfg.enable_order = false;
         cfg.enable_pnl = false;
         cfg.enable_history = c.enable_history;
-        cfg
+        Ok(cfg)
     }
 }
 
@@ -988,28 +1349,15 @@ impl DataClient for RithmicLiveDataClient {
 
     fn stop(&mut self) -> anyhow::Result<()> {
         log::info!("Stopping: client_id={}", self.client_id);
-
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-
-        if let Some(task) = self.event_task.take() {
-            task.abort();
-        }
-        self.is_connected.store(false, Ordering::Relaxed);
-        self.resolved_exchanges.write().clear();
+        self.abort_tasks();
+        self.gateway = None;
+        self.clear_local_state();
         Ok(())
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
         log::debug!("Resetting: client_id={}", self.client_id);
-        self.inner = None;
-        self.gateway = None;
-        self.event_task = None;
-        self.shutdown_tx = None;
-        self.is_connected.store(false, Ordering::Relaxed);
-        self.resolved_exchanges.write().clear();
-        Ok(())
+        self.stop()
     }
 
     fn dispose(&mut self) -> anyhow::Result<()> {
@@ -1018,7 +1366,7 @@ impl DataClient for RithmicLiveDataClient {
     }
 
     fn is_connected(&self) -> bool {
-        self.is_connected.load(Ordering::Relaxed)
+        self.is_connected.load(Ordering::Acquire)
     }
 
     fn is_disconnected(&self) -> bool {
@@ -1026,22 +1374,32 @@ impl DataClient for RithmicLiveDataClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
+        self.config.validate()?;
         if self.is_connected() {
             return Ok(());
         }
 
-        // Register volume-profile type for JSON round-trip (idempotent).
-        ensure_custom_data_json_registered::<RithmicMinuteVolumeProfileBar>().ok();
-        ensure_custom_data_json_registered::<RithmicTradeStatistics>().ok();
-        ensure_custom_data_json_registered::<RithmicQuoteStatistics>().ok();
-        ensure_custom_data_json_registered::<RithmicIndicatorPrices>().ok();
-        ensure_custom_data_json_registered::<RithmicOpenInterest>().ok();
-        ensure_custom_data_json_registered::<RithmicEndOfDayPrices>().ok();
-        ensure_custom_data_json_registered::<RithmicOrderPriceLimits>().ok();
-        ensure_custom_data_json_registered::<RithmicSymbolMarginRate>().ok();
-        ensure_custom_data_json_registered::<RithmicVolumeAtPrice>().ok();
+        // Register custom data types for JSON round-trip (idempotent).
+        ensure_custom_data_json_registered::<RithmicMinuteVolumeProfileBar>()
+            .map_err(|e| anyhow::anyhow!("Failed to register volume profile data: {e}"))?;
+        ensure_custom_data_json_registered::<RithmicTradeStatistics>()
+            .map_err(|e| anyhow::anyhow!("Failed to register trade statistics data: {e}"))?;
+        ensure_custom_data_json_registered::<RithmicQuoteStatistics>()
+            .map_err(|e| anyhow::anyhow!("Failed to register quote statistics data: {e}"))?;
+        ensure_custom_data_json_registered::<RithmicIndicatorPrices>()
+            .map_err(|e| anyhow::anyhow!("Failed to register indicator prices data: {e}"))?;
+        ensure_custom_data_json_registered::<RithmicOpenInterest>()
+            .map_err(|e| anyhow::anyhow!("Failed to register open interest data: {e}"))?;
+        ensure_custom_data_json_registered::<RithmicEndOfDayPrices>()
+            .map_err(|e| anyhow::anyhow!("Failed to register end-of-day prices data: {e}"))?;
+        ensure_custom_data_json_registered::<RithmicOrderPriceLimits>()
+            .map_err(|e| anyhow::anyhow!("Failed to register order price limits data: {e}"))?;
+        ensure_custom_data_json_registered::<RithmicSymbolMarginRate>()
+            .map_err(|e| anyhow::anyhow!("Failed to register symbol margin rate data: {e}"))?;
+        ensure_custom_data_json_registered::<RithmicVolumeAtPrice>()
+            .map_err(|e| anyhow::anyhow!("Failed to register volume-at-price data: {e}"))?;
 
-        let gateway_config = self.gateway_config();
+        let gateway_config = self.gateway_config()?;
         let gateway = SharedGatewayLease::acquire(gateway_config.clone());
         let shared_gateway = gateway.gateway();
         let rx = {
@@ -1084,7 +1442,7 @@ impl DataClient for RithmicLiveDataClient {
                         match event {
                             Ok(MarketDataEvent::ConnectionState(crate::common::enums::ConnectionState::Reconnecting)) => {
                                 log::warn!("Rithmic data gateway is reconnecting");
-                                is_connected.store(false, Ordering::Relaxed);
+                                is_connected.store(false, Ordering::Release);
                                 order_books.clear();
                                 order_book_delta_batches.clear();
                                 let reconnect_result = {
@@ -1099,8 +1457,14 @@ impl DataClient for RithmicLiveDataClient {
                             }
                             Ok(MarketDataEvent::Reconnected) => {
                                 log::info!("Rithmic reconnected — re-issuing all subscriptions");
-                                is_connected.store(true, Ordering::Relaxed);
-                                inner_for_reconnect.resubscribe_all().await;
+                                match inner_for_reconnect.resubscribe_all().await {
+                                    Ok(()) => is_connected.store(true, Ordering::Release),
+                                    Err(e) => {
+                                        is_connected.store(false, Ordering::Release);
+                                        log::error!("Rithmic subscription recovery failed: {e}");
+                                        break;
+                                    }
+                                }
                             }
                             Ok(evt) => {
                                 for data_event in process_market_data_event(
@@ -1117,11 +1481,26 @@ impl DataClient for RithmicLiveDataClient {
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                log::warn!("Rithmic market data subscriber lagged by {skipped} events");
+                                log::warn!(
+                                    "Rithmic market data subscriber lagged by {skipped} events; invalidating local books and recovering subscriptions"
+                                );
+                                is_connected.store(false, Ordering::Release);
+                                order_books.clear();
+                                order_book_delta_batches.clear();
+                                // Re-issuing book subscriptions requests a fresh snapshot;
+                                // other feeds are also refreshed so no stale venue intent remains.
+                                match inner_for_reconnect.resubscribe_all().await {
+                                    Ok(()) => is_connected.store(true, Ordering::Release),
+                                    Err(e) => {
+                                        log::error!("Rithmic lag recovery failed: {e}");
+                                        is_connected.store(false, Ordering::Release);
+                                        break;
+                                    }
+                                }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                                 log::info!("Rithmic market data channel closed");
-                                is_connected.store(false, Ordering::Relaxed);
+                                is_connected.store(false, Ordering::Release);
                                 break;
                             }
                         }
@@ -1134,7 +1513,7 @@ impl DataClient for RithmicLiveDataClient {
         self.gateway = Some(gateway);
         self.event_task = Some(task);
         self.shutdown_tx = Some(shutdown_tx);
-        self.is_connected.store(true, Ordering::Relaxed);
+        self.is_connected.store(true, Ordering::Release);
         log::info!("Connected: client_id={}", self.client_id);
         Ok(())
     }
@@ -1142,17 +1521,17 @@ impl DataClient for RithmicLiveDataClient {
     async fn disconnect(&mut self) -> anyhow::Result<()> {
         // Send venue-side unsubscribes before tearing down the connection so the
         // venue stops pushing data (prevents stale data on reconnect).
+        self.shutdown_tasks().await;
 
-        if let Some(inner) = &self.inner {
+        if let Some(inner) = self.inner.take() {
             inner.unsubscribe_all_async().await;
         }
-        self.inner = None;
 
         if let Some(mut gateway) = self.gateway.take() {
             gateway.release().await;
         }
-        self.bar_type_map.write().clear();
-        self.stop()
+        self.clear_local_state();
+        Ok(())
     }
 
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
@@ -1189,7 +1568,7 @@ impl DataClient for RithmicLiveDataClient {
                     resolve_contract_exchange(&gateway, &resolved_exchanges, &instrument_id)
                         .await?;
                 inner
-                    .unsubscribe_market_data_async(&symbol, &exchange)
+                    .unsubscribe_quotes_async(&symbol, &exchange)
                     .await
                     .map_err(Into::into)
             },
@@ -1232,7 +1611,7 @@ impl DataClient for RithmicLiveDataClient {
                     resolve_contract_exchange(&gateway, &resolved_exchanges, &instrument_id)
                         .await?;
                 inner
-                    .unsubscribe_market_data_async(&symbol, &exchange)
+                    .unsubscribe_trades_async(&symbol, &exchange)
                     .await
                     .map_err(Into::into)
             },
@@ -1374,23 +1753,23 @@ impl DataClient for RithmicLiveDataClient {
     }
 
     fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
-        let (instrument_id, spec) = match &cmd.bar_type {
+        let (instrument_id, spec, aggregation_source) = match &cmd.bar_type {
             BarType::Standard {
                 instrument_id,
                 spec,
-                ..
-            } => (*instrument_id, *spec),
+                aggregation_source,
+            } => (*instrument_id, *spec, *aggregation_source),
             _ => anyhow::bail!(
                 "Composite BarType is not supported for Rithmic: {}",
                 cmd.bar_type
             ),
         };
 
-        let period = spec.step.get() as u32;
+        let period = u32::try_from(spec.step.get())
+            .map_err(|_| anyhow::anyhow!("Rithmic bar step exceeds u32"))?;
         let gateway = self.require_gateway()?;
         let resolved_exchanges = Arc::clone(&self.resolved_exchanges);
         let bar_type_map = Arc::clone(&self.bar_type_map);
-        let bar_type = cmd.bar_type;
 
         if spec.aggregation == BarAggregation::Tick {
             let inner = self.require_inner()?;
@@ -1399,12 +1778,20 @@ impl DataClient for RithmicLiveDataClient {
                     let (symbol, exchange) =
                         resolve_contract_exchange(&gateway, &resolved_exchanges, &instrument_id)
                             .await?;
-                    let key = rithmic_tick_bar_key(&exchange, &symbol, period);
-                    bar_type_map.write().insert(key, bar_type);
                     inner
                         .subscribe_tick_bars(&symbol, &exchange, period)
                         .await
-                        .map_err(Into::into)
+                        .map_err(anyhow::Error::from)?;
+                    let key = rithmic_tick_bar_key(&exchange, &symbol, period);
+                    let bar_type = BarType::new(
+                        make_instrument_id(&symbol, &exchange).ok_or_else(|| {
+                            anyhow::anyhow!("Invalid resolved Rithmic instrument identity")
+                        })?,
+                        spec,
+                        aggregation_source,
+                    );
+                    bar_type_map.write().insert(key, bar_type);
+                    Ok(())
                 },
                 "subscribe_tick_bars",
             );
@@ -1412,18 +1799,28 @@ impl DataClient for RithmicLiveDataClient {
         }
 
         let time_bar_type = bar_aggregation_to_time_bar_type(spec.aggregation)?;
+        let time_period = i32::try_from(period)
+            .map_err(|_| anyhow::anyhow!("Rithmic time-bar step exceeds i32"))?;
         let inner = self.require_inner()?;
         self.spawn_ws(
             async move {
                 let (symbol, exchange) =
                     resolve_contract_exchange(&gateway, &resolved_exchanges, &instrument_id)
                         .await?;
-                let key = rithmic_bar_key(&exchange, &symbol, time_bar_type, period);
-                bar_type_map.write().insert(key, bar_type);
                 inner
-                    .subscribe_bars(&symbol, &exchange, time_bar_type, period as i32)
+                    .subscribe_bars(&symbol, &exchange, time_bar_type, time_period)
                     .await
-                    .map_err(Into::into)
+                    .map_err(anyhow::Error::from)?;
+                let key = rithmic_bar_key(&exchange, &symbol, time_bar_type, period);
+                let bar_type = BarType::new(
+                    make_instrument_id(&symbol, &exchange).ok_or_else(|| {
+                        anyhow::anyhow!("Invalid resolved Rithmic instrument identity")
+                    })?,
+                    spec,
+                    aggregation_source,
+                );
+                bar_type_map.write().insert(key, bar_type);
+                Ok(())
             },
             "subscribe_bars",
         );
@@ -1443,7 +1840,8 @@ impl DataClient for RithmicLiveDataClient {
             ),
         };
 
-        let period = spec.step.get() as u32;
+        let period = u32::try_from(spec.step.get())
+            .map_err(|_| anyhow::anyhow!("Rithmic bar step exceeds u32"))?;
         let Some(inner) = self.inner.clone() else {
             return Ok(());
         };
@@ -1457,12 +1855,13 @@ impl DataClient for RithmicLiveDataClient {
                     let (symbol, exchange) =
                         resolve_contract_exchange(&gateway, &resolved_exchanges, &instrument_id)
                             .await?;
-                    let key = rithmic_tick_bar_key(&exchange, &symbol, period);
-                    bar_type_map.write().remove(&key);
                     inner
                         .unsubscribe_tick_bars(&symbol, &exchange, period)
                         .await
-                        .map_err(Into::into)
+                        .map_err(anyhow::Error::from)?;
+                    let key = rithmic_tick_bar_key(&exchange, &symbol, period);
+                    bar_type_map.write().remove(&key);
+                    Ok(())
                 },
                 "unsubscribe_tick_bars",
             );
@@ -1470,18 +1869,21 @@ impl DataClient for RithmicLiveDataClient {
         }
 
         let time_bar_type = bar_aggregation_to_time_bar_type(spec.aggregation)?;
+        let time_period = i32::try_from(period)
+            .map_err(|_| anyhow::anyhow!("Rithmic time-bar step exceeds i32"))?;
 
         self.spawn_ws(
             async move {
                 let (symbol, exchange) =
                     resolve_contract_exchange(&gateway, &resolved_exchanges, &instrument_id)
                         .await?;
+                inner
+                    .unsubscribe_bars(&symbol, &exchange, time_bar_type, time_period)
+                    .await
+                    .map_err(anyhow::Error::from)?;
                 let key = rithmic_bar_key(&exchange, &symbol, time_bar_type, period);
                 bar_type_map.write().remove(&key);
-                inner
-                    .unsubscribe_bars(&symbol, &exchange, time_bar_type, period as i32)
-                    .await
-                    .map_err(Into::into)
+                Ok(())
             },
             "unsubscribe_bars",
         );
@@ -1490,14 +1892,22 @@ impl DataClient for RithmicLiveDataClient {
 
     fn request_trades(&self, cmd: RequestTrades) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
-        let start_sec = cmd.start.map_or(0, |dt| dt.as_second() as i32);
-        let now_sec = ((get_atomic_clock_realtime().get_time_ns().as_u64()) / 1_000_000_000)
-            .min(i32::MAX as u64) as i32;
-        let end_sec = normalize_history_request_end(
-            start_sec,
-            cmd.end.map_or(0, |dt| dt.as_second() as i32),
-            now_sec,
-        );
+        let start_sec = cmd
+            .start
+            .map(|dt| i32::try_from(dt.as_second()))
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("Historical trade start exceeds Rithmic i32 range"))?
+            .unwrap_or_default();
+        let now_sec =
+            i32::try_from(get_atomic_clock_realtime().get_time_ns().as_u64() / 1_000_000_000)
+                .unwrap_or(i32::MAX);
+        let requested_end = cmd
+            .end
+            .map(|dt| i32::try_from(dt.as_second()))
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("Historical trade end exceeds Rithmic i32 range"))?
+            .unwrap_or_default();
+        let end_sec = normalize_history_request_end(start_sec, requested_end, now_sec);
 
         log::warn!(
             "Historical Rithmic trades are synthesized from 1-tick bar replay; \
@@ -1522,6 +1932,8 @@ impl DataClient for RithmicLiveDataClient {
                 let (symbol, exchange) =
                     resolve_contract_exchange(&gateway, &resolved_exchanges, &instrument_id)
                         .await?;
+                let instrument_id = make_instrument_id(&symbol, &exchange)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid resolved Rithmic instrument"))?;
                 let history_handle = {
                     let gateway = gateway.read().await;
                     gateway.history_handle().cloned()
@@ -1551,16 +1963,11 @@ impl DataClient for RithmicLiveDataClient {
                             let key = format!("{exchange}:{symbol}");
                             let (price_prec, size_prec) = {
                                 let gateway = gateway.read().await;
-                                gateway
+                                let instruments = gateway
                                     .instruments()
                                     .try_read()
-                                    .ok()
-                                    .and_then(|m| m.get(&key).cloned())
-                                    .map_or((2, 0), |info| {
-                                        let price_prec =
-                                            info.tick_size.map_or(2, tick_size_to_precision);
-                                        (price_prec, 0)
-                                    })
+                                    .map_err(|e| anyhow::anyhow!("Instrument cache busy: {e}"))?;
+                                checked_instrument_precisions(instruments.get(&key), &key)?
                             };
 
                             responses
@@ -1656,7 +2063,9 @@ impl DataClient for RithmicLiveDataClient {
                     .await
                     && let RithmicMessage::ResponseAuxilliaryReferenceData(aux) = &aux_resp.message
                 {
-                    apply_auxiliary_reference_data(&mut instrument, aux);
+                    apply_auxiliary_reference_data(&mut instrument, aux).map_err(|e| {
+                        anyhow::anyhow!("Failed to parse auxiliary reference data: {e}")
+                    })?;
                 }
 
                 let resolved_id = instrument.id;
@@ -1788,6 +2197,8 @@ impl DataClient for RithmicLiveDataClient {
                 let (symbol, exchange) =
                     resolve_contract_exchange(&gateway, &resolved_exchanges, &instrument_id)
                         .await?;
+                let instrument_id = make_instrument_id(&symbol, &exchange)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid resolved Rithmic instrument"))?;
                 let now = get_atomic_clock_realtime().get_time_ns();
                 let responses = gateway
                     .read()
@@ -1799,14 +2210,11 @@ impl DataClient for RithmicLiveDataClient {
                 let (price_precision, size_precision) = {
                     let key = format!("{exchange}:{symbol}");
                     let gateway = gateway.read().await;
-                    gateway
+                    let instruments = gateway
                         .instruments()
                         .try_read()
-                        .ok()
-                        .and_then(|map| map.get(&key).cloned())
-                        .map_or((2, 0), |info| {
-                            (info.tick_size.map_or(2, tick_size_to_precision), 0)
-                        })
+                        .map_err(|e| anyhow::anyhow!("Instrument cache busy: {e}"))?;
+                    checked_instrument_precisions(instruments.get(&key), &key)?
                 };
 
                 let book = order_book_from_snapshot(
@@ -1815,7 +2223,7 @@ impl DataClient for RithmicLiveDataClient {
                     price_precision,
                     size_precision,
                     now,
-                );
+                )?;
 
                 sender
                     .send(DataEvent::Response(DataResponse::Book(BookResponse::new(
@@ -1841,22 +2249,23 @@ impl DataClient for RithmicLiveDataClient {
             log::warn!(
                 "RithmicMinuteVolumeProfileBar is historical-only — use request_data instead of \
                 subscribe. To fetch bars call request_data with DataType identifier set to the \
-                instrument_id (e.g. 'ESM5.RITHMIC')"
+                instrument_id (e.g. 'ESM5.CME.RITHMIC')"
             );
         } else if cmd.data_type.type_name() == VOLUME_AT_PRICE_TYPE_NAME {
             log::warn!(
                 "RithmicVolumeAtPrice is request-only — use request_data with DataType identifier \
-                set to the instrument_id (e.g. 'ESM5.RITHMIC')"
+                set to the instrument_id (e.g. 'ESM5.CME.RITHMIC')"
             );
         } else if ExtraMarketDataKind::from_custom_type(cmd.data_type.type_name()).is_some() {
             let identifier = cmd.data_type.identifier().ok_or_else(|| {
                 anyhow::anyhow!(
                     "subscribe({}): DataType must have an identifier equal to the instrument_id \
-                    (e.g. 'ESM5.RITHMIC')",
+                    (e.g. 'ESM5.CME.RITHMIC')",
                     cmd.data_type.type_name()
                 )
             })?;
-            let instrument_id = InstrumentId::from(identifier.to_string().as_str());
+            let instrument_id = InstrumentId::from_as_ref(identifier)
+                .map_err(|e| anyhow::anyhow!("Invalid VolumeAtPrice instrument identifier: {e}"))?;
             let gateway = self.require_gateway()?;
             let resolved_exchanges = Arc::clone(&self.resolved_exchanges);
             let type_name = cmd.data_type.type_name().to_string();
@@ -1893,11 +2302,12 @@ impl DataClient for RithmicLiveDataClient {
             let identifier = cmd.data_type.identifier().ok_or_else(|| {
                 anyhow::anyhow!(
                     "unsubscribe({}): DataType must have an identifier equal to the instrument_id \
-                    (e.g. 'ESM5.RITHMIC')",
+                    (e.g. 'ESM5.CME.RITHMIC')",
                     cmd.data_type.type_name()
                 )
             })?;
-            let instrument_id = InstrumentId::from(identifier.to_string().as_str());
+            let instrument_id = InstrumentId::from_as_ref(identifier)
+                .map_err(|e| anyhow::anyhow!("Invalid custom-data instrument identifier: {e}"))?;
             let gateway = self.require_gateway()?;
             let resolved_exchanges = Arc::clone(&self.resolved_exchanges);
             let type_name = cmd.data_type.type_name().to_string();
@@ -1932,12 +2342,13 @@ impl DataClient for RithmicLiveDataClient {
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "request_data(VolumeAtPrice): DataType must have an identifier equal to the \
-                        instrument_id (e.g. 'ESM5.RITHMIC')"
+                        instrument_id (e.g. 'ESM5.CME.RITHMIC')"
                     )
                 })?
                 .to_string();
 
-            let instrument_id = InstrumentId::from(identifier.as_str());
+            let instrument_id = InstrumentId::from_as_ref(&identifier)
+                .map_err(|e| anyhow::anyhow!("Invalid VolumeAtPrice instrument identifier: {e}"))?;
             let gateway = self.require_gateway()?;
             let resolved_exchanges = Arc::clone(&self.resolved_exchanges);
             let data_sender = self
@@ -1954,6 +2365,8 @@ impl DataClient for RithmicLiveDataClient {
                     let (symbol, exchange) =
                         resolve_contract_exchange(&gateway, &resolved_exchanges, &instrument_id)
                             .await?;
+                    let instrument_id = make_instrument_id(&symbol, &exchange)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid resolved Rithmic instrument"))?;
                     let now = get_atomic_clock_realtime().get_time_ns();
                     let responses = gateway
                         .read()
@@ -1967,16 +2380,28 @@ impl DataClient for RithmicLiveDataClient {
 
                     let mut trade_price = Vec::new();
                     let mut volume_at_price = Vec::new();
-                    let mut ts_event = now;
+                    let mut ts_event = None;
 
                     for response in responses {
                         let RithmicMessage::ResponseGetVolumeAtPrice(vap) = response.message else {
                             continue;
                         };
-                        trade_price.extend(vap.trade_price);
-                        volume_at_price.extend(vap.volume_at_price);
-                        ts_event = rithmic_timestamp_to_unix_nanos(vap.ssboe, vap.usecs);
+                        if let Some(timestamp) = append_volume_at_price_response(
+                            &vap,
+                            &mut trade_price,
+                            &mut volume_at_price,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Malformed VolumeAtPrice response for {symbol}.{exchange}: {e}"
+                            )
+                        })? {
+                            ts_event = Some(timestamp);
+                        }
                     }
+                    let ts_event = ts_event.ok_or_else(|| {
+                        anyhow::anyhow!("VolumeAtPrice response contained no timestamped rows")
+                    })?;
 
                     let payload = vec![RithmicVolumeAtPrice {
                         instrument_id,
@@ -2025,12 +2450,13 @@ impl DataClient for RithmicLiveDataClient {
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "request_data(VolumeProfile): DataType must have an identifier equal to the \
-                    instrument_id (e.g. 'ESM5.RITHMIC')"
+                    instrument_id (e.g. 'ESM5.CME.RITHMIC')"
                 )
             })?
             .to_string();
 
-        let instrument_id = InstrumentId::from(identifier.as_str());
+        let instrument_id = InstrumentId::from_as_ref(&identifier)
+            .map_err(|e| anyhow::anyhow!("Invalid volume-profile instrument identifier: {e}"))?;
 
         // Optional period in minutes — default 1.
         let period: i32 = request
@@ -2038,10 +2464,23 @@ impl DataClient for RithmicLiveDataClient {
             .metadata()
             .and_then(|m| m.get("period"))
             .and_then(|v| v.as_i64())
-            .map_or(1, |v| v as i32);
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("Volume-profile period exceeds Rithmic i32 range"))?
+            .unwrap_or(1);
 
-        let start_sec = request.start.map_or(0, |dt| dt.as_second() as i32);
-        let end_sec = request.end.map_or(0, |dt| dt.as_second() as i32);
+        let start_sec = request
+            .start
+            .map(|dt| i32::try_from(dt.as_second()))
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("Volume-profile start exceeds Rithmic i32 range"))?
+            .unwrap_or_default();
+        let end_sec = request
+            .end
+            .map(|dt| i32::try_from(dt.as_second()))
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("Volume-profile end exceeds Rithmic i32 range"))?
+            .unwrap_or_default();
 
         let gateway = self.require_gateway()?;
         let resolved_exchanges = Arc::clone(&self.resolved_exchanges);
@@ -2060,6 +2499,8 @@ impl DataClient for RithmicLiveDataClient {
             async move {
                 let (symbol, exchange) =
                     resolve_contract_exchange(&gateway, &resolved_exchanges, &instrument_id).await?;
+                let instrument_id = make_instrument_id(&symbol, &exchange)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid resolved Rithmic instrument"))?;
                 let now = get_atomic_clock_realtime().get_time_ns();
 
                 let history = match gateway.read().await.history_handle().cloned() {
@@ -2101,31 +2542,7 @@ impl DataClient for RithmicLiveDataClient {
                         else {
                             return None;
                         };
-                        let ts_event = vp
-                            .marker
-                            .map_or(now, |m| UnixNanos::from(m as u64 * 1_000_000_000));
-                        let poc_price = RithmicMinuteVolumeProfileBar::compute_poc(
-                            &vp.profile_price,
-                            &vp.profile_bid_volume,
-                            &vp.profile_ask_volume,
-                        );
-                        Some(RithmicMinuteVolumeProfileBar {
-                            instrument_id,
-                            open_price: vp.open_price.unwrap_or(0.0),
-                            high_price: vp.high_price.unwrap_or(0.0),
-                            low_price: vp.low_price.unwrap_or(0.0),
-                            close_price: vp.close_price.unwrap_or(0.0),
-                            volume: vp.volume.unwrap_or(0),
-                            bid_volume: vp.bid_volume.unwrap_or(0),
-                            ask_volume: vp.ask_volume.unwrap_or(0),
-                            num_trades: vp.num_trades.unwrap_or(0),
-                            poc_price,
-                            profile_price: vp.profile_price.clone(),
-                            profile_bid_volume: vp.profile_bid_volume.clone(),
-                            profile_ask_volume: vp.profile_ask_volume.clone(),
-                            ts_event,
-                            ts_init: now,
-                        })
+                        volume_profile_bar_from_response(vp, instrument_id, now)
                     })
                     .collect();
 
@@ -2157,12 +2574,12 @@ impl DataClient for RithmicLiveDataClient {
     }
 
     fn request_bars(&self, cmd: RequestBars) -> anyhow::Result<()> {
-        let (instrument_id, spec) = match &cmd.bar_type {
+        let (instrument_id, spec, aggregation_source) = match &cmd.bar_type {
             BarType::Standard {
                 instrument_id,
                 spec,
-                ..
-            } => (*instrument_id, *spec),
+                aggregation_source,
+            } => (*instrument_id, *spec, *aggregation_source),
             _ => anyhow::bail!(
                 "Composite BarType is not supported for Rithmic: {}",
                 cmd.bar_type
@@ -2170,15 +2587,24 @@ impl DataClient for RithmicLiveDataClient {
         };
 
         if spec.aggregation == BarAggregation::Tick {
-            let period = spec.step.get() as u32;
-            let start_sec = cmd.start.map_or(0, |dt| dt.as_second() as i32);
-            let now_sec = ((get_atomic_clock_realtime().get_time_ns().as_u64()) / 1_000_000_000)
-                .min(i32::MAX as u64) as i32;
-            let end_sec = normalize_history_request_end(
-                start_sec,
-                cmd.end.map_or(0, |dt| dt.as_second() as i32),
-                now_sec,
-            );
+            let period = u32::try_from(spec.step.get())
+                .map_err(|_| anyhow::anyhow!("Rithmic tick-bar step exceeds u32"))?;
+            let start_sec = cmd
+                .start
+                .map(|dt| i32::try_from(dt.as_second()))
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("Tick-bar history start exceeds i32 range"))?
+                .unwrap_or_default();
+            let now_sec =
+                i32::try_from(get_atomic_clock_realtime().get_time_ns().as_u64() / 1_000_000_000)
+                    .unwrap_or(i32::MAX);
+            let requested_end = cmd
+                .end
+                .map(|dt| i32::try_from(dt.as_second()))
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("Tick-bar history end exceeds i32 range"))?
+                .unwrap_or_default();
+            let end_sec = normalize_history_request_end(start_sec, requested_end, now_sec);
 
             let gateway = self.require_gateway()?;
             let resolved_exchanges = Arc::clone(&self.resolved_exchanges);
@@ -2188,7 +2614,6 @@ impl DataClient for RithmicLiveDataClient {
                 .ok_or_else(|| anyhow::anyhow!("Data sender not initialized"))?;
             let client_id = cmd.client_id.unwrap_or(self.client_id);
             let correlation_id = cmd.request_id;
-            let bar_type = cmd.bar_type;
             let cmd_start = cmd.start.map(|dt| dt.into());
             let cmd_end = cmd.end.map(|dt| dt.into());
 
@@ -2197,6 +2622,9 @@ impl DataClient for RithmicLiveDataClient {
                     let (symbol, exchange) =
                         resolve_contract_exchange(&gateway, &resolved_exchanges, &instrument_id)
                             .await?;
+                    let canonical_id = make_instrument_id(&symbol, &exchange)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid resolved Rithmic instrument"))?;
+                    let bar_type = BarType::new(canonical_id, spec, aggregation_source);
                     let now = get_atomic_clock_realtime().get_time_ns();
                     let history_handle = {
                         let gateway = gateway.read().await;
@@ -2235,17 +2663,11 @@ impl DataClient for RithmicLiveDataClient {
                                     let key = format!("{exchange}:{symbol}");
                                     let (price_prec, size_prec) = {
                                         let gateway = gateway.read().await;
-                                        gateway
-                                            .instruments()
-                                            .try_read()
-                                            .ok()
-                                            .and_then(|m| m.get(&key).cloned())
-                                            .map_or((2, 0), |info| {
-                                                let pp = info
-                                                    .tick_size
-                                                    .map_or(2, tick_size_to_precision);
-                                                (pp, 0)
-                                            })
+                                        let instruments =
+                                            gateway.instruments().try_read().map_err(|e| {
+                                                anyhow::anyhow!("Instrument cache busy: {e}")
+                                            })?;
+                                        checked_instrument_precisions(instruments.get(&key), &key)?
                                     };
 
                                     responses
@@ -2256,56 +2678,9 @@ impl DataClient for RithmicLiveDataClient {
                                             else {
                                                 return None;
                                             };
-                                            let tick_period = tick
-                                                .type_specifier
-                                                .as_deref()
-                                                .and_then(|s| s.parse::<u32>().ok())
-                                                .unwrap_or(0);
-
-                                            if tick_period != period {
-                                                return None;
-                                            }
-                                            let ts_event = tick
-                                                .data_bar_ssboe
-                                                .first()
-                                                .copied()
-                                                .map_or(now, |secs| {
-                                                    let usecs = tick
-                                                        .data_bar_usecs
-                                                        .first()
-                                                        .copied()
-                                                        .unwrap_or(0)
-                                                        as u64;
-                                                    UnixNanos::from(
-                                                        (secs as u64) * 1_000_000_000
-                                                            + usecs * 1_000,
-                                                    )
-                                                });
-                                            Some(Bar::new(
-                                                bar_type,
-                                                Price::new(
-                                                    tick.open_price.unwrap_or(0.0),
-                                                    price_prec,
-                                                ),
-                                                Price::new(
-                                                    tick.high_price.unwrap_or(0.0),
-                                                    price_prec,
-                                                ),
-                                                Price::new(
-                                                    tick.low_price.unwrap_or(0.0),
-                                                    price_prec,
-                                                ),
-                                                Price::new(
-                                                    tick.close_price.unwrap_or(0.0),
-                                                    price_prec,
-                                                ),
-                                                Quantity::new(
-                                                    tick.volume.unwrap_or(0) as f64,
-                                                    size_prec,
-                                                ),
-                                                ts_event,
-                                                now,
-                                            ))
+                                            historical_tick_bar_to_bar(
+                                                tick, bar_type, period, price_prec, size_prec, now,
+                                            )
                                         })
                                         .collect()
                                 }
@@ -2334,16 +2709,25 @@ impl DataClient for RithmicLiveDataClient {
         }
 
         let time_bar_type = bar_aggregation_to_time_bar_type(spec.aggregation)?;
-        let period = spec.step.get() as i32;
+        let period = i32::try_from(spec.step.get())
+            .map_err(|_| anyhow::anyhow!("Rithmic time-bar step exceeds i32"))?;
 
-        let start_sec = cmd.start.map_or(0, |dt| dt.as_second() as i32);
-        let now_sec = ((get_atomic_clock_realtime().get_time_ns().as_u64()) / 1_000_000_000)
-            .min(i32::MAX as u64) as i32;
-        let end_sec = normalize_history_request_end(
-            start_sec,
-            cmd.end.map_or(0, |dt| dt.as_second() as i32),
-            now_sec,
-        );
+        let start_sec = cmd
+            .start
+            .map(|dt| i32::try_from(dt.as_second()))
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("Time-bar history start exceeds i32 range"))?
+            .unwrap_or_default();
+        let now_sec =
+            i32::try_from(get_atomic_clock_realtime().get_time_ns().as_u64() / 1_000_000_000)
+                .unwrap_or(i32::MAX);
+        let requested_end = cmd
+            .end
+            .map(|dt| i32::try_from(dt.as_second()))
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("Time-bar history end exceeds i32 range"))?
+            .unwrap_or_default();
+        let end_sec = normalize_history_request_end(start_sec, requested_end, now_sec);
         let gateway = self.require_gateway()?;
         let resolved_exchanges = Arc::clone(&self.resolved_exchanges);
         let data_sender = self
@@ -2352,7 +2736,6 @@ impl DataClient for RithmicLiveDataClient {
             .ok_or_else(|| anyhow::anyhow!("Data sender not initialized"))?;
         let client_id = cmd.client_id.unwrap_or(self.client_id);
         let correlation_id = cmd.request_id;
-        let bar_type = cmd.bar_type;
         let cmd_start = cmd.start.map(|dt| dt.into());
         let cmd_end = cmd.end.map(|dt| dt.into());
 
@@ -2361,6 +2744,9 @@ impl DataClient for RithmicLiveDataClient {
                 let (symbol, exchange) =
                     resolve_contract_exchange(&gateway, &resolved_exchanges, &instrument_id)
                         .await?;
+                let canonical_id = make_instrument_id(&symbol, &exchange)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid resolved Rithmic instrument"))?;
+                let bar_type = BarType::new(canonical_id, spec, aggregation_source);
                 let now = get_atomic_clock_realtime().get_time_ns();
 
                 // Always emits a BarsResponse, even on error — strategy must not hang.
@@ -2388,16 +2774,11 @@ impl DataClient for RithmicLiveDataClient {
                         let key = format!("{exchange}:{symbol}");
                         let (price_prec, size_prec) = {
                             let gateway = gateway.read().await;
-                            gateway
+                            let instruments = gateway
                                 .instruments()
                                 .try_read()
-                                .ok()
-                                .and_then(|m| m.get(&key).cloned())
-                                .map_or((2, 0), |info| {
-                                    let price_prec =
-                                        info.tick_size.map_or(2, tick_size_to_precision);
-                                    (price_prec, 0)
-                                })
+                                .map_err(|e| anyhow::anyhow!("Instrument cache busy: {e}"))?;
+                            checked_instrument_precisions(instruments.get(&key), &key)?
                         };
 
                         let bars = responses
@@ -2447,7 +2828,8 @@ mod tests {
 
     use nautilus_model::enums::RecordFlag;
     use rithmic_rs::rti::{
-        DepthByOrder, ResponseDepthByOrderSnapshot, ResponseTickBarReplay, ResponseTimeBarReplay,
+        DepthByOrder, ResponseDepthByOrderSnapshot, ResponseGetVolumeAtPrice,
+        ResponseTickBarReplay, ResponseTimeBarReplay, ResponseVolumeProfileMinuteBars,
         depth_by_order::{TransactionType, UpdateType},
     };
     use serde::{Deserialize, de::DeserializeOwned};
@@ -2600,8 +2982,12 @@ mod tests {
             },
             price_precision: 2,
             size_precision: 0,
-            ts_event: rithmic_timestamp_to_unix_nanos(delta.ssboe, delta.usecs).as_u64(),
-            ts_init: rithmic_timestamp_to_unix_nanos(delta.ssboe, delta.usecs).as_u64(),
+            ts_event: rithmic_timestamp_to_unix_nanos(delta.ssboe, delta.usecs)
+                .expect("fixture timestamp should be valid")
+                .as_u64(),
+            ts_init: rithmic_timestamp_to_unix_nanos(delta.ssboe, delta.usecs)
+                .expect("fixture timestamp should be valid")
+                .as_u64(),
         }
     }
 
@@ -2631,6 +3017,22 @@ mod tests {
             1_700_000_030
         );
         assert_eq!(normalize_history_request_end(0, 0, 1_700_000_060), 0);
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_unvalidated_default_config_before_gateway_acquire() {
+        let mut client = RithmicLiveDataClient::new(
+            ClientId::new("RITHMIC-INVALID-CONFIG-TEST"),
+            RithmicDataClientConfig::default(),
+        );
+
+        let e = client
+            .connect()
+            .await
+            .expect_err("default config should fail validation");
+        assert!(e.to_string().contains("username"));
+        assert!(client.gateway.is_none());
+        assert!(!client.is_connected());
     }
 
     #[rstest::rstest]
@@ -2684,7 +3086,7 @@ mod tests {
             panic!("expected full order book delta batch");
         };
 
-        assert_eq!(deltas.instrument_id, InstrumentId::from("ESM6.RITHMIC"));
+        assert_eq!(deltas.instrument_id, InstrumentId::from("ESM6.CME.RITHMIC"));
         assert_eq!(deltas.deltas.len(), 2);
         assert_eq!(deltas.deltas[0].flags, 0);
         assert_eq!(deltas.deltas[1].flags, RecordFlag::F_LAST as u8);
@@ -2705,7 +3107,7 @@ mod tests {
 
     #[rstest::rstest]
     fn historical_time_bar_to_bar_accepts_replay_messages() {
-        let bar_type = BarType::from("ESM6.RITHMIC-1-MINUTE-LAST-EXTERNAL");
+        let bar_type = BarType::from("ESM6.CME.RITHMIC-1-MINUTE-LAST-EXTERNAL");
         let message = RithmicMessage::ResponseTimeBarReplay(ResponseTimeBarReplay {
             template_id: 203,
             request_key: Some("history-req".to_string()),
@@ -2739,7 +3141,7 @@ mod tests {
 
     #[rstest::rstest]
     fn historical_time_bar_to_bar_drops_markerless_messages() {
-        let bar_type = BarType::from("ESM6.RITHMIC-1-MINUTE-LAST-EXTERNAL");
+        let bar_type = BarType::from("ESM6.CME.RITHMIC-1-MINUTE-LAST-EXTERNAL");
 
         let replay = RithmicMessage::ResponseTimeBarReplay(ResponseTimeBarReplay {
             template_id: 203,
@@ -2778,7 +3180,7 @@ mod tests {
 
     #[rstest::rstest]
     fn historical_tick_bar_to_trade_sets_no_aggressor_for_replay_ticks() {
-        let instrument_id = InstrumentId::from("ESM6.RITHMIC");
+        let instrument_id = InstrumentId::from("ESM6.CME.RITHMIC");
         let message = RithmicMessage::ResponseTickBarReplay(ResponseTickBarReplay {
             template_id: 204,
             request_key: Some("history-req".to_string()),
@@ -2810,7 +3212,9 @@ mod tests {
         assert_eq!(trade.price.as_f64(), 4500.25);
         assert_eq!(trade.size.as_f64(), 7.0);
         assert_eq!(trade.aggressor_side, AggressorSide::NoAggressor);
-        assert_eq!(trade.trade_id.to_string(), "replay:1700000123456789000:3");
+        let trade_id = trade.trade_id.to_string();
+        assert!(trade_id.starts_with('R'));
+        assert_eq!(trade_id.len(), 33);
         assert_eq!(
             trade.ts_event,
             UnixNanos::from(1_700_000_123_456_789_000_u64)
@@ -2822,8 +3226,147 @@ mod tests {
     }
 
     #[rstest::rstest]
+    fn historical_tick_bar_to_bar_requires_complete_ohlcv_and_timestamp() {
+        let bar_type = BarType::from("ESM6.CME.RITHMIC-1-TICK-LAST-EXTERNAL");
+        let complete = ResponseTickBarReplay {
+            type_specifier: Some("1".to_string()),
+            volume: Some(7),
+            open_price: Some(4500.25),
+            high_price: Some(4501.00),
+            low_price: Some(4499.75),
+            close_price: Some(4500.50),
+            data_bar_ssboe: vec![1_700_000_123],
+            data_bar_usecs: vec![456_789],
+            ..Default::default()
+        };
+        assert!(
+            historical_tick_bar_to_bar(&complete, bar_type, 1, 2, 0, UnixNanos::from(5),).is_some()
+        );
+
+        let mut incomplete = Vec::new();
+        let mut value = complete.clone();
+        value.open_price = None;
+        incomplete.push(value);
+        let mut value = complete.clone();
+        value.high_price = None;
+        incomplete.push(value);
+        let mut value = complete.clone();
+        value.low_price = None;
+        incomplete.push(value);
+        let mut value = complete.clone();
+        value.close_price = None;
+        incomplete.push(value);
+        let mut value = complete.clone();
+        value.volume = None;
+        incomplete.push(value);
+        let mut value = complete;
+        value.data_bar_ssboe.clear();
+        incomplete.push(value);
+
+        for response in incomplete {
+            assert!(
+                historical_tick_bar_to_bar(&response, bar_type, 1, 2, 0, UnixNanos::from(5),)
+                    .is_none()
+            );
+        }
+    }
+
+    #[rstest::rstest]
+    fn volume_profile_bar_requires_complete_fields_and_valid_marker() {
+        let instrument_id = InstrumentId::from("ESM6.CME.RITHMIC");
+        let complete = ResponseVolumeProfileMinuteBars {
+            marker: Some(1_700_000_123),
+            num_trades: Some(3),
+            volume: Some(7),
+            bid_volume: Some(4),
+            ask_volume: Some(3),
+            open_price: Some(4500.25),
+            high_price: Some(4501.00),
+            low_price: Some(4499.75),
+            close_price: Some(4500.50),
+            profile_price: vec![4500.25],
+            profile_bid_volume: vec![4],
+            profile_ask_volume: vec![3],
+            ..Default::default()
+        };
+        assert!(
+            volume_profile_bar_from_response(&complete, instrument_id, UnixNanos::from(5))
+                .is_some()
+        );
+
+        let mut missing_marker = complete.clone();
+        missing_marker.marker = None;
+        assert!(
+            volume_profile_bar_from_response(&missing_marker, instrument_id, UnixNanos::from(5),)
+                .is_none()
+        );
+
+        let mut missing_volume = complete.clone();
+        missing_volume.volume = None;
+        assert!(
+            volume_profile_bar_from_response(&missing_volume, instrument_id, UnixNanos::from(5),)
+                .is_none()
+        );
+
+        let mut malformed_profile = complete;
+        malformed_profile.profile_ask_volume.clear();
+        assert!(
+            volume_profile_bar_from_response(
+                &malformed_profile,
+                instrument_id,
+                UnixNanos::from(5),
+            )
+            .is_none()
+        );
+    }
+
+    #[rstest::rstest]
+    fn volume_at_price_requires_aligned_valid_rows_and_venue_timestamp() {
+        let complete = ResponseGetVolumeAtPrice {
+            trade_price: vec![4500.25, 4500.50],
+            volume_at_price: vec![4, 3],
+            ssboe: Some(1_700_000_123),
+            usecs: Some(456_789),
+            ..Default::default()
+        };
+        let mut prices = Vec::new();
+        let mut volumes = Vec::new();
+        let timestamp = append_volume_at_price_response(&complete, &mut prices, &mut volumes)
+            .expect("complete venue response should be accepted")
+            .expect("nonempty response should carry its venue timestamp");
+        assert_eq!(prices, complete.trade_price);
+        assert_eq!(volumes, complete.volume_at_price);
+        assert_eq!(timestamp, UnixNanos::from(1_700_000_123_456_789_000_u64));
+
+        let mut malformed = complete.clone();
+        malformed.volume_at_price.pop();
+        assert!(
+            append_volume_at_price_response(&malformed, &mut Vec::new(), &mut Vec::new()).is_err()
+        );
+
+        let mut malformed = complete.clone();
+        malformed.trade_price[0] = f64::NAN;
+        assert!(
+            append_volume_at_price_response(&malformed, &mut Vec::new(), &mut Vec::new()).is_err()
+        );
+
+        let mut malformed = complete.clone();
+        malformed.volume_at_price[0] = -1;
+        assert!(
+            append_volume_at_price_response(&malformed, &mut Vec::new(), &mut Vec::new()).is_err()
+        );
+
+        let mut missing_timestamp = complete;
+        missing_timestamp.ssboe = None;
+        assert!(
+            append_volume_at_price_response(&missing_timestamp, &mut Vec::new(), &mut Vec::new(),)
+                .is_err()
+        );
+    }
+
+    #[rstest::rstest]
     fn historical_tick_bar_to_trade_drops_zero_timestamp_replay_rows() {
-        let instrument_id = InstrumentId::from("ESM6.RITHMIC");
+        let instrument_id = InstrumentId::from("ESM6.CME.RITHMIC");
         let message = RithmicMessage::ResponseTickBarReplay(ResponseTickBarReplay {
             template_id: 204,
             request_key: Some("history-req".to_string()),
@@ -2866,14 +3409,138 @@ mod tests {
             ts_init: 1_700_000_123_456_789_000_u64,
         };
 
-        let trade_id = live_trade_id(&tick);
+        let trade_id = live_trade_id(&tick).expect("fallback trade ID should be valid");
+        assert_eq!(trade_id, live_trade_id(&tick).unwrap());
+        assert!(trade_id.as_str().len() <= 36);
 
-        assert_eq!(trade_id.to_string(), "live:1700000123456789000:MNQM6");
+        let mut distinct = tick;
+        distinct.exchange = "CBOT".to_string();
+        assert_ne!(Some(trade_id), live_trade_id(&distinct));
+    }
+
+    #[rstest::rstest]
+    fn live_trade_id_rejects_invalid_venue_id() {
+        let tick = crate::data::TradeTick {
+            symbol: "MNQM6".to_string(),
+            exchange: "CME".to_string(),
+            price: 25_572.25,
+            size: 3.0,
+            aggressor_side: "BUY".to_string(),
+            trade_id: "invalid-💥-id".to_string(),
+            price_precision: 2,
+            size_precision: 0,
+            ts_event: 1_700_000_123_456_789_000_u64,
+            ts_init: 1_700_000_123_456_789_000_u64,
+        };
+
+        assert!(live_trade_id(&tick).is_none());
+    }
+
+    #[rstest::rstest]
+    fn malformed_quote_numeric_payload_is_dropped() {
+        let events = process_market_data_event(
+            MarketDataEvent::Quote(crate::data::QuoteTick {
+                symbol: "MNQM6".to_string(),
+                exchange: "CME".to_string(),
+                bid_price: f64::NAN,
+                ask_price: 20_000.25,
+                bid_size: 1.0,
+                ask_size: f64::INFINITY,
+                price_precision: 2,
+                size_precision: 0,
+                ts_event: 1,
+                ts_init: 2,
+            }),
+            &ParkingRwLock::new(AHashMap::new()),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &TestBookSubscriptions {
+                wants_deltas: false,
+                wants_depth10: false,
+            },
+        );
+
+        assert!(events.is_empty());
+    }
+
+    #[rstest::rstest]
+    fn legacy_exchange_less_input_resolves_to_canonical_event_identity() {
+        let legacy_input = InstrumentId::from("MNQM6.RITHMIC");
+        assert_eq!(
+            parse_rithmic_instrument(&legacy_input),
+            ("MNQM6".to_string(), String::new())
+        );
+
+        let canonical = make_instrument_id("MNQM6", "CME").unwrap();
+        assert_eq!(canonical, InstrumentId::from("MNQM6.CME.RITHMIC"));
+        assert_eq!(
+            parse_rithmic_instrument(&canonical),
+            ("MNQM6".to_string(), "CME".to_string())
+        );
+
+        let events = process_market_data_event(
+            MarketDataEvent::Quote(crate::data::QuoteTick {
+                symbol: "MNQM6".to_string(),
+                exchange: "CME".to_string(),
+                bid_price: 20_000.0,
+                ask_price: 20_000.25,
+                bid_size: 1.0,
+                ask_size: 2.0,
+                price_precision: 2,
+                size_precision: 0,
+                ts_event: 1,
+                ts_init: 2,
+            }),
+            &ParkingRwLock::new(AHashMap::new()),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &TestBookSubscriptions {
+                wants_deltas: false,
+                wants_depth10: false,
+            },
+        );
+        let [DataEvent::Data(Data::Quote(quote))] = events.as_slice() else {
+            panic!("expected one canonical quote event");
+        };
+        assert_eq!(quote.instrument_id, canonical);
+    }
+
+    #[rstest::rstest]
+    fn resolved_exchange_cache_is_exchange_aware_and_rejects_ambiguous_aliases() {
+        let cache = Arc::new(ParkingRwLock::new(AHashMap::new()));
+        cache_resolved_exchange(&cache, "MYMZ6", "CBOT");
+        assert_eq!(
+            get_cached_exchange(&cache, "MYMZ6").as_deref(),
+            Some("CBOT")
+        );
+
+        cache_resolved_exchange(&cache, "MYMZ6", "CME");
+        assert_eq!(get_cached_exchange(&cache, "MYMZ6"), None);
+        assert!(cache.read().contains_key("CBOT:MYMZ6"));
+        assert!(cache.read().contains_key("CME:MYMZ6"));
+    }
+
+    #[rstest::rstest]
+    fn exchange_resolution_requires_exactly_one_reference_match() {
+        let instrument_id = InstrumentId::from("MYMZ6.RITHMIC");
+        assert_eq!(
+            select_unique_resolved_exchange(&instrument_id, &["CBOT".to_string()]).unwrap(),
+            "CBOT"
+        );
+        assert!(select_unique_resolved_exchange(&instrument_id, &[]).is_err());
+
+        let e = select_unique_resolved_exchange(
+            &instrument_id,
+            &["CBOT".to_string(), "CME".to_string()],
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("Ambiguous exchange"));
+        assert!(e.to_string().contains("CBOT, CME"));
     }
 
     #[rstest::rstest]
     fn normalize_time_history_bars_keeps_current_open_bar() {
-        let bar_type = BarType::from("ESM6.RITHMIC-1-MINUTE-LAST-EXTERNAL");
+        let bar_type = BarType::from("ESM6.CME.RITHMIC-1-MINUTE-LAST-EXTERNAL");
         let ts_init = UnixNanos::from(5_u64);
         let bars = vec![
             Bar::new(
@@ -2914,7 +3581,7 @@ mod tests {
     #[rstest::rstest]
     fn order_book_snapshot_and_delta_fixtures_produce_expected_depth10() {
         let fixture = load_fixture::<DepthSnapshotFixture>("depth_snapshot_delta.json");
-        let instrument_id = InstrumentId::from("ESM6.RITHMIC");
+        let instrument_id = InstrumentId::from("ESM6.CME.RITHMIC");
         let snapshot_rows: Vec<ResponseDepthByOrderSnapshot> = fixture
             .snapshots
             .into_iter()
@@ -2923,7 +3590,8 @@ mod tests {
         let snapshot_refs: Vec<&ResponseDepthByOrderSnapshot> = snapshot_rows.iter().collect();
         let ts_init = UnixNanos::from(1_700_000_100_500_000_000_u64);
 
-        let mut book = order_book_from_snapshot_rows(instrument_id, &snapshot_refs, 2, 0, ts_init);
+        let mut book =
+            order_book_from_snapshot_rows(instrument_id, &snapshot_refs, 2, 0, ts_init).unwrap();
         let delta_message = fixture.delta.into_message();
         let initial_depth = depth10_from_order_book(&book, ts_init, ts_init);
 
@@ -2962,8 +3630,38 @@ mod tests {
     }
 
     #[rstest::rstest]
+    fn order_book_snapshot_distinguishes_valid_empty_from_missing_or_malformed() {
+        let instrument_id = InstrumentId::from("ESM6.CME.RITHMIC");
+        let ts_init = UnixNanos::from(1_700_000_100_500_000_000_u64);
+        assert!(order_book_from_snapshot_rows(instrument_id, &[], 2, 0, ts_init).is_err());
+
+        let malformed = ResponseDepthByOrderSnapshot {
+            symbol: Some("ESM6".to_string()),
+            exchange: Some("CME".to_string()),
+            sequence_number: None,
+            ..Default::default()
+        };
+        assert!(
+            order_book_from_snapshot_rows(instrument_id, &[&malformed], 2, 0, ts_init).is_err()
+        );
+
+        let valid_empty = ResponseDepthByOrderSnapshot {
+            symbol: Some("ESM6".to_string()),
+            exchange: Some("CME".to_string()),
+            sequence_number: Some(101),
+            ..Default::default()
+        };
+        let book =
+            order_book_from_snapshot_rows(instrument_id, &[&valid_empty], 2, 0, ts_init).unwrap();
+        let depth = depth10_from_order_book(&book, ts_init, ts_init);
+        assert!(depth.bid_counts.iter().all(|count| *count == 0));
+        assert!(depth.ask_counts.iter().all(|count| *count == 0));
+        assert_eq!(book.sequence, 101);
+    }
+
+    #[rstest::rstest]
     fn order_book_price_move_uses_exchange_order_id_identity() {
-        let instrument_id = InstrumentId::from("ESM6.RITHMIC");
+        let instrument_id = InstrumentId::from("ESM6.CME.RITHMIC");
         let snapshot = SnapshotRowFixture {
             template_id: 157,
             user_msg: vec![],
@@ -2982,7 +3680,8 @@ mod tests {
         let snapshot_refs = vec![&snapshot];
         let ts_init = UnixNanos::from(1_700_000_100_500_000_000_u64);
 
-        let mut book = order_book_from_snapshot_rows(instrument_id, &snapshot_refs, 2, 0, ts_init);
+        let mut book =
+            order_book_from_snapshot_rows(instrument_id, &snapshot_refs, 2, 0, ts_init).unwrap();
 
         let delta_message = DepthDeltaFixture {
             template_id: 156,

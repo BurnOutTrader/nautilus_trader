@@ -323,11 +323,28 @@ impl RithmicInstrumentProvider {
     /// Caches a single instrument.
     pub fn cache_instrument(&self, instrument: InstrumentAny) {
         let symbol = instrument.raw_symbol().to_string();
-        let exchange = instrument.exchange().map(|exchange| exchange.to_string());
-        let key = cache_key(&symbol, exchange.as_deref());
+        let Some(exchange) = instrument.exchange().map(|exchange| exchange.to_string()) else {
+            tracing::warn!("Ignoring Rithmic instrument without an exchange: {symbol}");
+            return;
+        };
+        let key = cache_key(&symbol, Some(&exchange));
 
         self.instruments.insert(key, instrument.clone());
-        self.instruments.insert(symbol, instrument);
+        let exchange_count = self
+            .instruments
+            .iter()
+            .filter(|entry| {
+                entry
+                    .key()
+                    .split_once(':')
+                    .is_some_and(|(_, cached_symbol)| cached_symbol == symbol)
+            })
+            .count();
+        if exchange_count == 1 {
+            self.instruments.insert(symbol, instrument);
+        } else {
+            self.instruments.remove(&symbol);
+        }
     }
 
     /// Gets an instrument by symbol.
@@ -347,7 +364,6 @@ impl RithmicInstrumentProvider {
         let key = cache_key(symbol, Some(exchange));
         self.instruments
             .get(&key)
-            .or_else(|| self.instruments.get(symbol))
             .map(|instrument| instrument.value().clone())
     }
 
@@ -408,7 +424,7 @@ impl Debug for RithmicInstrumentProvider {
 mod tests {
     use nautilus_model::{
         enums::AssetClass,
-        identifiers::{InstrumentId, Symbol},
+        identifiers::Symbol,
         instruments::{FuturesContract, InstrumentAny},
         types::{Currency, Price, Quantity},
     };
@@ -427,16 +443,18 @@ mod tests {
             "user",
             "pass",
             "system",
+            "TestApp",
             "fcm",
             "ib",
             "account",
-        );
+        )
+        .unwrap();
         Arc::new(RithmicGateway::new(config))
     }
 
     fn test_instrument(symbol: &str, exchange: &str) -> InstrumentAny {
         InstrumentAny::FuturesContract(FuturesContract::new(
-            InstrumentId::from(format!("{symbol}.RITHMIC")),
+            crate::common::converters::rithmic_instrument_id(symbol, exchange).unwrap(),
             Symbol::new(symbol),
             AssetClass::Index,
             Some(Ustr::from(exchange)),
@@ -506,6 +524,32 @@ mod tests {
 
         let retrieved = provider.get_by_exchange("ESZ4", "CME").unwrap();
         assert_eq!(retrieved.exchange(), Some(Ustr::from("CME")));
+        assert!(provider.get_by_exchange("ESZ4", "CBOT").is_none());
+    }
+
+    #[rstest]
+    fn test_bare_symbol_alias_is_removed_when_exchange_is_ambiguous() {
+        let gateway = test_gateway();
+        let provider = RithmicInstrumentProvider::new(gateway);
+        provider.cache_instrument(test_instrument("ESZ4", "CME"));
+        assert!(provider.get("ESZ4").is_some());
+
+        provider.cache_instrument(test_instrument("ESZ4", "CBOT"));
+
+        assert!(provider.get("ESZ4").is_none());
+        assert_eq!(
+            provider
+                .get_by_exchange("ESZ4", "CME")
+                .and_then(|instrument| instrument.exchange()),
+            Some(Ustr::from("CME"))
+        );
+        assert_eq!(
+            provider
+                .get_by_exchange("ESZ4", "CBOT")
+                .and_then(|instrument| instrument.exchange()),
+            Some(Ustr::from("CBOT"))
+        );
+        assert!(provider.get_by_exchange("ESZ4", "NYMEX").is_none());
     }
 
     #[rstest]

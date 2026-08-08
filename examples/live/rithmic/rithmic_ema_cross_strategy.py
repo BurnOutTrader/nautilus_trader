@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -------------------------------------------------------------------------------------------------
 #  Copyright (C) 2026 Kevin Monaghan. All rights reserved.
 #
@@ -22,21 +21,22 @@ from dataclasses import dataclass
 from typing import TypedDict
 from uuid import uuid4
 
-from nautilus_trader._libnautilus.core import UUID4
-from nautilus_trader._libnautilus.model import AccountId
-from nautilus_trader._libnautilus.model import Bar
-from nautilus_trader._libnautilus.model import BarType
-from nautilus_trader._libnautilus.model import ClientId
-from nautilus_trader._libnautilus.model import ClientOrderId
-from nautilus_trader._libnautilus.model import InstrumentId
 from nautilus_trader._libnautilus.common import LogColor
-from nautilus_trader._libnautilus.model import MarketOrder
-from nautilus_trader._libnautilus.model import OrderSide
-from nautilus_trader._libnautilus.model import Quantity
-from nautilus_trader._libnautilus.model import StrategyId
-from nautilus_trader._libnautilus.model import TimeInForce
-from nautilus_trader._libnautilus.trading import Strategy
-from nautilus_trader._libnautilus.trading import StrategyConfig
+from nautilus_trader._libnautilus.core import UUID4
+from nautilus_trader._libnautilus.model import (
+    AccountId,
+    Bar,
+    BarType,
+    ClientId,
+    ClientOrderId,
+    InstrumentId,
+    MarketOrder,
+    OrderSide,
+    Quantity,
+    StrategyId,
+    TimeInForce,
+)
+from nautilus_trader._libnautilus.trading import Strategy, StrategyConfig
 
 
 @dataclass(frozen=True)
@@ -96,8 +96,12 @@ def _serialize_log_payload(payload) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def _coerce_routes(routes: Sequence[RithmicRoute | RouteConfig]) -> tuple[RithmicRoute, ...]:
-    if isinstance(routes, tuple) and all(isinstance(route, RithmicRoute) for route in routes):
+def _coerce_routes(
+    routes: Sequence[RithmicRoute | RouteConfig],
+) -> tuple[RithmicRoute, ...]:
+    if isinstance(routes, tuple) and all(
+        isinstance(route, RithmicRoute) for route in routes
+    ):
         return routes
 
     parsed: list[RithmicRoute] = []
@@ -123,10 +127,10 @@ def _coerce_routes(routes: Sequence[RithmicRoute | RouteConfig]) -> tuple[Rithmi
 class RithmicEMACrossStrategyConfig(StrategyConfig):
     def __new__(
         cls,
-        instrument_id: str | InstrumentId = "MNQM6.RITHMIC",
+        instrument_id: str | InstrumentId = "MNQM6.CME.RITHMIC",
         data_client_id: str | ClientId = "RITHMIC",
         strategy_id: str | StrategyId = "RITHMIC-EMA-001",
-        bar_type: str | BarType = "MNQM6.RITHMIC-15-SECOND-LAST-EXTERNAL",
+        bar_type: str | BarType = "MNQM6.CME.RITHMIC-15-SECOND-LAST-EXTERNAL",
         trade_size: str | Quantity = "1",
         fast_ema_period: int = 10,
         slow_ema_period: int = 20,
@@ -287,8 +291,12 @@ class RithmicEMACrossStrategy(Strategy):
             self._slow_ema = close
             return
 
-        self._fast_ema = self._fast_alpha * close + (1.0 - self._fast_alpha) * self._fast_ema
-        self._slow_ema = self._slow_alpha * close + (1.0 - self._slow_alpha) * self._slow_ema
+        self._fast_ema = (
+            self._fast_alpha * close + (1.0 - self._fast_alpha) * self._fast_ema
+        )
+        self._slow_ema = (
+            self._slow_alpha * close + (1.0 - self._slow_alpha) * self._slow_ema
+        )
 
     def _process_bar(self, bar: Bar) -> None:
         if (
@@ -305,7 +313,7 @@ class RithmicEMACrossStrategy(Strategy):
             self._warmup_complete = True
             self.log.info(
                 "Historical warmup complete; live Rithmic execution enabled",
-                LogColor.GREEN,
+                color=LogColor.GREEN,
             )
 
         close = _coerce_price(bar.close)
@@ -360,7 +368,9 @@ class RithmicEMACrossStrategy(Strategy):
         )
         self._emit_structured("BAR", payload, LogColor.BLUE)
 
-    def _rebalance_route(self, route: RithmicRoute, *, is_bullish: bool, crossed: bool) -> None:
+    def _rebalance_route(
+        self, route: RithmicRoute, *, is_bullish: bool, crossed: bool
+    ) -> None:
         if not crossed or self._has_active_orders(route):
             return
 
@@ -460,7 +470,9 @@ class RithmicEMACrossStrategy(Strategy):
         return "FLAT"
 
     def _route_net_position(self, route: RithmicRoute) -> float:
-        return float(sum(position.signed_qty for position in self._open_positions(route)))
+        return float(
+            sum(position.signed_qty for position in self._open_positions(route))
+        )
 
     def _emit_structured(
         self,
@@ -493,7 +505,9 @@ class RithmicEMACrossStrategy(Strategy):
         color,
         level: str = "info",
     ) -> None:
-        self._emit_structured("ORDER_EVENT", self._object_payload(event), color, level=level)
+        self._emit_structured(
+            "ORDER_EVENT", self._object_payload(event), color, level=level
+        )
 
     def _log_position_event(self, event, *, color) -> None:
         self._emit_structured("POSITION_EVENT", self._object_payload(event), color)

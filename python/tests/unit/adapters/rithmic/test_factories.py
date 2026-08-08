@@ -30,6 +30,7 @@ class TestRithmicV2Factories:
             username="test_user",
             password="test_pass",
             system_name="Apex",
+            app_name="TestApp",
         )
 
         assert config.system_name == "Apex"
@@ -42,6 +43,7 @@ class TestRithmicV2Factories:
             password="test_pass",
             system_name="Apex",
             account_id="PA-123456",
+            app_name="TestApp",
         )
 
         assert config.account_id == "PA-123456"

@@ -23,26 +23,36 @@
 )]
 
 use std::{
+    collections::hash_map::DefaultHasher,
     fmt::{self, Display},
+    hash::{Hash, Hasher},
     str::FromStr,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use ahash::{AHashMap, AHashSet};
 use async_trait::async_trait;
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use nautilus_common::{
     clients::ExecutionClient,
-    live::{get_runtime, runner::try_get_exec_event_sender},
-    messages::execution::{
-        BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-        GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
-        GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
-        GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
-        SubmitOrderList,
+    live::{
+        get_runtime,
+        runner::{try_get_data_event_sender, try_get_exec_event_sender},
+        task::TaskHandles,
+    },
+    messages::{
+        DataEvent,
+        execution::{
+            BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
+            GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
+            GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
+            GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder,
+            SubmitOrder, SubmitOrderList,
+        },
     },
 };
 use nautilus_core::{
@@ -54,10 +64,10 @@ use nautilus_model::{
     accounts::AccountAny,
     enums::{
         ContingencyType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
-        PositionSideSpecified, TimeInForce,
+        PositionSideSpecified, TimeInForce, TrailingOffsetType,
     },
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, TradeId, Venue, VenueOrderId},
-    instruments::Instrument,
+    instruments::{Instrument, InstrumentAny},
     orders::{LIMIT_ORDER_TYPES, Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
@@ -65,12 +75,12 @@ use nautilus_model::{
 use parking_lot::RwLock as ParkingRwLock;
 use rithmic_rs::{
     OrderSide as RithmicOrderSide, OrderType as RithmicOrderType, RithmicAccount,
-    RithmicBracketOrder, RithmicOcoOrderLeg, TimeInForce as RithmicTif, api::RithmicResponse,
+    RithmicBracketOrder, RithmicOcoOrderLeg, TimeInForce as RithmicTif,
     rti::messages::RithmicMessage,
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use tokio::{
-    sync::{RwLock, broadcast},
+    sync::{Mutex as AsyncMutex, RwLock, broadcast},
     task::JoinHandle,
 };
 
@@ -86,6 +96,11 @@ use crate::{
     providers::{AccountEvent as ProviderAccountEvent, PositionEvent as ProviderPositionEvent},
     shared_gateway::SharedGatewayLease,
 };
+
+use super::client::{CommandFailureKind, OrderCommandError, first_command_response_error};
+
+const ACCOUNT_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(30);
+const ACCOUNT_REGISTRATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 fn to_rithmic_side(side: OrderSide) -> anyhow::Result<RithmicOrderSide> {
     match side {
@@ -119,10 +134,88 @@ fn to_rithmic_tif(tif: TimeInForce) -> anyhow::Result<RithmicTif> {
     }
 }
 
-fn first_response_error(responses: &[RithmicResponse]) -> Option<String> {
-    responses
-        .iter()
-        .find_map(|response| response.error.as_ref().map(|e| e.to_string()))
+fn replay_window_seconds(now: UnixNanos, replay_lookback_secs: u64) -> anyhow::Result<(i32, i32)> {
+    let end_seconds = now.as_u64() / 1_000_000_000;
+    let end_seconds = i32::try_from(end_seconds).map_err(|_| {
+        anyhow::anyhow!("Current UNIX timestamp exceeds Rithmic i32 replay index: {end_seconds}")
+    })?;
+    let lookback = i32::try_from(replay_lookback_secs).map_err(|_| {
+        anyhow::anyhow!(
+            "Execution replay lookback exceeds Rithmic i32 index: {replay_lookback_secs}"
+        )
+    })?;
+    let start_seconds = end_seconds.saturating_sub(lookback).max(0);
+    Ok((start_seconds, end_seconds))
+}
+
+async fn await_account_registration<F>(
+    account_id: AccountId,
+    timeout: Duration,
+    mut is_registered: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> bool,
+{
+    let start = Instant::now();
+
+    loop {
+        if is_registered() {
+            log::info!("Rithmic account {account_id} registered in cache");
+            return Ok(());
+        }
+
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            anyhow::bail!(
+                "Timed out waiting for Rithmic account {account_id} registration after {timeout:?}"
+            );
+        }
+
+        let remaining = timeout.saturating_sub(elapsed);
+        tokio::time::sleep(ACCOUNT_REGISTRATION_POLL_INTERVAL.min(remaining)).await;
+    }
+}
+
+async fn await_account_snapshot_observation(
+    account_registered: &AtomicBool,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let start = Instant::now();
+
+    while !account_registered.load(Ordering::Acquire) {
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            anyhow::bail!("Timed out waiting for a fresh Rithmic account snapshot");
+        }
+        tokio::time::sleep(ACCOUNT_REGISTRATION_POLL_INTERVAL.min(timeout.saturating_sub(elapsed)))
+            .await;
+    }
+    Ok(())
+}
+
+fn invalidate_account_readiness(is_ready: &AtomicBool, account_registered: &AtomicBool) {
+    is_ready.store(false, Ordering::Release);
+    account_registered.store(false, Ordering::Release);
+}
+
+fn observe_fresh_account_snapshot(
+    is_ready: &AtomicBool,
+    account_registered: &AtomicBool,
+    awaiting_snapshot: &mut bool,
+) {
+    account_registered.store(true, Ordering::Release);
+    if *awaiting_snapshot {
+        *awaiting_snapshot = false;
+        is_ready.store(true, Ordering::Release);
+    }
+}
+
+fn lookback_start(ts_now: UnixNanos, lookback_mins: u64) -> UnixNanos {
+    let lookback_ns = lookback_mins
+        .checked_mul(60)
+        .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+        .unwrap_or(u64::MAX);
+    UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
 }
 
 fn emit_order_list_rejected(emitter: &ExecutionEventEmitter, orders: &[OrderAny], reason: &str) {
@@ -130,6 +223,12 @@ fn emit_order_list_rejected(emitter: &ExecutionEventEmitter, orders: &[OrderAny]
 
     for order in orders {
         emitter.emit_order_rejected(order, reason, ts_event, false);
+    }
+}
+
+fn emit_order_list_denied(emitter: &ExecutionEventEmitter, orders: &[OrderAny], reason: &str) {
+    for order in orders {
+        emitter.emit_order_denied(order, reason);
     }
 }
 
@@ -163,12 +262,17 @@ pub struct RithmicLiveExecClient {
     inner: Option<Arc<RithmicExecutionClient>>,
     gateway: Option<SharedGatewayLease>,
     event_task: Option<JoinHandle<()>>,
-    is_connected: Arc<AtomicBool>,
-    pending_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// Authoritative execution readiness, including successful bootstrap/reconciliation.
+    is_ready: Arc<AtomicBool>,
+    /// Owner-thread proof that the execution account was observed in the engine cache.
+    account_registered: Arc<AtomicBool>,
+    reconciliation_gate: Arc<AsyncMutex<()>>,
+    pending_tasks: TaskHandles,
     order_reports_by_client: Arc<DashMap<ClientOrderId, OrderStatusReport>>,
     order_reports_by_venue: Arc<DashMap<VenueOrderId, OrderStatusReport>>,
     fill_reports: Arc<DashMap<String, FillReport>>,
     position_reports: Arc<DashMap<String, PositionStatusReport>>,
+    tracked_orders: Arc<DashMap<ClientOrderId, OrderAny>>,
     resolved_exchanges: Arc<ParkingRwLock<AHashMap<String, String>>>,
 }
 
@@ -177,8 +281,14 @@ impl fmt::Debug for RithmicLiveExecClient {
         f.debug_struct(stringify!(RithmicLiveExecClient))
             .field("client_id", &self.core.client_id)
             .field("account_id", &self.core.account_id)
-            .field("is_connected", &self.is_connected.load(Ordering::Relaxed))
+            .field("is_ready", &self.is_ready.load(Ordering::Acquire))
             .finish()
+    }
+}
+
+impl Drop for RithmicLiveExecClient {
+    fn drop(&mut self) {
+        self.cleanup_resources();
     }
 }
 
@@ -202,12 +312,15 @@ impl RithmicLiveExecClient {
             inner: None,
             gateway: None,
             event_task: None,
-            is_connected: Arc::new(AtomicBool::new(false)),
-            pending_tasks: Arc::new(Mutex::new(Vec::new())),
+            is_ready: Arc::new(AtomicBool::new(false)),
+            account_registered: Arc::new(AtomicBool::new(false)),
+            reconciliation_gate: Arc::new(AsyncMutex::new(())),
+            pending_tasks: TaskHandles::default(),
             order_reports_by_client: Arc::new(DashMap::new()),
             order_reports_by_venue: Arc::new(DashMap::new()),
             fill_reports: Arc::new(DashMap::new()),
             position_reports: Arc::new(DashMap::new()),
+            tracked_orders: Arc::new(DashMap::new()),
             resolved_exchanges: Arc::new(ParkingRwLock::new(AHashMap::new())),
         }
     }
@@ -216,6 +329,13 @@ impl RithmicLiveExecClient {
         self.inner
             .clone()
             .ok_or_else(|| anyhow::anyhow!("RithmicLiveExecClient is not connected"))
+    }
+
+    fn require_ready_inner(&self) -> anyhow::Result<Arc<RithmicExecutionClient>> {
+        if !self.is_ready.load(Ordering::Acquire) {
+            anyhow::bail!("RithmicLiveExecClient is not ready for order commands");
+        }
+        self.require_inner()
     }
 
     /// Spawns an async task on the Rithmic runtime. Errors are logged; the
@@ -229,23 +349,37 @@ impl RithmicLiveExecClient {
                 log::warn!("{description} failed: {e:?}");
             }
         });
-        let mut tasks = self
-            .pending_tasks
-            .lock()
-            .expect("pending_tasks mutex poisoned");
-        tasks.retain(|h| !h.is_finished());
-        tasks.push(handle);
+        self.pending_tasks.push(handle);
     }
 
     fn abort_pending_tasks(&self) {
-        let mut tasks = self
-            .pending_tasks
-            .lock()
-            .expect("pending_tasks mutex poisoned");
+        self.pending_tasks.abort_all();
+    }
 
-        for task in tasks.drain(..) {
+    fn cleanup_resources(&mut self) {
+        if let Some(task) = self.event_task.take() {
             task.abort();
         }
+        self.abort_pending_tasks();
+        self.inner = None;
+        // Dropping the lease schedules its reference-counted asynchronous release.
+        self.gateway = None;
+        self.is_ready.store(false, Ordering::Release);
+        self.account_registered.store(false, Ordering::Release);
+        self.resolved_exchanges.write().clear();
+        self.tracked_orders.clear();
+        self.clear_cached_reports();
+        self.core.set_disconnected();
+    }
+
+    fn reset_emitter(&mut self) {
+        self.emitter = ExecutionEventEmitter::new(
+            self.clock,
+            self.core.trader_id,
+            self.core.account_id,
+            self.core.account_type,
+            self.core.base_currency,
+        );
     }
 
     fn clear_cached_reports(&self) {
@@ -255,12 +389,43 @@ impl RithmicLiveExecClient {
         self.position_reports.clear();
     }
 
+    fn owns_cached_order(&self, client_order_id: ClientOrderId) -> bool {
+        self.core.cache().client_id(&client_order_id) == Some(&self.core.client_id)
+    }
+
+    fn refresh_tracked_orders(&self) {
+        let orders: Vec<OrderAny> = self
+            .core
+            .cache()
+            .orders(Some(&self.core.venue), None, None, None, None)
+            .into_iter()
+            .filter(|order| self.owns_cached_order(order.client_order_id()))
+            .map(|order| order.cloned())
+            .collect();
+        self.tracked_orders.clear();
+
+        for order in orders {
+            self.tracked_orders.insert(order.client_order_id(), order);
+        }
+    }
+
+    async fn await_account_registered(&self, timeout: Duration) -> anyhow::Result<()> {
+        let account_id = self.core.account_id;
+        await_account_registration(account_id, timeout, || {
+            // The cache borrow is scoped to this predicate and is dropped before any await.
+            self.account_registered.load(Ordering::Acquire)
+                && self.core.cache().account(&account_id).is_some()
+        })
+        .await
+    }
+
     async fn cache_missing_instruments_for_reports(
         &self,
         order_reports: &[OrderStatusReport],
         fill_reports: &[FillReport],
         position_reports: &[PositionStatusReport],
     ) {
+        let data_sender = try_get_data_event_sender();
         let Some(gateway) = self.gateway.as_ref().map(SharedGatewayLease::gateway) else {
             return;
         };
@@ -295,10 +460,24 @@ impl RithmicLiveExecClient {
         }
 
         for instrument_id in missing_ids {
-            if let Err(e) =
-                ensure_cached_instrument(&gateway, &self.resolved_exchanges, instrument_id).await
+            match load_reconciliation_instrument(&gateway, &self.resolved_exchanges, instrument_id)
+                .await
             {
-                log::warn!("Failed to cache Rithmic reconciliation instrument: {e}");
+                Ok(instrument) => {
+                    if let Some(sender) = &data_sender {
+                        if let Err(e) = sender.send(DataEvent::Instrument(instrument)) {
+                            log::warn!("Failed to publish Rithmic reconciliation instrument: {e}");
+                        }
+                    } else {
+                        log::warn!(
+                            "No data event sender is installed; reconciliation instrument \
+                             {instrument_id} could not be published to the data engine"
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to load Rithmic reconciliation instrument: {e}");
+                }
             }
         }
     }
@@ -362,12 +541,6 @@ impl RithmicLiveExecClient {
         }
     }
 
-    fn emit_order_list_submitted(&self, orders: &[OrderAny]) {
-        for order in orders {
-            self.emitter.emit_order_submitted(order);
-        }
-    }
-
     fn whole_quantity(quantity: Quantity) -> anyhow::Result<i32> {
         let quantity_decimal = quantity.as_decimal();
 
@@ -384,6 +557,52 @@ impl RithmicLiveExecClient {
         quantity_decimal.to_i32().ok_or_else(|| {
             anyhow::anyhow!("Quantity exceeds Rithmic i32 contract limit: {quantity_decimal}")
         })
+    }
+
+    fn trailing_stop_config(
+        order_type: OrderType,
+        trailing_offset: Option<Decimal>,
+        trailing_offset_type: Option<TrailingOffsetType>,
+    ) -> anyhow::Result<Option<TrailingStopConfig>> {
+        let is_trailing = matches!(
+            order_type,
+            OrderType::TrailingStopMarket | OrderType::TrailingStopLimit
+        );
+
+        if !is_trailing {
+            if trailing_offset.is_some()
+                || trailing_offset_type
+                    .is_some_and(|offset_type| offset_type != TrailingOffsetType::NoTrailingOffset)
+            {
+                anyhow::bail!("Trailing offset is only valid for trailing-stop orders");
+            }
+            return Ok(None);
+        }
+
+        let offset_type = trailing_offset_type
+            .ok_or_else(|| anyhow::anyhow!("Trailing-stop order requires trailing_offset_type"))?;
+
+        if offset_type != TrailingOffsetType::Ticks {
+            anyhow::bail!(
+                "Rithmic only supports TICKS trailing offset type, received {offset_type:?}"
+            );
+        }
+
+        let offset = trailing_offset
+            .ok_or_else(|| anyhow::anyhow!("Trailing-stop order requires trailing_offset"))?;
+
+        if offset <= Decimal::ZERO {
+            anyhow::bail!("Trailing offset must be positive, received: {offset}");
+        }
+
+        if offset.fract() != Decimal::ZERO {
+            anyhow::bail!("Trailing offset must be a whole number of ticks, received: {offset}");
+        }
+
+        let trail_by_ticks = offset.to_i32().ok_or_else(|| {
+            anyhow::anyhow!("Trailing offset exceeds Rithmic i32 tick limit: {offset}")
+        })?;
+        Ok(Some(TrailingStopConfig { trail_by_ticks }))
     }
 
     fn require_positive_tick_distance(
@@ -629,7 +848,7 @@ impl RithmicLiveExecClient {
     }
 
     fn submit_native_oco_order_list(&self, spec: &NativeRithmicOcoSpec) -> anyhow::Result<()> {
-        let inner = self.require_inner()?;
+        let inner = self.require_ready_inner()?;
         let gateway = self
             .gateway
             .as_ref()
@@ -639,12 +858,14 @@ impl RithmicLiveExecClient {
         let account = inner.account().clone();
         let orders = vec![spec.leg1.clone(), spec.leg2.clone()];
 
-        self.emit_order_list_submitted(&orders);
-
         let emitter = self.emitter.clone();
+        let is_ready = Arc::clone(&self.is_ready);
+        let account_registered = Arc::clone(&self.account_registered);
+        let reconciliation_gate = Arc::clone(&self.reconciliation_gate);
+        let replay_lookback_secs = self.config.execution_replay_lookback_secs;
         let spec = spec.clone();
         self.spawn_task("submit_order_list_oco", async move {
-            let result: anyhow::Result<()> = async {
+            let prepared = async {
                 let (leg1_symbol, leg1_exchange) = resolve_contract_exchange(
                     &gateway,
                     &resolved_exchanges,
@@ -704,22 +925,57 @@ impl RithmicLiveExecClient {
                     .order_handle(&account)
                     .ok_or_else(|| anyhow::anyhow!("Order plant not connected"))?;
 
-                let responses = handle
-                    .place_oco_order(leg1, leg2)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("OCO submission failed: {e}"))?;
-
-                if let Some(e) = first_response_error(&responses) {
-                    anyhow::bail!("OCO submission failed: {e}");
-                }
-
-                Ok(())
+                Ok::<_, anyhow::Error>((handle, leg1, leg2))
             }
             .await;
+            let (handle, leg1, leg2) = match prepared {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    emit_order_list_denied(&emitter, &orders, &e.to_string());
+                    return Err(e);
+                }
+            };
 
-            if let Err(e) = result {
-                emit_order_list_rejected(&emitter, &orders, &e.to_string());
-                return Err(e);
+            for order in &orders {
+                emitter.emit_order_submitted(order);
+            }
+
+            let result = match handle.place_oco_order(leg1, leg2).await {
+                Ok(responses) => first_command_response_error(&responses).map_or_else(
+                    || {
+                        responses
+                            .iter()
+                            .any(|response| {
+                                matches!(&response.message, RithmicMessage::ResponseOcoOrder(_))
+                            })
+                            .then_some(())
+                            .ok_or_else(|| {
+                                OrderCommandError::unknown("No OCO-order acknowledgement")
+                            })
+                    },
+                    Err,
+                ),
+                Err(e) => Err(OrderCommandError::from_api(e)),
+            };
+
+            if let Err(failure) = result {
+                match failure.kind() {
+                    CommandFailureKind::Definitive => {
+                        emit_order_list_rejected(&emitter, &orders, &failure.to_string());
+                    }
+                    CommandFailureKind::Unknown => {
+                        reconcile_execution_readiness(
+                            Arc::clone(&inner),
+                            Arc::clone(&is_ready),
+                            Arc::clone(&account_registered),
+                            Arc::clone(&reconciliation_gate),
+                            replay_lookback_secs,
+                            "OCO submission",
+                        )
+                        .await;
+                    }
+                }
+                return Err(anyhow::Error::new(failure));
             }
 
             Ok(())
@@ -732,7 +988,7 @@ impl RithmicLiveExecClient {
         &self,
         spec: &NativeRithmicBracketSpec,
     ) -> anyhow::Result<()> {
-        let inner = self.require_inner()?;
+        let inner = self.require_ready_inner()?;
         let gateway = self
             .gateway
             .as_ref()
@@ -742,12 +998,14 @@ impl RithmicLiveExecClient {
         let account = inner.account().clone();
         let orders = vec![spec.entry.clone(), spec.stop.clone(), spec.target.clone()];
 
-        self.emit_order_list_submitted(&orders);
-
         let emitter = self.emitter.clone();
+        let is_ready = Arc::clone(&self.is_ready);
+        let account_registered = Arc::clone(&self.account_registered);
+        let reconciliation_gate = Arc::clone(&self.reconciliation_gate);
+        let replay_lookback_secs = self.config.execution_replay_lookback_secs;
         let spec = spec.clone();
         self.spawn_task("submit_order_list_bracket", async move {
-            let result: anyhow::Result<()> = async {
+            let prepared = async {
                 let (symbol, exchange) = resolve_contract_exchange(
                     &gateway,
                     &resolved_exchanges,
@@ -773,22 +1031,57 @@ impl RithmicLiveExecClient {
                     .order_handle(&account)
                     .ok_or_else(|| anyhow::anyhow!("Order plant not connected"))?;
 
-                let responses = handle
-                    .place_bracket_order(bracket_order)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Bracket submission failed: {e}"))?;
-
-                if let Some(e) = first_response_error(&responses) {
-                    anyhow::bail!("Bracket submission failed: {e}");
-                }
-
-                Ok(())
+                Ok::<_, anyhow::Error>((handle, bracket_order))
             }
             .await;
+            let (handle, bracket_order) = match prepared {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    emit_order_list_denied(&emitter, &orders, &e.to_string());
+                    return Err(e);
+                }
+            };
 
-            if let Err(e) = result {
-                emit_order_list_rejected(&emitter, &orders, &e.to_string());
-                return Err(e);
+            for order in &orders {
+                emitter.emit_order_submitted(order);
+            }
+
+            let result = match handle.place_bracket_order(bracket_order).await {
+                Ok(responses) => first_command_response_error(&responses).map_or_else(
+                    || {
+                        responses
+                            .iter()
+                            .any(|response| {
+                                matches!(&response.message, RithmicMessage::ResponseBracketOrder(_))
+                            })
+                            .then_some(())
+                            .ok_or_else(|| {
+                                OrderCommandError::unknown("No bracket-order acknowledgement")
+                            })
+                    },
+                    Err,
+                ),
+                Err(e) => Err(OrderCommandError::from_api(e)),
+            };
+
+            if let Err(failure) = result {
+                match failure.kind() {
+                    CommandFailureKind::Definitive => {
+                        emit_order_list_rejected(&emitter, &orders, &failure.to_string());
+                    }
+                    CommandFailureKind::Unknown => {
+                        reconcile_execution_readiness(
+                            Arc::clone(&inner),
+                            Arc::clone(&is_ready),
+                            Arc::clone(&account_registered),
+                            Arc::clone(&reconciliation_gate),
+                            replay_lookback_secs,
+                            "bracket submission",
+                        )
+                        .await;
+                    }
+                }
+                return Err(anyhow::Error::new(failure));
             }
 
             Ok(())
@@ -798,18 +1091,18 @@ impl RithmicLiveExecClient {
     }
 
     /// Builds a `GatewayConfig` for the execution client (order + pnl plants).
-    fn gateway_config(&self) -> GatewayConfig {
+    fn gateway_config(&self) -> crate::error::Result<GatewayConfig> {
         let c = &self.config;
         let mut cfg = GatewayConfig::new(
             c.environment,
             c.username.as_str(),
             c.password.as_str(),
             c.system_name.as_str(),
+            c.app_name.as_str(),
             c.fcm_id.as_deref().unwrap_or(""),
             c.ib_id.as_deref().unwrap_or(""),
             c.account_id.as_str(),
-        );
-        cfg.app_name = c.app_name.clone();
+        )?;
         cfg.app_version = c.app_version.clone();
         cfg.server = c.server.clone();
         cfg.alt_server = c.alt_server.clone();
@@ -817,7 +1110,7 @@ impl RithmicLiveExecClient {
         cfg.enable_order = true;
         cfg.enable_pnl = true;
         cfg.enable_history = false;
-        cfg
+        Ok(cfg)
     }
 
     async fn bootstrap_connection(
@@ -830,9 +1123,10 @@ impl RithmicLiveExecClient {
         inner.query_orders().await?;
 
         if replay_lookback_secs > 0 {
-            let end_sec = (get_atomic_clock_realtime().get_time_ns().as_u64() / 1_000_000_000)
-                .min(i32::MAX as u64) as i32;
-            let start_sec = end_sec.saturating_sub(replay_lookback_secs as i32);
+            let (start_sec, end_sec) = replay_window_seconds(
+                get_atomic_clock_realtime().get_time_ns(),
+                replay_lookback_secs,
+            )?;
 
             if let Err(e) = inner.replay_executions(start_sec, end_sec).await {
                 if is_empty_replay_error(&e) {
@@ -850,7 +1144,7 @@ impl RithmicLiveExecClient {
 #[async_trait(?Send)]
 impl ExecutionClient for RithmicLiveExecClient {
     fn is_connected(&self) -> bool {
-        self.core.is_connected()
+        self.is_ready.load(Ordering::Acquire)
     }
 
     fn client_id(&self) -> ClientId {
@@ -904,29 +1198,40 @@ impl ExecutionClient for RithmicLiveExecClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
-        if self.core.is_stopped() {
-            return Ok(());
-        }
-
         log::info!("Stopping: client_id={}", self.core.client_id);
+        self.cleanup_resources();
+        self.reset_emitter();
+        self.core.set_stopped();
+        Ok(())
+    }
 
-        if let Some(task) = self.event_task.take() {
-            task.abort();
-        }
-        self.abort_pending_tasks();
-        self.is_connected.store(false, Ordering::Relaxed);
-        self.resolved_exchanges.write().clear();
-        self.core.set_disconnected();
+    fn reset(&mut self) -> anyhow::Result<()> {
+        self.cleanup_resources();
+        self.reset_emitter();
+        self.core.set_stopped();
+        Ok(())
+    }
+
+    fn dispose(&mut self) -> anyhow::Result<()> {
+        self.cleanup_resources();
+        self.reset_emitter();
         self.core.set_stopped();
         Ok(())
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        if self.core.is_connected() {
+        self.config.validate()?;
+
+        if self.is_ready.load(Ordering::Acquire) {
             return Ok(());
         }
 
-        let gateway_config = self.gateway_config();
+        if self.gateway.is_some() || self.inner.is_some() || self.event_task.is_some() {
+            self.disconnect().await?;
+        }
+        self.refresh_tracked_orders();
+
+        let gateway_config = self.gateway_config()?;
         let gateway = SharedGatewayLease::acquire(gateway_config.clone());
         let shared_gateway = gateway.gateway();
         let (exec_rx, pnl_rx) = {
@@ -935,10 +1240,9 @@ impl ExecutionClient for RithmicLiveExecClient {
             let pnl_rx = guard.subscribe_pnl_events();
             (exec_rx, pnl_rx)
         };
-        gateway
-            .connect(&gateway_config)
-            .await
-            .map_err(|e| anyhow::anyhow!("Gateway connect failed: {e}"))?;
+        if let Err(e) = gateway.connect(&gateway_config).await {
+            return Err(anyhow::Error::new(e).context("Gateway connect failed"));
+        }
 
         let inner = Arc::new(RithmicExecutionClient::new(
             Arc::clone(&shared_gateway),
@@ -957,11 +1261,14 @@ impl ExecutionClient for RithmicLiveExecClient {
                 inner: Arc::clone(&inner),
                 account_id: self.core.account_id,
                 emitter: self.emitter.clone(),
-                is_connected: Arc::clone(&self.is_connected),
+                is_ready: Arc::clone(&self.is_ready),
+                account_registered: Arc::clone(&self.account_registered),
+                reconciliation_gate: Arc::clone(&self.reconciliation_gate),
                 order_reports_by_client: Arc::clone(&self.order_reports_by_client),
                 order_reports_by_venue: Arc::clone(&self.order_reports_by_venue),
                 fill_reports: Arc::clone(&self.fill_reports),
                 position_reports: Arc::clone(&self.position_reports),
+                tracked_orders: Arc::clone(&self.tracked_orders),
                 replay_lookback_secs: self.config.execution_replay_lookback_secs,
             },
         ));
@@ -969,14 +1276,47 @@ impl ExecutionClient for RithmicLiveExecClient {
         self.inner = Some(inner);
         self.gateway = Some(gateway);
         self.event_task = Some(task);
-        self.is_connected.store(true, Ordering::Relaxed);
+        self.account_registered.store(false, Ordering::Release);
+        let bootstrap_result = {
+            let _guard = self.reconciliation_gate.lock().await;
+            let result = Self::bootstrap_connection(
+                self.require_inner()?,
+                self.config.execution_replay_lookback_secs,
+            )
+            .await;
+
+            let result = match result {
+                Ok(()) => {
+                    self.await_account_registered(ACCOUNT_REGISTRATION_TIMEOUT)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+
+            match result {
+                Ok(())
+                    if self
+                        .event_task
+                        .as_ref()
+                        .is_some_and(|task| !task.is_finished()) =>
+                {
+                    self.is_ready.store(true, Ordering::Release);
+                    Ok(())
+                }
+                Ok(()) => Err(anyhow::anyhow!(
+                    "Rithmic execution event loop stopped during bootstrap"
+                )),
+                Err(e) => Err(e),
+            }
+        };
+
+        if let Err(e) = bootstrap_result {
+            self.disconnect().await?;
+            return Err(e.context("Rithmic execution bootstrap failed"));
+        }
+
         self.core.set_connected();
-        log::info!("Connected: client_id={}", self.core.client_id);
-        Self::bootstrap_connection(
-            self.require_inner()?,
-            self.config.execution_replay_lookback_secs,
-        )
-        .await?;
+        log::info!("Connected and ready: client_id={}", self.core.client_id);
         Ok(())
     }
 
@@ -992,7 +1332,9 @@ impl ExecutionClient for RithmicLiveExecClient {
             gateway.release().await;
         }
         self.clear_cached_reports();
-        self.is_connected.store(false, Ordering::Relaxed);
+        self.is_ready.store(false, Ordering::Release);
+        self.account_registered.store(false, Ordering::Release);
+        self.tracked_orders.clear();
         self.resolved_exchanges.write().clear();
         self.core.set_disconnected();
         log::info!("Disconnected: client_id={}", self.core.client_id);
@@ -1005,7 +1347,7 @@ impl ExecutionClient for RithmicLiveExecClient {
             .cache()
             .order_owned(&cmd.client_order_id)
             .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?;
-        let inner = self.require_inner()?;
+        let inner = self.require_ready_inner()?;
         let gateway = self
             .gateway
             .as_ref()
@@ -1014,59 +1356,116 @@ impl ExecutionClient for RithmicLiveExecClient {
         let resolved_exchanges = Arc::clone(&self.resolved_exchanges);
         let o = &cmd.order_init;
 
-        let trailing_stop = o.trailing_offset.map(|offset| TrailingStopConfig {
-            trail_by_ticks: offset.to_string().parse::<f64>().map_or(0, |f| f as i32),
-        });
-        self.emitter.emit_order_submitted(&order);
+        let preflight = (|| {
+            let quantity = Self::whole_quantity(o.quantity)?;
+            let side = to_rithmic_side(o.order_side)?;
+            let order_type = to_rithmic_order_type(o.order_type)?;
+            let time_in_force = to_rithmic_tif(o.time_in_force)?;
+            let trailing_stop = Self::trailing_stop_config(
+                o.order_type,
+                o.trailing_offset,
+                o.trailing_offset_type,
+            )?;
 
+            if LIMIT_ORDER_TYPES.contains(&o.order_type) && o.price.is_none() {
+                anyhow::bail!("Limit/StopLimit order requires price");
+            }
+
+            if matches!(o.order_type, OrderType::StopMarket | OrderType::StopLimit)
+                && o.trigger_price.is_none()
+            {
+                anyhow::bail!("Stop order requires trigger_price");
+            }
+
+            Ok((quantity, side, order_type, time_in_force, trailing_stop))
+        })();
+        let (quantity, order_side, order_type, time_in_force, trailing_stop) = match preflight {
+            Ok(values) => values,
+            Err(e) => {
+                self.emitter.emit_order_denied(&order, &e.to_string());
+                return Ok(());
+            }
+        };
+
+        self.tracked_orders
+            .insert(order.client_order_id(), order.clone());
         let emitter = self.emitter.clone();
-        let order_for_reject = order;
+        let order_for_events = order;
+        let is_ready = Arc::clone(&self.is_ready);
+        let account_registered = Arc::clone(&self.account_registered);
+        let reconciliation_gate = Arc::clone(&self.reconciliation_gate);
+        let replay_lookback_secs = self.config.execution_replay_lookback_secs;
         let client_order_id = cmd.client_order_id.to_string();
         let instrument_id = cmd.instrument_id;
-        let order_side = o.order_side;
-        let order_type = o.order_type;
-        let time_in_force = o.time_in_force;
-        let quantity = f64::from(o.quantity);
         let price = o.price.map(f64::from);
         let stop_price = o.trigger_price.map(f64::from);
 
         self.spawn_task("submit_order", async move {
-            let result: anyhow::Result<()> = async {
-                let (symbol, exchange) =
-                    resolve_contract_exchange(&gateway, &resolved_exchanges, &instrument_id)
-                        .await?;
-                let request = OrderRequest {
-                    client_order_id,
-                    symbol,
-                    exchange,
-                    side: to_rithmic_side(order_side)?,
-                    order_type: to_rithmic_order_type(order_type)?,
-                    time_in_force: to_rithmic_tif(time_in_force)?,
-                    quantity,
-                    price,
-                    stop_price,
-                    trailing_stop,
-                };
-                inner.submit_order(request).await.map_err(Into::into)
-            }
-            .await;
+            let (symbol, exchange) = match resolve_contract_exchange(
+                &gateway,
+                &resolved_exchanges,
+                &instrument_id,
+            )
+            .await
+            {
+                Ok(contract) => contract,
+                Err(e) => {
+                    emitter.emit_order_denied(&order_for_events, &e.to_string());
+                    return Err(e);
+                }
+            };
+            let request = OrderRequest {
+                client_order_id: client_order_id.clone(),
+                symbol,
+                exchange,
+                side: order_side,
+                order_type,
+                time_in_force,
+                quantity: f64::from(quantity),
+                price,
+                stop_price,
+                trailing_stop,
+            };
+            emitter.emit_order_submitted(&order_for_events);
 
-            if let Err(e) = result {
-                emitter.emit_order_rejected(
-                    &order_for_reject,
-                    &e.to_string(),
-                    get_atomic_clock_realtime().get_time_ns(),
-                    false,
-                );
-                return Err(e);
+            match inner.submit_order_classified(request).await {
+                Ok(()) => Ok(()),
+                Err(failure) => {
+                    match failure.kind() {
+                        CommandFailureKind::Definitive => {
+                            emitter.emit_order_rejected(
+                                &order_for_events,
+                                &failure.to_string(),
+                                get_atomic_clock_realtime().get_time_ns(),
+                                false,
+                            );
+                        }
+                        CommandFailureKind::Unknown => {
+                            reconcile_execution_readiness(
+                                Arc::clone(&inner),
+                                Arc::clone(&is_ready),
+                                Arc::clone(&account_registered),
+                                Arc::clone(&reconciliation_gate),
+                                replay_lookback_secs,
+                                &format!("submit {client_order_id}"),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(anyhow::Error::new(failure))
+                }
             }
-            Ok(())
         });
         Ok(())
     }
 
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
         let orders = self.core.get_orders_for_list(&cmd.order_list)?;
+
+        for order in &orders {
+            self.tracked_orders
+                .insert(order.client_order_id(), order.clone());
+        }
 
         match self.build_native_bracket_spec(&orders) {
             Ok(Some(spec)) => return self.submit_native_bracket_order_list(&spec),
@@ -1095,108 +1494,284 @@ impl ExecutionClient for RithmicLiveExecClient {
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
         let cached_order = self.core.cache().order_owned(&cmd.client_order_id);
-        let inner = self.require_inner()?;
+        let inner = self.require_ready_inner()?;
         let client_order_id = cmd.client_order_id.to_string();
-        let new_qty = cmd.quantity.map(f64::from);
         let new_price = cmd.price.map(f64::from);
 
         if cmd.trigger_price.is_some() {
-            log::warn!(
-                "modify_order: trigger_price modification is not supported by rithmic-rs \
-                (RithmicModifyOrder has no stop_price field). \
-                trigger_price will be ignored for order {}",
-                cmd.client_order_id
-            );
+            let reason = "Rithmic does not support trigger-price modification";
+
+            if let Some(order) = cached_order.as_ref() {
+                self.emitter.emit_order_modify_rejected(
+                    order,
+                    order.venue_order_id(),
+                    reason,
+                    self.clock.get_time_ns(),
+                );
+            } else {
+                self.emitter.emit_order_modify_rejected_event(
+                    cmd.strategy_id,
+                    cmd.instrument_id,
+                    cmd.client_order_id,
+                    cmd.venue_order_id,
+                    reason,
+                    self.clock.get_time_ns(),
+                );
+            }
+            return Ok(());
         }
 
-        let emitter = self.emitter.clone();
-        let command = cmd;
-        self.spawn_task("modify_order", async move {
-            if let Err(e) = inner
-                .modify_order(&client_order_id, new_qty, new_price)
-                .await
-            {
+        let new_qty = match cmd.quantity.map(Self::whole_quantity).transpose() {
+            Ok(quantity) => quantity.map(f64::from),
+            Err(e) => {
                 if let Some(order) = cached_order.as_ref() {
-                    emitter.emit_order_modify_rejected(
+                    self.emitter.emit_order_modify_rejected(
                         order,
                         order.venue_order_id(),
                         &e.to_string(),
-                        get_atomic_clock_realtime().get_time_ns(),
+                        self.clock.get_time_ns(),
                     );
                 } else {
-                    emitter.emit_order_modify_rejected_event(
-                        command.strategy_id,
-                        command.instrument_id,
-                        command.client_order_id,
-                        command.venue_order_id,
+                    self.emitter.emit_order_modify_rejected_event(
+                        cmd.strategy_id,
+                        cmd.instrument_id,
+                        cmd.client_order_id,
+                        cmd.venue_order_id,
                         &e.to_string(),
-                        get_atomic_clock_realtime().get_time_ns(),
+                        self.clock.get_time_ns(),
                     );
                 }
-                return Err(anyhow::Error::from(e));
+                return Ok(());
             }
-            Ok(())
+        };
+
+        let emitter = self.emitter.clone();
+        let is_ready = Arc::clone(&self.is_ready);
+        let account_registered = Arc::clone(&self.account_registered);
+        let reconciliation_gate = Arc::clone(&self.reconciliation_gate);
+        let replay_lookback_secs = self.config.execution_replay_lookback_secs;
+        let command = cmd;
+        self.spawn_task("modify_order", async move {
+            match inner
+                .modify_order_classified(&client_order_id, new_qty, new_price)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(failure) => {
+                    match failure.kind() {
+                        CommandFailureKind::Definitive => {
+                            if let Some(order) = cached_order.as_ref() {
+                                emitter.emit_order_modify_rejected(
+                                    order,
+                                    order.venue_order_id(),
+                                    &failure.to_string(),
+                                    get_atomic_clock_realtime().get_time_ns(),
+                                );
+                            } else {
+                                emitter.emit_order_modify_rejected_event(
+                                    command.strategy_id,
+                                    command.instrument_id,
+                                    command.client_order_id,
+                                    command.venue_order_id,
+                                    &failure.to_string(),
+                                    get_atomic_clock_realtime().get_time_ns(),
+                                );
+                            }
+                        }
+                        CommandFailureKind::Unknown => {
+                            reconcile_execution_readiness(
+                                Arc::clone(&inner),
+                                Arc::clone(&is_ready),
+                                Arc::clone(&account_registered),
+                                Arc::clone(&reconciliation_gate),
+                                replay_lookback_secs,
+                                &format!("modify {client_order_id}"),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(anyhow::Error::new(failure))
+                }
+            }
         });
         Ok(())
     }
 
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
         let cached_order = self.core.cache().order_owned(&cmd.client_order_id);
-        let inner = self.require_inner()?;
+        let inner = self.require_ready_inner()?;
         let client_order_id = cmd.client_order_id.to_string();
 
         let emitter = self.emitter.clone();
+        let is_ready = Arc::clone(&self.is_ready);
+        let account_registered = Arc::clone(&self.account_registered);
+        let reconciliation_gate = Arc::clone(&self.reconciliation_gate);
+        let replay_lookback_secs = self.config.execution_replay_lookback_secs;
         let command = cmd;
         self.spawn_task("cancel_order", async move {
-            if let Err(e) = inner.cancel_order(&client_order_id).await {
-                if let Some(order) = cached_order.as_ref() {
-                    emitter.emit_order_cancel_rejected(
-                        order,
-                        order.venue_order_id(),
-                        &e.to_string(),
-                        get_atomic_clock_realtime().get_time_ns(),
-                    );
-                } else {
-                    emitter.emit_order_cancel_rejected_event(
-                        command.strategy_id,
-                        command.instrument_id,
-                        command.client_order_id,
-                        command.venue_order_id,
-                        &e.to_string(),
-                        get_atomic_clock_realtime().get_time_ns(),
-                    );
+            match inner.cancel_order_classified(&client_order_id).await {
+                Ok(()) => Ok(()),
+                Err(failure) => {
+                    match failure.kind() {
+                        CommandFailureKind::Definitive => {
+                            if let Some(order) = cached_order.as_ref() {
+                                emitter.emit_order_cancel_rejected(
+                                    order,
+                                    order.venue_order_id(),
+                                    &failure.to_string(),
+                                    get_atomic_clock_realtime().get_time_ns(),
+                                );
+                            } else {
+                                emitter.emit_order_cancel_rejected_event(
+                                    command.strategy_id,
+                                    command.instrument_id,
+                                    command.client_order_id,
+                                    command.venue_order_id,
+                                    &failure.to_string(),
+                                    get_atomic_clock_realtime().get_time_ns(),
+                                );
+                            }
+                        }
+                        CommandFailureKind::Unknown => {
+                            reconcile_execution_readiness(
+                                Arc::clone(&inner),
+                                Arc::clone(&is_ready),
+                                Arc::clone(&account_registered),
+                                Arc::clone(&reconciliation_gate),
+                                replay_lookback_secs,
+                                &format!("cancel {client_order_id}"),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(anyhow::Error::new(failure))
                 }
-                return Err(anyhow::Error::from(e));
             }
-            Ok(())
         });
         Ok(())
     }
 
-    fn cancel_all_orders(&self, _cmd: CancelAllOrders) -> anyhow::Result<()> {
-        let inner = self.require_inner()?;
+    fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
+        let inner = self.require_ready_inner()?;
+        let cached_orders: Vec<OrderAny> = self
+            .core
+            .cache()
+            .orders(Some(&self.core.venue), None, None, None, None)
+            .into_iter()
+            .filter(|order| self.owns_cached_order(order.client_order_id()))
+            .filter(|order| order.instrument_id() == cmd.instrument_id)
+            .filter(|order| {
+                cmd.order_side == OrderSide::NoOrderSide || order.order_side() == cmd.order_side
+            })
+            .map(|order| order.cloned())
+            .collect();
+        let emitter = self.emitter.clone();
+        let is_ready = Arc::clone(&self.is_ready);
+        let account_registered = Arc::clone(&self.account_registered);
+        let reconciliation_gate = Arc::clone(&self.reconciliation_gate);
+        let replay_lookback_secs = self.config.execution_replay_lookback_secs;
 
         self.spawn_task("cancel_all_orders", async move {
-            inner.cancel_all_orders().await.map_err(Into::into)
+            match inner.cancel_all_orders_classified().await {
+                Ok(()) => Ok(()),
+                Err(failure) => {
+                    match failure.kind() {
+                        CommandFailureKind::Definitive => {
+                            for order in &cached_orders {
+                                emitter.emit_order_cancel_rejected(
+                                    order,
+                                    order.venue_order_id(),
+                                    &failure.to_string(),
+                                    get_atomic_clock_realtime().get_time_ns(),
+                                );
+                            }
+                        }
+                        CommandFailureKind::Unknown => {
+                            reconcile_execution_readiness(
+                                Arc::clone(&inner),
+                                Arc::clone(&is_ready),
+                                Arc::clone(&account_registered),
+                                Arc::clone(&reconciliation_gate),
+                                replay_lookback_secs,
+                                "cancel all orders",
+                            )
+                            .await;
+                        }
+                    }
+                    Err(anyhow::Error::new(failure))
+                }
+            }
         });
         Ok(())
     }
 
     fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
-        let inner = self.require_inner()?;
-        let ids: Vec<String> = cmd
+        let inner = self.require_ready_inner()?;
+        let cancels: Vec<(CancelOrder, Option<OrderAny>)> = cmd
             .cancels
-            .iter()
-            .map(|o| o.client_order_id.to_string())
+            .into_iter()
+            .map(|cancel| {
+                let order = self.core.cache().order_owned(&cancel.client_order_id);
+                (cancel, order)
+            })
             .collect();
+        let emitter = self.emitter.clone();
+        let is_ready = Arc::clone(&self.is_ready);
+        let account_registered = Arc::clone(&self.account_registered);
+        let reconciliation_gate = Arc::clone(&self.reconciliation_gate);
+        let replay_lookback_secs = self.config.execution_replay_lookback_secs;
 
         self.spawn_task("batch_cancel_orders", async move {
-            let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-            inner
-                .batch_cancel_orders(&id_refs)
-                .await
-                .map(|_| ())
-                .map_err(Into::into)
+            let mut failures = Vec::new();
+            let mut has_unknown = false;
+
+            for (cancel, order) in cancels {
+                let client_order_id = cancel.client_order_id.to_string();
+
+                if let Err(failure) = inner.cancel_order_classified(&client_order_id).await {
+                    match failure.kind() {
+                        CommandFailureKind::Definitive => {
+                            if let Some(order) = order.as_ref() {
+                                emitter.emit_order_cancel_rejected(
+                                    order,
+                                    order.venue_order_id(),
+                                    &failure.to_string(),
+                                    get_atomic_clock_realtime().get_time_ns(),
+                                );
+                            } else {
+                                emitter.emit_order_cancel_rejected_event(
+                                    cancel.strategy_id,
+                                    cancel.instrument_id,
+                                    cancel.client_order_id,
+                                    cancel.venue_order_id,
+                                    &failure.to_string(),
+                                    get_atomic_clock_realtime().get_time_ns(),
+                                );
+                            }
+                        }
+                        CommandFailureKind::Unknown => has_unknown = true,
+                    }
+                    failures.push(format!("{client_order_id}: {failure}"));
+                }
+            }
+
+            if has_unknown {
+                reconcile_execution_readiness(
+                    Arc::clone(&inner),
+                    Arc::clone(&is_ready),
+                    Arc::clone(&account_registered),
+                    Arc::clone(&reconciliation_gate),
+                    replay_lookback_secs,
+                    "batch cancellation",
+                )
+                .await;
+            }
+
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                anyhow::bail!("Batch cancellation failures: {}", failures.join("; "))
+            }
         });
         Ok(())
     }
@@ -1236,12 +1811,13 @@ impl ExecutionClient for RithmicLiveExecClient {
         if let Some(local_order) = self
             .require_inner()?
             .get_order(cmd.client_order_id.as_str())
+            && let Some(order_status) = to_model_order_status(local_order.status)
             && let Some(report) = report_from_local_order_state(
                 self.core.account_id,
                 cmd.client_order_id,
                 cmd.venue_order_id,
                 &local_order,
-                to_model_order_status(local_order.status),
+                order_status,
                 self.clock.get_time_ns(),
                 self.clock.get_time_ns(),
             )
@@ -1325,6 +1901,7 @@ impl ExecutionClient for RithmicLiveExecClient {
             .cache()
             .orders(Some(&self.core.venue), None, None, None, None)
             .into_iter()
+            .filter(|order| self.owns_cached_order(order.client_order_id()))
             .map(|order| order.cloned())
             .collect();
 
@@ -1415,8 +1992,7 @@ impl ExecutionClient for RithmicLiveExecClient {
             return Ok(Some(self.build_current_state_mass_status(ts_now).await?));
         }
 
-        let start = lookback_mins
-            .map(|mins| UnixNanos::from(ts_now.as_u64().saturating_sub(mins * 60 * 1_000_000_000)));
+        let start = lookback_mins.map(|mins| lookback_start(ts_now, mins));
 
         let order_cmd = GenerateOrderStatusReportsBuilder::default()
             .ts_init(ts_now)
@@ -1472,26 +2048,56 @@ async fn run_execution_event_loop(
         inner,
         account_id,
         emitter,
-        is_connected,
+        is_ready,
+        account_registered,
+        reconciliation_gate,
         order_reports_by_client,
         order_reports_by_venue,
         fill_reports,
         position_reports,
+        tracked_orders,
         replay_lookback_secs,
     } = ctx;
+    let reconnect_timeout = tokio::time::sleep(ACCOUNT_REGISTRATION_TIMEOUT);
+    tokio::pin!(reconnect_timeout);
+    let mut awaiting_reconnect_account_snapshot = false;
 
     loop {
         tokio::select! {
+            () = &mut reconnect_timeout, if awaiting_reconnect_account_snapshot => {
+                log::error!(
+                    "Timed out waiting for a fresh Rithmic account snapshot after reconnect"
+                );
+                break;
+            }
             maybe_event = exec_rx.recv() => {
                 let event = match maybe_event {
                     Ok(event) => event,
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         log::warn!("Rithmic execution subscriber lagged by {skipped} events");
+                        let reconciliation = start_event_loop_reconciliation(
+                            Arc::clone(&inner),
+                            Arc::clone(&is_ready),
+                            Arc::clone(&account_registered),
+                            Arc::clone(&reconciliation_gate),
+                            replay_lookback_secs,
+                            "execution stream lag",
+                        ).await;
+                        match reconciliation {
+                            Some(true) => {
+                                awaiting_reconnect_account_snapshot = true;
+                                reconnect_timeout.as_mut().reset(
+                                    tokio::time::Instant::now() + ACCOUNT_REGISTRATION_TIMEOUT,
+                                );
+                            }
+                            Some(false) => {}
+                            None => break,
+                        }
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         log::warn!("Rithmic execution channel closed");
-                        is_connected.store(false, Ordering::Relaxed);
+                        is_ready.store(false, Ordering::Release);
                         break;
                     }
                 };
@@ -1500,11 +2106,14 @@ async fn run_execution_event_loop(
                     continue;
                 }
 
-                inner.apply_event(&event);
+                if !inner.apply_event(&event) {
+                    continue;
+                }
 
                 match event {
                     ExecutionEvent::ConnectionState(ConnectionState::Reconnecting) => {
-                        is_connected.store(false, Ordering::Relaxed);
+                        invalidate_account_readiness(&is_ready, &account_registered);
+                        awaiting_reconnect_account_snapshot = false;
                         let reconnect_result = {
                             let mut gateway = gateway.write().await;
                             gateway.reconnect_if_needed().await
@@ -1512,12 +2121,27 @@ async fn run_execution_event_loop(
 
                         match reconnect_result {
                             Ok(()) => {
-                                is_connected.store(true, Ordering::Relaxed);
+                                let bootstrap_result = {
+                                    let _guard = reconciliation_gate.lock().await;
+                                    let result = RithmicLiveExecClient::bootstrap_connection(
+                                        Arc::clone(&inner),
+                                        replay_lookback_secs,
+                                    ).await;
 
-                                if let Err(e) = RithmicLiveExecClient::bootstrap_connection(
-                                    Arc::clone(&inner),
-                                    replay_lookback_secs,
-                                ).await {
+                                    match result {
+                                        Ok(()) => {
+                                            awaiting_reconnect_account_snapshot = true;
+                                            reconnect_timeout.as_mut().reset(
+                                                tokio::time::Instant::now()
+                                                    + ACCOUNT_REGISTRATION_TIMEOUT,
+                                            );
+                                            Ok(())
+                                        }
+                                        Err(e) => Err(e),
+                                    }
+                                };
+
+                                if let Err(e) = bootstrap_result {
                                     log::error!("Rithmic execution bootstrap after reconnect failed: {e}");
                                     break;
                                 }
@@ -1542,9 +2166,12 @@ async fn run_execution_event_loop(
                             &inner,
                             account_id,
                             &emitter,
-                            &order_reports_by_client,
-                            &order_reports_by_venue,
-                            &fill_reports,
+                            ExecutionUpdateStores {
+                                order_reports_by_client: &order_reports_by_client,
+                                order_reports_by_venue: &order_reports_by_venue,
+                                fill_reports: &fill_reports,
+                                tracked_orders: &tracked_orders,
+                            },
                             other,
                         );
                     }
@@ -1555,21 +2182,134 @@ async fn run_execution_event_loop(
                     Ok(event) => event,
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         log::warn!("Rithmic pnl subscriber lagged by {skipped} events");
+                        let reconciliation = start_event_loop_reconciliation(
+                            Arc::clone(&inner),
+                            Arc::clone(&is_ready),
+                            Arc::clone(&account_registered),
+                            Arc::clone(&reconciliation_gate),
+                            replay_lookback_secs,
+                            "PnL stream lag",
+                        ).await;
+                        match reconciliation {
+                            Some(true) => {
+                                awaiting_reconnect_account_snapshot = true;
+                                reconnect_timeout.as_mut().reset(
+                                    tokio::time::Instant::now() + ACCOUNT_REGISTRATION_TIMEOUT,
+                                );
+                            }
+                            Some(false) => {}
+                            None => break,
+                        }
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         log::warn!("Rithmic pnl channel closed");
+                        is_ready.store(false, Ordering::Release);
                         break;
                     }
                 };
-                process_pnl_update(
+                let observed_account_snapshot = process_pnl_update(
                     account_id,
                     inner.account_id(),
                     &emitter,
                     &position_reports,
                     event,
                 );
+                if observed_account_snapshot {
+                    let was_awaiting_snapshot = awaiting_reconnect_account_snapshot;
+                    observe_fresh_account_snapshot(
+                        &is_ready,
+                        &account_registered,
+                        &mut awaiting_reconnect_account_snapshot,
+                    );
+                    if was_awaiting_snapshot {
+                        log::info!(
+                            "Rithmic execution readiness restored after fresh account snapshot"
+                        );
+                    }
+                }
             }
+        }
+    }
+
+    is_ready.store(false, Ordering::Release);
+    account_registered.store(false, Ordering::Release);
+}
+
+async fn reconcile_execution_readiness(
+    inner: Arc<RithmicExecutionClient>,
+    is_ready: Arc<AtomicBool>,
+    account_registered: Arc<AtomicBool>,
+    reconciliation_gate: Arc<AsyncMutex<()>>,
+    replay_lookback_secs: u64,
+    reason: &str,
+) -> bool {
+    single_flight_reconciliation(is_ready, reconciliation_gate, reason, || async move {
+        account_registered.store(false, Ordering::Release);
+        RithmicLiveExecClient::bootstrap_connection(inner, replay_lookback_secs).await?;
+        await_account_snapshot_observation(&account_registered, ACCOUNT_REGISTRATION_TIMEOUT).await
+    })
+    .await
+}
+
+/// Starts reconciliation from inside the event loop without waiting on the account snapshot that
+/// the same loop must consume. `Some(true)` means readiness must remain false until that snapshot;
+/// `Some(false)` means another single-flight caller already restored readiness.
+async fn start_event_loop_reconciliation(
+    inner: Arc<RithmicExecutionClient>,
+    is_ready: Arc<AtomicBool>,
+    account_registered: Arc<AtomicBool>,
+    reconciliation_gate: Arc<AsyncMutex<()>>,
+    replay_lookback_secs: u64,
+    reason: &str,
+) -> Option<bool> {
+    let initiated_from_ready = is_ready.swap(false, Ordering::AcqRel);
+    log::warn!("Rithmic execution state is stale after {reason}; reconciling");
+    let _guard = reconciliation_gate.lock().await;
+
+    if !initiated_from_ready && is_ready.load(Ordering::Acquire) {
+        log::debug!("Rithmic execution readiness was already restored after {reason}");
+        return Some(false);
+    }
+
+    account_registered.store(false, Ordering::Release);
+    match RithmicLiveExecClient::bootstrap_connection(inner, replay_lookback_secs).await {
+        Ok(()) => Some(true),
+        Err(e) => {
+            log::error!("Rithmic execution reconciliation failed after {reason}: {e}");
+            None
+        }
+    }
+}
+
+async fn single_flight_reconciliation<F, Fut>(
+    is_ready: Arc<AtomicBool>,
+    reconciliation_gate: Arc<AsyncMutex<()>>,
+    reason: &str,
+    reconcile: F,
+) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let initiated_from_ready = is_ready.swap(false, Ordering::AcqRel);
+    log::warn!("Rithmic execution state is stale after {reason}; reconciling");
+    let _guard = reconciliation_gate.lock().await;
+
+    if !initiated_from_ready && is_ready.load(Ordering::Acquire) {
+        log::debug!("Rithmic execution readiness was already restored after {reason}");
+        return true;
+    }
+
+    match reconcile().await {
+        Ok(()) => {
+            is_ready.store(true, Ordering::Release);
+            log::info!("Rithmic execution readiness restored after {reason}");
+            true
+        }
+        Err(e) => {
+            log::error!("Rithmic execution reconciliation failed after {reason}: {e}");
+            false
         }
     }
 }
@@ -1626,11 +2366,11 @@ fn event_venue_order_id(event: &ExecutionEvent) -> Option<&str> {
     }
 }
 
-async fn ensure_cached_instrument(
+async fn load_reconciliation_instrument(
     gateway: &Arc<RwLock<RithmicGateway>>,
     resolved_exchanges: &Arc<ParkingRwLock<AHashMap<String, String>>>,
     instrument_id: InstrumentId,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<InstrumentAny> {
     let (symbol, exchange) =
         resolve_contract_exchange(gateway, resolved_exchanges, &instrument_id).await?;
     let ticker = {
@@ -1661,10 +2401,12 @@ async fn ensure_cached_instrument(
         .await
         && let RithmicMessage::ResponseAuxilliaryReferenceData(aux) = &aux_resp.message
     {
-        apply_auxiliary_reference_data(&mut instrument, aux);
+        apply_auxiliary_reference_data(&mut instrument, aux).map_err(|e| {
+            anyhow::anyhow!("Failed to apply auxiliary data for {instrument_id}: {e}")
+        })?;
     }
 
-    Ok(())
+    Ok(InstrumentAny::FuturesContract(instrument))
 }
 
 struct ExecutionEventLoopContext {
@@ -1672,30 +2414,65 @@ struct ExecutionEventLoopContext {
     inner: Arc<RithmicExecutionClient>,
     account_id: AccountId,
     emitter: ExecutionEventEmitter,
-    is_connected: Arc<AtomicBool>,
+    is_ready: Arc<AtomicBool>,
+    account_registered: Arc<AtomicBool>,
+    reconciliation_gate: Arc<AsyncMutex<()>>,
     order_reports_by_client: Arc<DashMap<ClientOrderId, OrderStatusReport>>,
     order_reports_by_venue: Arc<DashMap<VenueOrderId, OrderStatusReport>>,
     fill_reports: Arc<DashMap<String, FillReport>>,
     position_reports: Arc<DashMap<String, PositionStatusReport>>,
+    tracked_orders: Arc<DashMap<ClientOrderId, OrderAny>>,
     replay_lookback_secs: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ExecutionUpdateStores<'a> {
+    order_reports_by_client: &'a DashMap<ClientOrderId, OrderStatusReport>,
+    order_reports_by_venue: &'a DashMap<VenueOrderId, OrderStatusReport>,
+    fill_reports: &'a DashMap<String, FillReport>,
+    tracked_orders: &'a DashMap<ClientOrderId, OrderAny>,
 }
 
 fn process_execution_update(
     inner: &RithmicExecutionClient,
     account_id: AccountId,
     emitter: &ExecutionEventEmitter,
-    order_reports_by_client: &DashMap<ClientOrderId, OrderStatusReport>,
-    order_reports_by_venue: &DashMap<VenueOrderId, OrderStatusReport>,
-    fill_reports: &DashMap<String, FillReport>,
+    stores: ExecutionUpdateStores<'_>,
     event: ExecutionEvent,
 ) {
+    let ExecutionUpdateStores {
+        order_reports_by_client,
+        order_reports_by_venue,
+        fill_reports,
+        tracked_orders,
+    } = stores;
+
     match event {
         ExecutionEvent::Submitted(event) => {
+            let tracked_order = make_client_order_id(&event.client_order_id)
+                .and_then(|client_order_id| tracked_orders.get(&client_order_id))
+                .map(|order| order.clone());
             let local_order = local_order_for_event(
                 inner,
                 event.client_order_id.as_str(),
                 event.venue_order_id.as_deref(),
             );
+            if let (Some(order), Some(venue_order_id)) = (
+                tracked_order.as_ref(),
+                event
+                    .venue_order_id
+                    .as_deref()
+                    .and_then(make_venue_order_id),
+            ) {
+                seed_tracked_order_report(
+                    account_id,
+                    order,
+                    venue_order_id,
+                    UnixNanos::from(event.ts_event),
+                    order_reports_by_client,
+                    order_reports_by_venue,
+                );
+            }
             let report = coalesce_snapshot_report(
                 build_submitted_report(
                     account_id,
@@ -1716,17 +2493,33 @@ fn process_execution_update(
                     report.clone(),
                 );
 
-                if !event.context.is_snapshot && local_order.is_none() {
+                if !event.context.is_snapshot && tracked_order.is_none() && local_order.is_none() {
                     emitter.send_order_status_report(report);
                 }
             }
         }
         ExecutionEvent::Accepted(event) => {
+            let tracked_order = make_client_order_id(&event.client_order_id)
+                .and_then(|client_order_id| tracked_orders.get(&client_order_id))
+                .map(|order| order.clone());
             let local_order = local_order_for_event(
                 inner,
                 event.client_order_id.as_str(),
                 Some(event.venue_order_id.as_str()),
             );
+            if let (Some(order), Some(venue_order_id)) = (
+                tracked_order.as_ref(),
+                make_venue_order_id(&event.venue_order_id),
+            ) {
+                seed_tracked_order_report(
+                    account_id,
+                    order,
+                    venue_order_id,
+                    UnixNanos::from(event.ts_event),
+                    order_reports_by_client,
+                    order_reports_by_venue,
+                );
+            }
             let report = coalesce_snapshot_report(
                 build_accept_report(
                     account_id,
@@ -1747,10 +2540,17 @@ fn process_execution_update(
             if !event.context.is_snapshot
                 && let Some(report) = report
             {
-                emitter.send_order_status_report(report);
+                if let Some(order) = tracked_order.as_ref() {
+                    emitter.emit_order_accepted(order, report.venue_order_id, report.ts_last);
+                } else {
+                    emitter.send_order_status_report(report);
+                }
             }
         }
         ExecutionEvent::Rejected(event) => {
+            let tracked_order = make_client_order_id(&event.client_order_id)
+                .and_then(|client_order_id| tracked_orders.get(&client_order_id))
+                .map(|order| order.clone());
             let local_order = local_order_for_event(inner, event.client_order_id.as_str(), None);
             let report = coalesce_snapshot_report(
                 build_rejected_report(
@@ -1769,18 +2569,41 @@ fn process_execution_update(
                 store_order_report(order_reports_by_client, order_reports_by_venue, report);
             }
 
-            if !event.context.is_snapshot
-                && let Some(report) = report
-            {
-                emitter.send_order_status_report(report);
+            if !event.context.is_snapshot {
+                if let Some(order) = tracked_order.as_ref().filter(|_| report.is_some()) {
+                    emitter.emit_order_rejected(
+                        order,
+                        &event.reason,
+                        UnixNanos::from(event.ts_event),
+                        false,
+                    );
+                } else if let Some(report) = report {
+                    emitter.send_order_status_report(report);
+                }
             }
         }
         ExecutionEvent::Modified(event) => {
+            let tracked_order = make_client_order_id(&event.client_order_id)
+                .and_then(|client_order_id| tracked_orders.get(&client_order_id))
+                .map(|order| order.clone());
             let local_order = local_order_for_event(
                 inner,
                 event.client_order_id.as_str(),
                 Some(event.venue_order_id.as_str()),
             );
+            if let (Some(order), Some(venue_order_id)) = (
+                tracked_order.as_ref(),
+                make_venue_order_id(&event.venue_order_id),
+            ) {
+                seed_tracked_order_report(
+                    account_id,
+                    order,
+                    venue_order_id,
+                    UnixNanos::from(event.ts_event),
+                    order_reports_by_client,
+                    order_reports_by_venue,
+                );
+            }
             let report = coalesce_snapshot_report(
                 build_modified_report(
                     account_id,
@@ -1801,15 +2624,43 @@ fn process_execution_update(
             if !event.context.is_snapshot
                 && let Some(report) = report
             {
-                emitter.send_order_status_report(report);
+                if let Some(order) = tracked_order.as_ref() {
+                    emitter.emit_order_updated(
+                        order,
+                        report.venue_order_id,
+                        report.quantity,
+                        report.price,
+                        report.trigger_price,
+                        None,
+                        report.ts_last,
+                    );
+                } else {
+                    emitter.send_order_status_report(report);
+                }
             }
         }
         ExecutionEvent::Cancelled(event) => {
+            let tracked_order = make_client_order_id(&event.client_order_id)
+                .and_then(|client_order_id| tracked_orders.get(&client_order_id))
+                .map(|order| order.clone());
             let local_order = local_order_for_event(
                 inner,
                 event.client_order_id.as_str(),
                 Some(event.venue_order_id.as_str()),
             );
+            if let (Some(order), Some(venue_order_id)) = (
+                tracked_order.as_ref(),
+                make_venue_order_id(&event.venue_order_id),
+            ) {
+                seed_tracked_order_report(
+                    account_id,
+                    order,
+                    venue_order_id,
+                    UnixNanos::from(event.ts_event),
+                    order_reports_by_client,
+                    order_reports_by_venue,
+                );
+            }
             let report = coalesce_snapshot_report(
                 build_cancelled_report(
                     account_id,
@@ -1830,15 +2681,35 @@ fn process_execution_update(
             if !event.context.is_snapshot
                 && let Some(report) = report
             {
-                emitter.send_order_status_report(report);
+                if let Some(order) = tracked_order.as_ref() {
+                    emitter.emit_order_canceled(order, Some(report.venue_order_id), report.ts_last);
+                } else {
+                    emitter.send_order_status_report(report);
+                }
             }
         }
         ExecutionEvent::Filled(event) => {
+            let tracked_order = make_client_order_id(&event.client_order_id)
+                .and_then(|client_order_id| tracked_orders.get(&client_order_id))
+                .map(|order| order.clone());
             let local_order = local_order_for_event(
                 inner,
                 event.client_order_id.as_str(),
                 Some(event.venue_order_id.as_str()),
             );
+            if let (Some(order), Some(venue_order_id)) = (
+                tracked_order.as_ref(),
+                make_venue_order_id(&event.venue_order_id),
+            ) {
+                seed_tracked_order_report(
+                    account_id,
+                    order,
+                    venue_order_id,
+                    UnixNanos::from(event.ts_event),
+                    order_reports_by_client,
+                    order_reports_by_venue,
+                );
+            }
             let fill_report = build_fill_report(
                 account_id,
                 &event,
@@ -1846,11 +2717,15 @@ fn process_execution_update(
                 order_reports_by_client,
                 order_reports_by_venue,
             );
-            let fill_key = fill_report.as_ref().map(fill_report_key);
-
-            if let (Some(key), Some(report)) = (fill_key, fill_report.clone()) {
-                fill_reports.insert(key, report);
-            }
+            let is_new_fill = fill_report.as_ref().is_some_and(|report| {
+                match fill_reports.entry(fill_report_key(report)) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(report.clone());
+                        true
+                    }
+                    Entry::Occupied(_) => false,
+                }
+            });
 
             let order_report = coalesce_snapshot_report(
                 build_fill_status_report(
@@ -1871,12 +2746,29 @@ fn process_execution_update(
             }
 
             if !event.context.is_snapshot
+                && is_new_fill
                 && let Some(report) = fill_report
             {
-                emitter.send_fill_report(report);
+                if let Some(order) = tracked_order.as_ref() {
+                    emitter.emit_order_filled(
+                        order,
+                        report.venue_order_id,
+                        report.venue_position_id,
+                        report.trade_id,
+                        report.last_qty,
+                        report.last_px,
+                        report.commission.currency,
+                        Some(report.commission),
+                        report.liquidity_side,
+                        report.ts_event,
+                    );
+                } else {
+                    emitter.send_fill_report(report);
+                }
             }
 
             if !event.context.is_snapshot
+                && tracked_order.is_none()
                 && let Some(report) = order_report
             {
                 emitter.send_order_status_report(report);
@@ -1895,43 +2787,65 @@ fn process_pnl_update(
     emitter: &ExecutionEventEmitter,
     position_reports: &DashMap<String, PositionStatusReport>,
     event: PnlEvent,
-) {
+) -> bool {
     match event {
         PnlEvent::Account(ProviderAccountEvent::BalanceUpdate(balance)) => {
             if balance.account_id != venue_account_id {
-                return;
+                return false;
             }
-            let currency = parse_currency(&balance.currency).unwrap_or_else(Currency::USD);
-            let total = Money::new(balance.total, currency);
-            let locked = Money::new(balance.locked, currency);
-            let free = total - locked;
+            let Some(currency) = parse_wire_currency(&balance.currency, "PnL balance") else {
+                return false;
+            };
+            let Some(total) = make_money(balance.total, currency) else {
+                return false;
+            };
+            let Some(locked) = make_money(balance.locked, currency) else {
+                return false;
+            };
+            let Some(free) = make_money(balance.available, currency) else {
+                return false;
+            };
+            let Ok(account_balance) = AccountBalance::new_checked(total, locked, free) else {
+                log::warn!(
+                    "Ignoring inconsistent Rithmic PnL balance for {account_id}: total={total}, locked={locked}, free={free}"
+                );
+                return false;
+            };
             emitter.emit_account_state(
-                vec![AccountBalance::new(total, locked, free)],
+                vec![account_balance],
                 Vec::new(),
                 true,
                 UnixNanos::from(balance.ts_event),
             );
+            balance.is_snapshot
         }
         PnlEvent::Account(ProviderAccountEvent::Error(e)) => {
             log::error!("Rithmic pnl account error: {e}");
+            false
         }
         PnlEvent::Account(ProviderAccountEvent::MarginWarning {
             account_id: warning_account_id,
             message,
         }) => {
             if warning_account_id != venue_account_id {
-                return;
+                return false;
             }
             log::warn!("Rithmic pnl margin warning for {account_id}: {message}");
+            false
         }
         PnlEvent::Position(
             ProviderPositionEvent::Opened(position) | ProviderPositionEvent::Updated(position),
         ) => {
             if position.account_id != venue_account_id {
-                return;
+                return false;
             }
-            let instrument_id = make_instrument_id(&position.symbol, &position.exchange);
-            let quantity = make_quantity(position.quantity.abs(), 0);
+            let Some(instrument_id) = make_instrument_id(&position.symbol, &position.exchange)
+            else {
+                return false;
+            };
+            let Some(quantity) = make_quantity(position.quantity.abs(), 0) else {
+                return false;
+            };
             let position_side = if position.quantity > 0.0 {
                 PositionSideSpecified::Long
             } else if position.quantity < 0.0 {
@@ -1941,8 +2855,16 @@ fn process_pnl_update(
             };
             let avg_px_open = if position.quantity == 0.0 {
                 None
+            } else if let Some(avg_px) = Decimal::from_f64_retain(position.avg_price) {
+                Some(avg_px)
             } else {
-                Decimal::from_f64_retain(position.avg_price)
+                log::warn!(
+                    "Ignoring Rithmic position with invalid average price: symbol={} exchange={} avg_price={}",
+                    position.symbol,
+                    position.exchange,
+                    position.avg_price
+                );
+                return false;
             };
             let report = PositionStatusReport::new(
                 account_id,
@@ -1956,6 +2878,7 @@ fn process_pnl_update(
                 avg_px_open,
             );
             position_reports.insert(instrument_id.to_string(), report);
+            false
         }
         PnlEvent::Position(ProviderPositionEvent::Closed {
             account_id: closed_account_id,
@@ -1964,19 +2887,33 @@ fn process_pnl_update(
             ..
         }) => {
             if closed_account_id != venue_account_id {
-                return;
+                return false;
             }
-            let instrument_id = make_instrument_id(&symbol, &exchange);
+            let Some(instrument_id) = make_instrument_id(&symbol, &exchange) else {
+                return false;
+            };
             position_reports.remove(&instrument_id.to_string());
+            false
         }
         PnlEvent::Position(ProviderPositionEvent::Error(e)) => {
             log::error!("Rithmic pnl position error: {e}");
+            false
         }
     }
 }
 
 fn parse_currency(value: &str) -> Option<Currency> {
     Currency::from_str(value).ok()
+}
+
+fn parse_wire_currency(value: &str, source: &str) -> Option<Currency> {
+    match parse_currency(value) {
+        Some(currency) => Some(currency),
+        None => {
+            log::warn!("Ignoring Rithmic {source} with invalid currency {value:?}");
+            None
+        }
+    }
 }
 
 fn report_from_cache_order(
@@ -2014,6 +2951,52 @@ fn report_from_cache_order(
     sanitize_order_report(report, "cache")
 }
 
+fn seed_tracked_order_report(
+    account_id: AccountId,
+    order: &OrderAny,
+    venue_order_id: VenueOrderId,
+    ts_event: UnixNanos,
+    client_reports: &DashMap<ClientOrderId, OrderStatusReport>,
+    venue_reports: &DashMap<VenueOrderId, OrderStatusReport>,
+) {
+    if client_reports.contains_key(&order.client_order_id())
+        || venue_reports.contains_key(&venue_order_id)
+    {
+        return;
+    }
+
+    let mut report = OrderStatusReport::new(
+        account_id,
+        order.instrument_id(),
+        Some(order.client_order_id()),
+        venue_order_id,
+        order.order_side(),
+        order.order_type(),
+        order.time_in_force(),
+        OrderStatus::Submitted,
+        order.quantity(),
+        order.filled_qty(),
+        ts_event,
+        ts_event,
+        get_atomic_clock_realtime().get_time_ns(),
+        None,
+    );
+    report.price = order.price();
+    report.trigger_price = order.trigger_price();
+    report.avg_px = order.avg_px();
+    report.post_only = order.is_post_only();
+    report.reduce_only = order.is_reduce_only();
+    report.venue_position_id = order.position_id();
+    report.order_list_id = order.order_list_id();
+    report.parent_order_id = order.parent_order_id();
+    report.linked_order_ids = order.linked_order_ids().map(|ids| ids.to_vec());
+    report.expire_time = order.expire_time();
+
+    if let Some(report) = sanitize_order_report(report, "tracked") {
+        store_order_report(client_reports, venue_reports, report);
+    }
+}
+
 fn infer_price_precision(value: f64) -> u8 {
     let s = format!("{value:.12}");
     let trimmed = s.trim_end_matches('0').trim_end_matches('.');
@@ -2032,9 +3015,18 @@ fn report_from_local_order_state(
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> Option<OrderStatusReport> {
-    let venue_order_id =
-        venue_order_id.or_else(|| order.venue_order_id.as_deref().map(VenueOrderId::from))?;
-    let instrument_id = make_instrument_id(&order.symbol, &order.exchange);
+    let venue_order_id = venue_order_id.or_else(|| {
+        order
+            .venue_order_id
+            .as_deref()
+            .and_then(make_venue_order_id)
+    })?;
+    let instrument_id = make_instrument_id(&order.symbol, &order.exchange)?;
+    let order_side = to_model_side(order.side)?;
+    let order_type = to_model_order_type(order.order_type)?;
+    let time_in_force = to_model_tif(order.time_in_force)?;
+    let quantity = make_quantity(order.quantity, 0)?;
+    let filled_qty = make_quantity(order.filled_qty, 0)?;
     let price_precision = order
         .price
         .or(order.trigger_price)
@@ -2045,12 +3037,12 @@ fn report_from_local_order_state(
         instrument_id,
         Some(client_order_id),
         venue_order_id,
-        to_model_side(order.side),
-        to_model_order_type(order.order_type),
-        to_model_tif(order.time_in_force),
+        order_side,
+        order_type,
+        time_in_force,
         order_status,
-        make_quantity(order.quantity, 0),
-        make_quantity(order.filled_qty, 0),
+        quantity,
+        filled_qty,
         ts_event,
         ts_event,
         ts_init,
@@ -2181,6 +3173,24 @@ fn fill_report_key(report: &FillReport) -> String {
     format!("{}:{}", report.venue_order_id, report.trade_id)
 }
 
+/// Builds a bounded fallback trade ID when Rithmic omits `fill_id`.
+///
+/// The 64-bit digest makes same-timestamp fills with different immutable fields distinct while
+/// keeping the identifier short. As with any bounded digest, a theoretical hash collision can
+/// still cause two otherwise distinct fills to share an ID.
+fn fallback_fill_trade_id(event: &crate::execution::OrderFilled) -> Option<TradeId> {
+    let mut hasher = DefaultHasher::new();
+    event.venue_order_id.hash(&mut hasher);
+    event.client_order_id.hash(&mut hasher);
+    event.account_id.hash(&mut hasher);
+    event.ts_event.hash(&mut hasher);
+    event.fill_price.to_bits().hash(&mut hasher);
+    event.fill_qty.to_bits().hash(&mut hasher);
+    event.commission.to_bits().hash(&mut hasher);
+    event.currency.hash(&mut hasher);
+    make_trade_id(&format!("RITHMIC-{:016x}", hasher.finish()))
+}
+
 fn matches_order_report(report: &OrderStatusReport, cmd: &GenerateOrderStatusReports) -> bool {
     if cmd
         .instrument_id
@@ -2252,16 +3262,75 @@ fn sort_position_reports(reports: &mut [PositionStatusReport]) {
     });
 }
 
-fn make_instrument_id(symbol: &str, _exchange: &str) -> InstrumentId {
-    crate::common::converters::rithmic_instrument_id(symbol)
+fn make_instrument_id(symbol: &str, exchange: &str) -> Option<InstrumentId> {
+    match crate::common::converters::rithmic_instrument_id(symbol, exchange) {
+        Ok(instrument_id) => Some(instrument_id),
+        Err(e) => {
+            log::warn!(
+                "Ignoring Rithmic execution payload with invalid instrument identity \
+                 symbol={symbol:?} exchange={exchange:?}: {e}"
+            );
+            None
+        }
+    }
 }
 
-fn make_quantity(value: f64, precision: u8) -> Quantity {
-    Quantity::new(value, precision)
+fn make_client_order_id(value: &str) -> Option<ClientOrderId> {
+    ClientOrderId::new_checked(value)
+        .map_err(|e| {
+            log::warn!(
+                "Ignoring Rithmic execution payload with invalid client order ID {value:?}: {e}"
+            );
+        })
+        .ok()
 }
 
-fn make_price(value: f64, precision: u8) -> Price {
-    Price::new(value, precision)
+fn make_venue_order_id(value: &str) -> Option<VenueOrderId> {
+    VenueOrderId::new_checked(value)
+        .map_err(|e| {
+            log::warn!(
+                "Ignoring Rithmic execution payload with invalid venue order ID {value:?}: {e}"
+            );
+        })
+        .ok()
+}
+
+fn make_trade_id(value: &str) -> Option<TradeId> {
+    TradeId::new_checked(value)
+        .map_err(|e| {
+            log::warn!("Ignoring Rithmic execution payload with invalid trade ID {value:?}: {e}");
+        })
+        .ok()
+}
+
+fn make_quantity(value: f64, precision: u8) -> Option<Quantity> {
+    Quantity::new_checked(value, precision)
+        .map_err(|e| {
+            log::warn!(
+                "Ignoring Rithmic execution payload with invalid quantity {value} at precision {precision}: {e}"
+            );
+        })
+        .ok()
+}
+
+fn make_price(value: f64, precision: u8) -> Option<Price> {
+    Price::new_checked(value, precision)
+        .map_err(|e| {
+            log::warn!(
+                "Ignoring Rithmic execution payload with invalid price {value} at precision {precision}: {e}"
+            );
+        })
+        .ok()
+}
+
+fn make_money(value: f64, currency: Currency) -> Option<Money> {
+    Money::new_checked(value, currency)
+        .map_err(|e| {
+            log::warn!(
+                "Ignoring Rithmic execution payload with invalid money amount {value} {currency}: {e}"
+            );
+        })
+        .ok()
 }
 
 fn resolve_instrument_id(
@@ -2271,13 +3340,15 @@ fn resolve_instrument_id(
 ) -> Option<InstrumentId> {
     previous
         .map(|report| report.instrument_id)
-        .or_else(|| local_order.map(|order| make_instrument_id(&order.symbol, &order.exchange)))
+        .or_else(|| {
+            local_order.and_then(|order| make_instrument_id(&order.symbol, &order.exchange))
+        })
         .or_else(|| {
             context
                 .symbol
                 .as_deref()
                 .zip(context.exchange.as_deref())
-                .map(|(symbol, exchange)| make_instrument_id(symbol, exchange))
+                .and_then(|(symbol, exchange)| make_instrument_id(symbol, exchange))
         })
 }
 
@@ -2285,36 +3356,33 @@ fn resolve_order_side(
     previous: Option<&OrderStatusReport>,
     local_order: Option<&OrderState>,
     context: &crate::execution::OrderContext,
-) -> OrderSide {
+) -> Option<OrderSide> {
     previous
         .map(|report| report.order_side)
-        .or_else(|| local_order.map(|order| to_model_side(order.side)))
-        .or_else(|| context.side.map(to_model_side))
-        .unwrap_or(OrderSide::Buy)
+        .or_else(|| local_order.and_then(|order| to_model_side(order.side)))
+        .or_else(|| context.side.and_then(to_model_side))
 }
 
 fn resolve_order_type(
     previous: Option<&OrderStatusReport>,
     local_order: Option<&OrderState>,
     context: &crate::execution::OrderContext,
-) -> OrderType {
+) -> Option<OrderType> {
     previous
         .map(|report| report.order_type)
-        .or_else(|| local_order.map(|order| to_model_order_type(order.order_type)))
-        .or_else(|| context.order_type.map(to_model_order_type))
-        .unwrap_or(OrderType::Market)
+        .or_else(|| local_order.and_then(|order| to_model_order_type(order.order_type)))
+        .or_else(|| context.order_type.and_then(to_model_order_type))
 }
 
 fn resolve_time_in_force(
     previous: Option<&OrderStatusReport>,
     local_order: Option<&OrderState>,
     context: &crate::execution::OrderContext,
-) -> TimeInForce {
+) -> Option<TimeInForce> {
     previous
         .map(|report| report.time_in_force)
-        .or_else(|| local_order.map(|order| to_model_tif(order.time_in_force)))
-        .or_else(|| context.time_in_force.map(to_model_tif))
-        .unwrap_or(TimeInForce::Day)
+        .or_else(|| local_order.and_then(|order| to_model_tif(order.time_in_force)))
+        .or_else(|| context.time_in_force.and_then(to_model_tif))
 }
 
 fn resolve_quantity(
@@ -2322,9 +3390,9 @@ fn resolve_quantity(
     fallback: Option<Quantity>,
     local_value: Option<f64>,
     precision: u8,
-) -> Quantity {
+) -> Option<Quantity> {
     if let Some(fallback) = fallback {
-        return fallback;
+        return Some(fallback);
     }
 
     if let Some(value) = value {
@@ -2334,7 +3402,7 @@ fn resolve_quantity(
     if let Some(local_value) = local_value {
         return make_quantity(local_value, precision);
     }
-    make_quantity(0.0, precision)
+    None
 }
 
 fn resolve_price(
@@ -2346,11 +3414,11 @@ fn resolve_price(
     fallback.or_else(|| {
         value
             .filter(|value| *value > 0.0)
-            .map(|value| make_price(value, precision))
+            .and_then(|value| make_price(value, precision))
             .or_else(|| {
                 local_value
                     .filter(|value| *value > 0.0)
-                    .map(|value| make_price(value, precision))
+                    .and_then(|value| make_price(value, precision))
             })
     })
 }
@@ -2418,14 +3486,21 @@ fn build_submitted_report(
     client_reports: &DashMap<ClientOrderId, OrderStatusReport>,
     venue_reports: &DashMap<VenueOrderId, OrderStatusReport>,
 ) -> Option<OrderStatusReport> {
-    let venue_order_id = event.venue_order_id.as_deref().map(VenueOrderId::from)?;
+    let venue_order_id = event
+        .venue_order_id
+        .as_deref()
+        .and_then(make_venue_order_id)?;
+    let client_order_id = make_client_order_id(&event.client_order_id)?;
     let previous = find_existing_report(
         client_reports,
         venue_reports,
-        Some(ClientOrderId::from(event.client_order_id.as_str())),
+        Some(client_order_id),
         Some(venue_order_id),
     );
     let instrument_id = resolve_instrument_id(previous.as_ref(), local_order, &event.context)?;
+    let order_side = resolve_order_side(previous.as_ref(), local_order, &event.context)?;
+    let order_type = resolve_order_type(previous.as_ref(), local_order, &event.context)?;
+    let time_in_force = resolve_time_in_force(previous.as_ref(), local_order, &event.context)?;
     let quantity_precision = previous
         .as_ref()
         .map_or(0, |report| report.quantity.precision);
@@ -2441,24 +3516,24 @@ fn build_submitted_report(
     Some(OrderStatusReport {
         account_id,
         instrument_id,
-        client_order_id: Some(ClientOrderId::from(event.client_order_id.as_str())),
+        client_order_id: Some(client_order_id),
         venue_order_id,
-        order_side: resolve_order_side(previous.as_ref(), local_order, &event.context),
-        order_type: resolve_order_type(previous.as_ref(), local_order, &event.context),
-        time_in_force: resolve_time_in_force(previous.as_ref(), local_order, &event.context),
+        order_side,
+        order_type,
+        time_in_force,
         order_status: OrderStatus::Submitted,
         quantity: resolve_quantity(
             event.context.quantity,
             previous.as_ref().map(|r| r.quantity),
             local_order.map(|order| order.quantity),
             quantity_precision,
-        ),
+        )?,
         filled_qty: resolve_quantity(
             event.context.filled_qty,
             previous.as_ref().map(|r| r.filled_qty),
             local_order.map(|order| order.filled_qty),
             quantity_precision,
-        ),
+        )?,
         report_id: UUID4::new(),
         ts_accepted: previous
             .as_ref()
@@ -2511,14 +3586,18 @@ fn build_accept_report(
     client_reports: &DashMap<ClientOrderId, OrderStatusReport>,
     venue_reports: &DashMap<VenueOrderId, OrderStatusReport>,
 ) -> Option<OrderStatusReport> {
-    let venue_order_id = VenueOrderId::from(event.venue_order_id.as_str());
+    let venue_order_id = make_venue_order_id(&event.venue_order_id)?;
+    let client_order_id = make_client_order_id(&event.client_order_id)?;
     let previous = find_existing_report(
         client_reports,
         venue_reports,
-        Some(ClientOrderId::from(event.client_order_id.as_str())),
+        Some(client_order_id),
         Some(venue_order_id),
     );
     let instrument_id = resolve_instrument_id(previous.as_ref(), local_order, &event.context)?;
+    let order_side = resolve_order_side(previous.as_ref(), local_order, &event.context)?;
+    let order_type = resolve_order_type(previous.as_ref(), local_order, &event.context)?;
+    let time_in_force = resolve_time_in_force(previous.as_ref(), local_order, &event.context)?;
     let quantity_precision = previous
         .as_ref()
         .map_or(0, |report| report.quantity.precision);
@@ -2534,24 +3613,24 @@ fn build_accept_report(
     Some(OrderStatusReport {
         account_id,
         instrument_id,
-        client_order_id: Some(ClientOrderId::from(event.client_order_id.as_str())),
+        client_order_id: Some(client_order_id),
         venue_order_id,
-        order_side: resolve_order_side(previous.as_ref(), local_order, &event.context),
-        order_type: resolve_order_type(previous.as_ref(), local_order, &event.context),
-        time_in_force: resolve_time_in_force(previous.as_ref(), local_order, &event.context),
+        order_side,
+        order_type,
+        time_in_force,
         order_status: OrderStatus::Accepted,
         quantity: resolve_quantity(
             event.context.quantity,
             previous.as_ref().map(|r| r.quantity),
             local_order.map(|order| order.quantity),
             quantity_precision,
-        ),
+        )?,
         filled_qty: resolve_quantity(
             event.context.filled_qty,
             previous.as_ref().map(|r| r.filled_qty),
             local_order.map(|order| order.filled_qty),
             quantity_precision,
-        ),
+        )?,
         report_id: UUID4::new(),
         ts_accepted: previous
             .as_ref()
@@ -2604,17 +3683,13 @@ fn build_rejected_report(
     client_reports: &DashMap<ClientOrderId, OrderStatusReport>,
     venue_reports: &DashMap<VenueOrderId, OrderStatusReport>,
 ) -> Option<OrderStatusReport> {
-    let previous = find_existing_report(
-        client_reports,
-        venue_reports,
-        Some(ClientOrderId::from(event.client_order_id.as_str())),
-        None,
-    );
+    let client_order_id = make_client_order_id(&event.client_order_id)?;
+    let previous = find_existing_report(client_reports, venue_reports, Some(client_order_id), None);
     let previous = previous.or_else(|| {
         local_order.and_then(|order| {
             report_from_local_order_state(
                 account_id,
-                ClientOrderId::from(event.client_order_id.as_str()),
+                client_order_id,
                 None,
                 order,
                 OrderStatus::Rejected,
@@ -2641,11 +3716,13 @@ fn build_modified_report(
     client_reports: &DashMap<ClientOrderId, OrderStatusReport>,
     venue_reports: &DashMap<VenueOrderId, OrderStatusReport>,
 ) -> Option<OrderStatusReport> {
+    let client_order_id = make_client_order_id(&event.client_order_id)?;
+    let venue_order_id = make_venue_order_id(&event.venue_order_id)?;
     let base = find_existing_report(
         client_reports,
         venue_reports,
-        Some(ClientOrderId::from(event.client_order_id.as_str())),
-        Some(VenueOrderId::from(event.venue_order_id.as_str())),
+        Some(client_order_id),
+        Some(venue_order_id),
     )?;
     let quantity_precision = base.quantity.precision;
     let price_precision = base.price.map_or(2, |price| price.precision);
@@ -2656,7 +3733,7 @@ fn build_modified_report(
             Some(base.quantity),
             local_order.map(|order| order.quantity),
             quantity_precision,
-        ),
+        )?,
         price: resolve_price(
             event.new_price,
             base.price,
@@ -2678,18 +3755,20 @@ fn build_cancelled_report(
     client_reports: &DashMap<ClientOrderId, OrderStatusReport>,
     venue_reports: &DashMap<VenueOrderId, OrderStatusReport>,
 ) -> Option<OrderStatusReport> {
+    let client_order_id = make_client_order_id(&event.client_order_id)?;
+    let venue_order_id = make_venue_order_id(&event.venue_order_id)?;
     let base = find_existing_report(
         client_reports,
         venue_reports,
-        Some(ClientOrderId::from(event.client_order_id.as_str())),
-        Some(VenueOrderId::from(event.venue_order_id.as_str())),
+        Some(client_order_id),
+        Some(venue_order_id),
     )
     .or_else(|| {
         local_order.and_then(|order| {
             report_from_local_order_state(
                 account_id,
-                ClientOrderId::from(event.client_order_id.as_str()),
-                Some(VenueOrderId::from(event.venue_order_id.as_str())),
+                client_order_id,
+                Some(venue_order_id),
                 order,
                 OrderStatus::Canceled,
                 UnixNanos::from(event.ts_event),
@@ -2715,8 +3794,8 @@ fn build_fill_status_report(
     venue_reports: &DashMap<VenueOrderId, OrderStatusReport>,
     fill_reports: &DashMap<String, FillReport>,
 ) -> Option<OrderStatusReport> {
-    let client_order_id = ClientOrderId::from(event.client_order_id.as_str());
-    let venue_order_id = VenueOrderId::from(event.venue_order_id.as_str());
+    let client_order_id = make_client_order_id(&event.client_order_id)?;
+    let venue_order_id = make_venue_order_id(&event.venue_order_id)?;
     let previous = find_existing_report(
         client_reports,
         venue_reports,
@@ -2734,31 +3813,33 @@ fn build_fill_status_report(
                 .and_then(|report| report.trigger_price.map(|price| price.precision))
         })
         .unwrap_or_else(|| infer_price_precision(event.fill_price));
-    let total_filled = event.context.filled_qty.map_or_else(
-        || {
-            let previous_filled = base
-                .as_ref()
-                .map_or(0.0, |report| report.filled_qty.as_f64());
-            make_quantity(previous_filled + event.fill_qty, quantity_precision)
-        },
-        |value| make_quantity(value, quantity_precision),
-    );
-    let leaves_qty = make_quantity(
-        event.context.leaves_qty.unwrap_or(event.leaves_qty),
-        quantity_precision,
-    );
-    let quantity = base.as_ref().map_or_else(
-        || {
-            make_quantity(
-                total_filled.as_f64() + leaves_qty.as_f64(),
-                quantity_precision,
-            )
-        },
-        |report| report.quantity,
-    );
-    let order_side = resolve_order_side(base.as_ref(), local_order, &event.context);
-    let order_type = resolve_order_type(base.as_ref(), local_order, &event.context);
-    let time_in_force = resolve_time_in_force(base.as_ref(), local_order, &event.context);
+    let total_filled_value = event.context.filled_qty.unwrap_or_else(|| {
+        let previous_filled = base
+            .as_ref()
+            .map_or(0.0, |report| report.filled_qty.as_f64());
+        previous_filled + event.fill_qty
+    });
+    let total_filled = make_quantity(total_filled_value, quantity_precision)?;
+    let leaves_value = event
+        .context
+        .leaves_qty
+        .or(event.leaves_qty)
+        .or_else(|| {
+            base.as_ref()
+                .map(|report| report.quantity.as_f64() - total_filled.as_f64())
+        })
+        .or_else(|| local_order.map(|order| order.quantity - total_filled.as_f64()))?;
+    let leaves_qty = make_quantity(leaves_value, quantity_precision)?;
+    let quantity = match base.as_ref() {
+        Some(report) => report.quantity,
+        None => make_quantity(
+            total_filled.as_f64() + leaves_qty.as_f64(),
+            quantity_precision,
+        )?,
+    };
+    let order_side = resolve_order_side(base.as_ref(), local_order, &event.context)?;
+    let order_type = resolve_order_type(base.as_ref(), local_order, &event.context)?;
+    let time_in_force = resolve_time_in_force(base.as_ref(), local_order, &event.context)?;
     let order_status = if leaves_qty.as_f64() > 0.0 {
         OrderStatus::PartiallyFilled
     } else {
@@ -2857,11 +3938,13 @@ fn build_fill_report(
     client_reports: &DashMap<ClientOrderId, OrderStatusReport>,
     venue_reports: &DashMap<VenueOrderId, OrderStatusReport>,
 ) -> Option<FillReport> {
+    let client_order_id = make_client_order_id(&event.client_order_id)?;
+    let venue_order_id = make_venue_order_id(&event.venue_order_id)?;
     let previous = find_existing_report(
         client_reports,
         venue_reports,
-        Some(ClientOrderId::from(event.client_order_id.as_str())),
-        Some(VenueOrderId::from(event.venue_order_id.as_str())),
+        Some(client_order_id),
+        Some(venue_order_id),
     );
     let instrument_id = resolve_instrument_id(previous.as_ref(), local_order, &event.context)?;
     let quantity_precision = previous
@@ -2876,28 +3959,26 @@ fn build_fill_report(
                 .and_then(|report| report.trigger_price.map(|price| price.precision))
         })
         .unwrap_or(2);
-    let quote_currency = event
-        .currency
-        .as_deref()
-        .and_then(parse_currency)
-        .unwrap_or_else(Currency::USD);
+    let quote_currency = parse_wire_currency(event.currency.as_deref().unwrap_or(""), "fill")?;
+    let trade_id = match event.trade_id.as_deref() {
+        Some(raw_trade_id) => make_trade_id(raw_trade_id)?,
+        None => fallback_fill_trade_id(event)?,
+    };
+    let order_side = resolve_order_side(previous.as_ref(), local_order, &event.context)?;
+    let last_qty = make_quantity(event.fill_qty, quantity_precision)?;
+    let last_px = make_price(event.fill_price, price_precision)?;
+    let commission = make_money(event.commission, quote_currency)?;
     Some(FillReport::new(
         account_id,
         instrument_id,
-        VenueOrderId::from(event.venue_order_id.as_str()),
-        TradeId::from(
-            event
-                .trade_id
-                .clone()
-                .unwrap_or_else(|| format!("{}-{}", event.venue_order_id, event.ts_event))
-                .as_str(),
-        ),
-        resolve_order_side(previous.as_ref(), local_order, &event.context),
-        make_quantity(event.fill_qty, quantity_precision),
-        make_price(event.fill_price, price_precision),
-        Money::new(event.commission, quote_currency),
+        venue_order_id,
+        trade_id,
+        order_side,
+        last_qty,
+        last_px,
+        commission,
         LiquiditySide::NoLiquiditySide,
-        Some(ClientOrderId::from(event.client_order_id.as_str())),
+        Some(client_order_id),
         None,
         UnixNanos::from(event.ts_event),
         get_atomic_clock_realtime().get_time_ns(),
@@ -2905,45 +3986,45 @@ fn build_fill_report(
     ))
 }
 
-fn to_model_side(side: RithmicOrderSide) -> OrderSide {
+fn to_model_side(side: RithmicOrderSide) -> Option<OrderSide> {
     match side {
-        RithmicOrderSide::Buy => OrderSide::Buy,
-        RithmicOrderSide::Sell => OrderSide::Sell,
-        _ => OrderSide::NoOrderSide,
+        RithmicOrderSide::Buy => Some(OrderSide::Buy),
+        RithmicOrderSide::Sell => Some(OrderSide::Sell),
+        _ => None,
     }
 }
 
-fn to_model_order_type(order_type: RithmicOrderType) -> OrderType {
+fn to_model_order_type(order_type: RithmicOrderType) -> Option<OrderType> {
     match order_type {
-        RithmicOrderType::Market => OrderType::Market,
-        RithmicOrderType::Limit => OrderType::Limit,
-        RithmicOrderType::StopMarket => OrderType::StopMarket,
-        RithmicOrderType::StopLimit => OrderType::StopLimit,
-        _ => OrderType::Market,
+        RithmicOrderType::Market => Some(OrderType::Market),
+        RithmicOrderType::Limit => Some(OrderType::Limit),
+        RithmicOrderType::StopMarket => Some(OrderType::StopMarket),
+        RithmicOrderType::StopLimit => Some(OrderType::StopLimit),
+        _ => None,
     }
 }
 
-fn to_model_order_status(status: rithmic_rs::OrderStatus) -> OrderStatus {
+fn to_model_order_status(status: rithmic_rs::OrderStatus) -> Option<OrderStatus> {
     match status {
-        rithmic_rs::OrderStatus::Pending => OrderStatus::Submitted,
-        rithmic_rs::OrderStatus::Open => OrderStatus::Accepted,
-        rithmic_rs::OrderStatus::Partial => OrderStatus::PartiallyFilled,
-        rithmic_rs::OrderStatus::Cancelled => OrderStatus::Canceled,
-        rithmic_rs::OrderStatus::Rejected => OrderStatus::Rejected,
-        rithmic_rs::OrderStatus::Expired => OrderStatus::Expired,
-        rithmic_rs::OrderStatus::Complete => OrderStatus::Filled,
-        rithmic_rs::OrderStatus::Unknown => OrderStatus::Submitted,
-        _ => OrderStatus::Submitted,
+        rithmic_rs::OrderStatus::Pending => Some(OrderStatus::Submitted),
+        rithmic_rs::OrderStatus::Open => Some(OrderStatus::Accepted),
+        rithmic_rs::OrderStatus::Partial => Some(OrderStatus::PartiallyFilled),
+        rithmic_rs::OrderStatus::Cancelled => Some(OrderStatus::Canceled),
+        rithmic_rs::OrderStatus::Rejected => Some(OrderStatus::Rejected),
+        rithmic_rs::OrderStatus::Expired => Some(OrderStatus::Expired),
+        rithmic_rs::OrderStatus::Complete => Some(OrderStatus::Filled),
+        rithmic_rs::OrderStatus::Unknown => None,
+        _ => None,
     }
 }
 
-fn to_model_tif(tif: RithmicTif) -> TimeInForce {
+fn to_model_tif(tif: RithmicTif) -> Option<TimeInForce> {
     match tif {
-        RithmicTif::Day => TimeInForce::Day,
-        RithmicTif::Gtc => TimeInForce::Gtc,
-        RithmicTif::Ioc => TimeInForce::Ioc,
-        RithmicTif::Fok => TimeInForce::Fok,
-        _ => TimeInForce::Day,
+        RithmicTif::Day => Some(TimeInForce::Day),
+        RithmicTif::Gtc => Some(TimeInForce::Gtc),
+        RithmicTif::Ioc => Some(TimeInForce::Ioc),
+        RithmicTif::Fok => Some(TimeInForce::Fok),
+        _ => None,
     }
 }
 
@@ -2955,19 +4036,17 @@ fn is_empty_replay_error(error: &impl Display) -> bool {
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         rc::Rc,
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
 
     use nautilus_common::{
         cache::Cache,
-        clock::TestClock,
-        factories::OrderFactory,
         live::get_runtime,
         messages::{ExecutionEvent as EngineExecutionEvent, ExecutionReport},
     };
@@ -2976,7 +4055,7 @@ mod tests {
         events::OrderEventAny,
         identifiers::{ClientId, OrderListId, StrategyId, TraderId},
         instruments::{FuturesContract, InstrumentAny},
-        orders::{OrderList, builder::OrderTestBuilder},
+        orders::{OrderList, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
     };
     use tokio::{
         sync::{broadcast, mpsc},
@@ -2987,7 +4066,7 @@ mod tests {
     use super::*;
     use crate::{
         config::RithmicEnv,
-        execution::{OrderAccepted, OrderContext, OrderFilled},
+        execution::{OrderAccepted, OrderCancelled, OrderContext, OrderFilled},
         gateway::GatewayConfig,
         providers::{AccountBalance as ProviderAccountBalance, Position as ProviderPosition},
     };
@@ -2995,7 +4074,7 @@ mod tests {
     fn sample_report(order_status: OrderStatus, filled_qty: &str) -> OrderStatusReport {
         let mut report = OrderStatusReport::new(
             AccountId::from("RITHMIC-001"),
-            InstrumentId::from("ESM6.RITHMIC"),
+            InstrumentId::from("ESM6.CME.RITHMIC"),
             Some(ClientOrderId::from("O-1")),
             VenueOrderId::from("V-1"),
             OrderSide::Buy,
@@ -3016,7 +4095,7 @@ mod tests {
     fn sample_fill_report(trade_id: &str, ts_event: u64) -> FillReport {
         FillReport::new(
             AccountId::from("RITHMIC-001"),
-            InstrumentId::from("ESM6.RITHMIC"),
+            InstrumentId::from("ESM6.CME.RITHMIC"),
             VenueOrderId::from("V-1"),
             TradeId::from(trade_id),
             OrderSide::Buy,
@@ -3043,7 +4122,7 @@ mod tests {
 
         PositionStatusReport::new(
             AccountId::from("RITHMIC-001"),
-            InstrumentId::from("ESM6.RITHMIC"),
+            InstrumentId::from("ESM6.CME.RITHMIC"),
             side,
             Quantity::from(signed_qty.abs()),
             UnixNanos::from(ts_event),
@@ -3059,7 +4138,7 @@ mod tests {
     }
 
     fn sample_rithmic_instrument_id() -> InstrumentId {
-        InstrumentId::from("ESM6.RITHMIC")
+        InstrumentId::from("ESM6.CME.RITHMIC")
     }
 
     fn sample_rithmic_instrument() -> InstrumentAny {
@@ -3067,7 +4146,7 @@ mod tests {
             sample_rithmic_instrument_id(),
             "ESM6".into(),
             AssetClass::Index,
-            Some(Ustr::from("XCME")),
+            Some(Ustr::from("CME")),
             Ustr::from("ES"),
             UnixNanos::default(),
             UnixNanos::from(1),
@@ -3100,7 +4179,9 @@ mod tests {
             "pass",
             "TestSystem",
             "ACC-001",
-        );
+            "NautilusTrader",
+        )
+        .expect("valid execution config");
         let core = ExecutionClientCore::new(
             TraderId::from("TESTER-001"),
             ClientId::new("TESTSYSTEM_ACC_001"),
@@ -3114,17 +4195,369 @@ mod tests {
         RithmicLiveExecClient::new(core, config)
     }
 
-    #[expect(dead_code)]
-    fn sample_order_factory() -> OrderFactory {
-        OrderFactory::new(
-            TraderId::from("TESTER-001"),
-            StrategyId::from("S-001"),
-            None,
-            None,
-            Rc::new(RefCell::new(TestClock::new())),
-            false,
-            true,
+    #[rstest::rstest]
+    fn replay_window_uses_checked_i32_conversion() {
+        let now = UnixNanos::from(1_700_000_000_000_000_000_u64);
+
+        assert_eq!(
+            replay_window_seconds(now, 60).unwrap(),
+            (1_699_999_940, 1_700_000_000)
+        );
+
+        let timestamp_overflow = UnixNanos::from((i32::MAX as u64 + 1) * 1_000_000_000);
+        assert!(replay_window_seconds(timestamp_overflow, 60).is_err());
+        assert!(replay_window_seconds(now, i32::MAX as u64 + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn account_registration_polling_is_bounded_and_rechecks() {
+        let attempts = Cell::new(0_u8);
+        await_account_registration(
+            AccountId::from("RITHMIC-001"),
+            Duration::from_millis(100),
+            || {
+                attempts.set(attempts.get() + 1);
+                attempts.get() >= 2
+            },
         )
+        .await
+        .unwrap();
+        assert_eq!(attempts.get(), 2);
+
+        assert!(
+            await_account_registration(AccountId::from("RITHMIC-001"), Duration::ZERO, || false,)
+                .await
+                .is_err()
+        );
+    }
+
+    #[rstest::rstest]
+    fn mass_status_lookback_saturates_at_epoch_without_overflow() {
+        assert_eq!(
+            lookback_start(UnixNanos::from(120_000_000_000_u64), 1),
+            UnixNanos::from(60_000_000_000_u64)
+        );
+        assert_eq!(
+            lookback_start(UnixNanos::from(120_000_000_000_u64), u64::MAX),
+            UnixNanos::default()
+        );
+    }
+
+    #[rstest::rstest]
+    fn unknown_local_order_status_is_not_invented() {
+        assert_eq!(
+            to_model_order_status(rithmic_rs::OrderStatus::Unknown),
+            None
+        );
+    }
+
+    #[rstest::rstest]
+    fn reconnect_readiness_requires_fresh_account_snapshot() {
+        let is_ready = AtomicBool::new(true);
+        let account_registered = AtomicBool::new(true);
+        invalidate_account_readiness(&is_ready, &account_registered);
+        assert!(!is_ready.load(Ordering::Acquire));
+        assert!(!account_registered.load(Ordering::Acquire));
+
+        let mut awaiting_snapshot = false;
+        observe_fresh_account_snapshot(&is_ready, &account_registered, &mut awaiting_snapshot);
+        assert!(account_registered.load(Ordering::Acquire));
+        assert!(!is_ready.load(Ordering::Acquire));
+
+        invalidate_account_readiness(&is_ready, &account_registered);
+        awaiting_snapshot = true;
+        observe_fresh_account_snapshot(&is_ready, &account_registered, &mut awaiting_snapshot);
+        assert!(account_registered.load(Ordering::Acquire));
+        assert!(is_ready.load(Ordering::Acquire));
+        assert!(!awaiting_snapshot);
+    }
+
+    #[rstest::rstest]
+    fn fallback_fill_trade_id_distinguishes_same_timestamp_fills() {
+        let base = OrderFilled {
+            client_order_id: "CLIENT-1".to_string(),
+            account_id: "ACC-1".to_string(),
+            venue_order_id: "VENUE-1".to_string(),
+            fill_price: 5000.25,
+            fill_qty: 1.0,
+            leaves_qty: Some(1.0),
+            commission: 0.0,
+            ts_event: 42,
+            trade_id: None,
+            currency: Some("USD".to_string()),
+            context: sample_order_context(),
+        };
+        let first = fallback_fill_trade_id(&base).expect("valid fallback trade ID");
+        let mut distinct = base;
+        distinct.fill_qty = 2.0;
+        let second = fallback_fill_trade_id(&distinct).expect("valid fallback trade ID");
+
+        assert_ne!(first, second);
+        assert!(first.to_string().starts_with("RITHMIC-"));
+        assert!(first.to_string().len() <= 24);
+    }
+
+    #[tokio::test]
+    async fn connect_validates_config_before_acquiring_gateway() {
+        let cache = sample_cache();
+        let mut client = sample_exec_client(cache);
+        client.config.username.clear();
+
+        let e = client
+            .connect()
+            .await
+            .expect_err("invalid config should fail before gateway acquisition");
+
+        assert!(e.to_string().contains("username"));
+        assert!(client.gateway.is_none());
+        assert!(client.inner.is_none());
+        assert!(!client.is_ready.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_is_single_flight() {
+        let is_ready = Arc::new(AtomicBool::new(true));
+        let gate = Arc::new(AsyncMutex::new(()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let first_attempts = Arc::clone(&attempts);
+        let first = tokio::spawn(single_flight_reconciliation(
+            Arc::clone(&is_ready),
+            Arc::clone(&gate),
+            "first lag",
+            move || async move {
+                first_attempts.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                Ok(())
+            },
+        ));
+
+        while is_ready.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        let second_attempts = Arc::clone(&attempts);
+        let second = tokio::spawn(single_flight_reconciliation(
+            Arc::clone(&is_ready),
+            Arc::clone(&gate),
+            "simultaneous lag",
+            move || async move {
+                second_attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        ));
+
+        assert!(first.await.unwrap());
+        assert!(second.await.unwrap());
+        assert!(is_ready.load(Ordering::Acquire));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[rstest::rstest]
+    fn trailing_stop_requires_positive_whole_tick_offsets() {
+        let config = RithmicLiveExecClient::trailing_stop_config(
+            OrderType::TrailingStopMarket,
+            Some(Decimal::from(12)),
+            Some(TrailingOffsetType::Ticks),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.trail_by_ticks, 12);
+
+        assert!(
+            RithmicLiveExecClient::trailing_stop_config(
+                OrderType::TrailingStopMarket,
+                Some(Decimal::from(12)),
+                Some(TrailingOffsetType::Price),
+            )
+            .is_err()
+        );
+        assert!(
+            RithmicLiveExecClient::trailing_stop_config(
+                OrderType::TrailingStopMarket,
+                Some(Decimal::from_str("1.5").unwrap()),
+                Some(TrailingOffsetType::Ticks),
+            )
+            .is_err()
+        );
+        assert!(
+            RithmicLiveExecClient::trailing_stop_config(
+                OrderType::TrailingStopMarket,
+                Some(Decimal::ZERO),
+                Some(TrailingOffsetType::Ticks),
+            )
+            .is_err()
+        );
+    }
+
+    #[rstest::rstest]
+    fn execution_reports_use_exchange_qualified_instrument_ids() {
+        assert_eq!(
+            make_instrument_id("ESM6", "CME").unwrap().to_string(),
+            "ESM6.CME.RITHMIC"
+        );
+        assert_ne!(
+            make_instrument_id("ESM6", "CME"),
+            make_instrument_id("ESM6", "CBOT")
+        );
+        assert!(make_instrument_id("BAD.SYMBOL", "CME").is_none());
+    }
+
+    #[rstest::rstest]
+    fn venue_numeric_identifier_and_currency_boundaries_are_checked() {
+        assert!(make_quantity(f64::NAN, 0).is_none());
+        assert!(make_quantity(f64::INFINITY, 0).is_none());
+        assert!(make_price(f64::NEG_INFINITY, 2).is_none());
+        assert!(make_money(f64::NAN, Currency::USD()).is_none());
+        assert!(make_client_order_id("").is_none());
+        assert!(make_venue_order_id("").is_none());
+        assert!(make_trade_id("").is_none());
+        assert!(parse_wire_currency("USD", "test").is_some());
+        assert!(parse_wire_currency("", "test").is_none());
+        assert!(parse_wire_currency("NOT_A_CURRENCY", "test").is_none());
+    }
+
+    #[rstest::rstest]
+    fn pnl_balance_uses_venue_available_and_drops_inconsistent_values() {
+        let account_id = AccountId::from("RITHMIC-001");
+        let mut emitter = sample_emitter(account_id);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        emitter.set_sender(tx);
+        let positions = DashMap::new();
+        let balance = |available| {
+            PnlEvent::Account(ProviderAccountEvent::BalanceUpdate(
+                ProviderAccountBalance {
+                    is_snapshot: true,
+                    account_id: "ACC-1".to_string(),
+                    currency: "USD".to_string(),
+                    total: 100.0,
+                    available,
+                    locked: 20.0,
+                    unrealized_pnl: 0.0,
+                    realized_pnl: 0.0,
+                    ts_event: 1,
+                },
+            ))
+        };
+
+        process_pnl_update(account_id, "ACC-1", &emitter, &positions, balance(80.0));
+        let EngineExecutionEvent::Account(state) = rx.try_recv().unwrap() else {
+            panic!("expected account state event");
+        };
+        assert_eq!(state.balances[0].free.as_f64(), 80.0);
+
+        process_pnl_update(account_id, "ACC-1", &emitter, &positions, balance(70.0));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[rstest::rstest]
+    fn incomplete_or_malformed_external_update_is_dropped() {
+        let client_reports = DashMap::new();
+        let venue_reports = DashMap::new();
+        let context = crate::execution::OrderContext {
+            symbol: Some("ESM6".to_string()),
+            exchange: Some("CME".to_string()),
+            ..Default::default()
+        };
+        let incomplete = OrderAccepted {
+            client_order_id: "EXTERNAL-1".to_string(),
+            venue_order_id: "VENUE-1".to_string(),
+            account_id: "ACC-1".to_string(),
+            ts_event: 1,
+            context,
+        };
+
+        assert!(
+            build_accept_report(
+                AccountId::from("RITHMIC-001"),
+                &incomplete,
+                None,
+                &client_reports,
+                &venue_reports,
+            )
+            .is_none()
+        );
+
+        let mut malformed = incomplete;
+        malformed.client_order_id.clear();
+        assert!(
+            build_accept_report(
+                AccountId::from("RITHMIC-001"),
+                &malformed,
+                None,
+                &client_reports,
+                &venue_reports,
+            )
+            .is_none()
+        );
+    }
+
+    #[rstest::rstest]
+    fn reset_and_dispose_clear_execution_resources() {
+        let mut client = sample_exec_client(sample_cache());
+        client.core.set_started();
+        client.core.set_connected();
+        client.is_ready.store(true, Ordering::Release);
+        client.event_task = Some(get_runtime().spawn(std::future::pending()));
+        client
+            .pending_tasks
+            .push(get_runtime().spawn(std::future::pending()));
+        client.order_reports_by_client.insert(
+            ClientOrderId::from("O-1"),
+            sample_report(OrderStatus::Accepted, "0"),
+        );
+
+        client.reset().unwrap();
+
+        assert!(!client.is_connected());
+        assert!(client.core.is_stopped());
+        assert!(client.event_task.is_none());
+        assert!(client.inner.is_none());
+        assert!(client.gateway.is_none());
+        assert!(client.pending_tasks.is_empty());
+        assert!(client.order_reports_by_client.is_empty());
+
+        client.core.set_started();
+        client.is_ready.store(true, Ordering::Release);
+        client.event_task = Some(get_runtime().spawn(std::future::pending()));
+        client.dispose().unwrap();
+
+        assert!(!client.is_connected());
+        assert!(client.core.is_stopped());
+        assert!(client.event_task.is_none());
+    }
+
+    fn sample_tracked_order(client_order_id: &str) -> OrderAny {
+        let mut builder = OrderTestBuilder::new(OrderType::Limit);
+        builder
+            .trader_id(TraderId::from("TESTER-001"))
+            .strategy_id(StrategyId::from("S-001"))
+            .instrument_id(sample_rithmic_instrument_id())
+            .client_order_id(ClientOrderId::from(client_order_id))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(1))
+            .price(Price::from("5000.25"))
+            .time_in_force(TimeInForce::Day);
+        builder.build()
+    }
+
+    fn sample_accepted_tracked_order(
+        client_order_id: &str,
+        venue_order_id: &str,
+        account_id: AccountId,
+    ) -> OrderAny {
+        let mut order = sample_tracked_order(client_order_id);
+        let submitted = TestOrderEventStubs::submitted(&order, account_id);
+        order
+            .apply(submitted)
+            .expect("submitted event should apply");
+        let accepted =
+            TestOrderEventStubs::accepted(&order, account_id, VenueOrderId::from(venue_order_id));
+        order.apply(accepted).expect("accepted event should apply");
+        order
     }
 
     fn sample_bracket_orders(market_entry: bool) -> Vec<OrderAny> {
@@ -3289,13 +4722,18 @@ mod tests {
     }
 
     fn attach_submit_path(client: &mut RithmicLiveExecClient) {
-        let lease = SharedGatewayLease::acquire(client.gateway_config());
+        let lease = SharedGatewayLease::acquire(
+            client
+                .gateway_config()
+                .expect("valid execution gateway config"),
+        );
         let gateway = lease.gateway();
         client.inner = Some(Arc::new(RithmicExecutionClient::new(
             gateway,
             RithmicAccount::new("fcm", "ib", "ACC-001"),
         )));
         client.gateway = Some(lease);
+        client.is_ready.store(true, Ordering::Release);
     }
 
     async fn recv_order_events(
@@ -3391,9 +4829,12 @@ mod tests {
             &inner,
             account_id,
             &emitter,
-            &client_reports,
-            &venue_reports,
-            &fill_reports,
+            ExecutionUpdateStores {
+                order_reports_by_client: &client_reports,
+                order_reports_by_venue: &venue_reports,
+                fill_reports: &fill_reports,
+                tracked_orders: &DashMap::new(),
+            },
             event,
         );
 
@@ -3423,9 +4864,12 @@ mod tests {
             &inner,
             account_id,
             &emitter,
-            &client_reports,
-            &venue_reports,
-            &fill_reports,
+            ExecutionUpdateStores {
+                order_reports_by_client: &client_reports,
+                order_reports_by_venue: &venue_reports,
+                fill_reports: &fill_reports,
+                tracked_orders: &DashMap::new(),
+            },
             ExecutionEvent::Accepted(OrderAccepted {
                 client_order_id: "CLIENT-1".to_string(),
                 venue_order_id: "VENUE-1".to_string(),
@@ -3461,16 +4905,19 @@ mod tests {
             &inner,
             account_id,
             &emitter,
-            &client_reports,
-            &venue_reports,
-            &fill_reports,
+            ExecutionUpdateStores {
+                order_reports_by_client: &client_reports,
+                order_reports_by_venue: &venue_reports,
+                fill_reports: &fill_reports,
+                tracked_orders: &DashMap::new(),
+            },
             ExecutionEvent::Filled(OrderFilled {
                 client_order_id: "CLIENT-2".to_string(),
                 account_id: "ACC-1".to_string(),
                 venue_order_id: "VENUE-2".to_string(),
                 fill_price: 5000.50,
                 fill_qty: 1.0,
-                leaves_qty: 0.0,
+                leaves_qty: Some(0.0),
                 commission: 0.0,
                 ts_event: 2,
                 trade_id: Some("TRADE-1".to_string()),
@@ -3489,6 +4936,67 @@ mod tests {
         assert_eq!(report.order_status, OrderStatus::Filled);
         assert_eq!(report.price, Some(Price::from("5000.50")));
         assert_eq!(report.avg_px, Decimal::from_str("5000.5").ok());
+    }
+
+    #[rstest::rstest]
+    fn snapshot_fill_deduplicates_overlapping_live_fill() {
+        let account_id = AccountId::from("RITHMIC-001");
+        let mut emitter = sample_emitter(account_id);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        emitter.set_sender(tx);
+        let inner = RithmicExecutionClient::new(
+            sample_gateway(),
+            RithmicAccount::new("fcm", "ib", "ACC-1"),
+        );
+        let client_reports = DashMap::new();
+        let venue_reports = DashMap::new();
+        let fill_reports = DashMap::new();
+        let tracked_orders = DashMap::new();
+        let stores = ExecutionUpdateStores {
+            order_reports_by_client: &client_reports,
+            order_reports_by_venue: &venue_reports,
+            fill_reports: &fill_reports,
+            tracked_orders: &tracked_orders,
+        };
+        let mut context = sample_order_context();
+        context.is_snapshot = true;
+        context.filled_qty = Some(1.0);
+        context.leaves_qty = Some(0.0);
+        let snapshot = OrderFilled {
+            client_order_id: "EXTERNAL-SNAPSHOT".to_string(),
+            account_id: "ACC-1".to_string(),
+            venue_order_id: "VENUE-SNAPSHOT".to_string(),
+            fill_price: 5000.25,
+            fill_qty: 1.0,
+            leaves_qty: Some(0.0),
+            commission: 0.0,
+            ts_event: 2,
+            trade_id: Some("TRADE-SNAPSHOT".to_string()),
+            currency: Some("USD".to_string()),
+            context,
+        };
+        process_execution_update(
+            &inner,
+            account_id,
+            &emitter,
+            stores,
+            ExecutionEvent::Filled(snapshot.clone()),
+        );
+        let mut live = snapshot;
+        live.context.is_snapshot = false;
+        process_execution_update(
+            &inner,
+            account_id,
+            &emitter,
+            stores,
+            ExecutionEvent::Filled(live),
+        );
+
+        assert_eq!(fill_reports.len(), 1);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[rstest::rstest]
@@ -3528,7 +5036,10 @@ mod tests {
         )
         .expect("expected local market order fallback report");
 
-        assert_eq!(report.instrument_id, InstrumentId::from("MNQM6.RITHMIC"));
+        assert_eq!(
+            report.instrument_id,
+            InstrumentId::from("MNQM6.CME.RITHMIC")
+        );
         assert_eq!(report.order_type, OrderType::Market);
         assert_eq!(report.time_in_force, TimeInForce::Ioc);
         assert_eq!(report.order_status, OrderStatus::Accepted);
@@ -3557,28 +5068,29 @@ mod tests {
         context.filled_qty = Some(1.0);
         context.leaves_qty = Some(0.0);
         context.avg_price = Some(5000.50);
+        let tracked_orders = DashMap::new();
+        let stores = ExecutionUpdateStores {
+            order_reports_by_client: &client_reports,
+            order_reports_by_venue: &venue_reports,
+            fill_reports: &fill_reports,
+            tracked_orders: &tracked_orders,
+        };
+        let fill_event = ExecutionEvent::Filled(OrderFilled {
+            client_order_id: "CLIENT-FILL".to_string(),
+            account_id: "ACC-1".to_string(),
+            venue_order_id: "VENUE-FILL".to_string(),
+            fill_price: 5000.50,
+            fill_qty: 1.0,
+            leaves_qty: Some(0.0),
+            commission: 0.0,
+            ts_event: 2,
+            trade_id: Some("TRADE-FILL".to_string()),
+            currency: Some("USD".to_string()),
+            context,
+        });
 
-        process_execution_update(
-            &inner,
-            account_id,
-            &emitter,
-            &client_reports,
-            &venue_reports,
-            &fill_reports,
-            ExecutionEvent::Filled(OrderFilled {
-                client_order_id: "CLIENT-FILL".to_string(),
-                account_id: "ACC-1".to_string(),
-                venue_order_id: "VENUE-FILL".to_string(),
-                fill_price: 5000.50,
-                fill_qty: 1.0,
-                leaves_qty: 0.0,
-                commission: 0.0,
-                ts_event: 2,
-                trade_id: Some("TRADE-FILL".to_string()),
-                currency: Some("USD".to_string()),
-                context,
-            }),
-        );
+        process_execution_update(&inner, account_id, &emitter, stores, fill_event.clone());
+        process_execution_update(&inner, account_id, &emitter, stores, fill_event);
 
         let first = timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -3600,6 +5112,148 @@ mod tests {
             }
             other => panic!("expected order execution report, received {other:?}"),
         }
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tracked_updates_emit_typed_order_events_instead_of_reports() {
+        let account_id = AccountId::from("RITHMIC-001");
+        let mut emitter = sample_emitter(account_id);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        emitter.set_sender(tx);
+        let inner = RithmicExecutionClient::new(
+            sample_gateway(),
+            RithmicAccount::new("fcm", "ib", "ACC-1"),
+        );
+        let client_reports = DashMap::new();
+        let venue_reports = DashMap::new();
+        let fill_reports = DashMap::new();
+        let tracked_orders = DashMap::new();
+        tracked_orders.insert(
+            ClientOrderId::from("TRACKED-1"),
+            sample_tracked_order("TRACKED-1"),
+        );
+        let stores = ExecutionUpdateStores {
+            order_reports_by_client: &client_reports,
+            order_reports_by_venue: &venue_reports,
+            fill_reports: &fill_reports,
+            tracked_orders: &tracked_orders,
+        };
+
+        process_execution_update(
+            &inner,
+            account_id,
+            &emitter,
+            stores,
+            ExecutionEvent::Accepted(OrderAccepted {
+                client_order_id: "TRACKED-1".to_string(),
+                venue_order_id: "VENUE-TRACKED-1".to_string(),
+                account_id: "ACC-1".to_string(),
+                ts_event: 1,
+                context: sample_order_context(),
+            }),
+        );
+        assert_eq!(rx.len(), 1, "tracked accept should emit one order event");
+        process_execution_update(
+            &inner,
+            account_id,
+            &emitter,
+            stores,
+            ExecutionEvent::Cancelled(OrderCancelled {
+                client_order_id: "TRACKED-1".to_string(),
+                account_id: "ACC-1".to_string(),
+                venue_order_id: "VENUE-TRACKED-1".to_string(),
+                ts_event: 2,
+                context: sample_order_context(),
+            }),
+        );
+        assert_eq!(rx.len(), 2, "tracked cancel should emit one order event");
+        let mut fill_context = sample_order_context();
+        fill_context.filled_qty = Some(1.0);
+        fill_context.leaves_qty = None;
+        process_execution_update(
+            &inner,
+            account_id,
+            &emitter,
+            stores,
+            ExecutionEvent::Filled(OrderFilled {
+                client_order_id: "TRACKED-1".to_string(),
+                account_id: "ACC-1".to_string(),
+                venue_order_id: "VENUE-TRACKED-1".to_string(),
+                fill_price: 5000.25,
+                fill_qty: 1.0,
+                leaves_qty: None,
+                commission: 0.0,
+                ts_event: 3,
+                trade_id: Some("TRADE-TRACKED-1".to_string()),
+                currency: Some("USD".to_string()),
+                context: fill_context,
+            }),
+        );
+        assert_eq!(rx.len(), 3, "tracked fill should emit one order event");
+
+        let events = recv_order_events(&mut rx, 3).await;
+        assert!(matches!(events[0], OrderEventAny::Accepted(_)));
+        assert!(matches!(events[1], OrderEventAny::Canceled(_)));
+        assert!(matches!(events[2], OrderEventAny::Filled(_)));
+    }
+
+    #[tokio::test]
+    async fn cache_reconciliation_isolated_by_execution_client() {
+        let cache = sample_cache();
+        let client = sample_exec_client(Rc::clone(&cache));
+        let account_id = client.core.account_id;
+        let own_order = sample_accepted_tracked_order("OWN-1", "OWN-V-1", account_id);
+        let sibling_order = sample_accepted_tracked_order("SIBLING-1", "SIBLING-V-1", account_id);
+
+        {
+            let mut guard = cache.borrow_mut();
+            guard
+                .add_instrument(sample_rithmic_instrument())
+                .expect("instrument should add to cache");
+            guard
+                .add_order(own_order, None, Some(client.core.client_id), true)
+                .expect("own order should add to cache");
+            guard
+                .add_order(
+                    sibling_order,
+                    None,
+                    Some(ClientId::new("SIBLING_EXEC")),
+                    true,
+                )
+                .expect("sibling order should add to cache");
+        }
+
+        client.refresh_tracked_orders();
+        assert!(
+            client
+                .tracked_orders
+                .contains_key(&ClientOrderId::from("OWN-1"))
+        );
+        assert!(
+            !client
+                .tracked_orders
+                .contains_key(&ClientOrderId::from("SIBLING-1"))
+        );
+
+        let cmd = GenerateOrderStatusReportsBuilder::default()
+            .ts_init(UnixNanos::default())
+            .open_only(false)
+            .build()
+            .expect("valid reports command");
+        let reports = client
+            .generate_order_status_reports(&cmd)
+            .await
+            .expect("reports should generate");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].client_order_id,
+            Some(ClientOrderId::from("OWN-1"))
+        );
+        assert_eq!(reports[0].account_id, client.core.account_id);
     }
 
     #[tokio::test]
@@ -3640,9 +5294,10 @@ mod tests {
             .fill_reports
             .insert(fill_report_key(&closed_fill), closed_fill);
 
-        client
-            .position_reports
-            .insert("ESM6.RITHMIC".to_string(), sample_position_report(1, 12));
+        client.position_reports.insert(
+            "ESM6.CME.RITHMIC".to_string(),
+            sample_position_report(1, 12),
+        );
 
         let mass_status = client
             .generate_mass_status(None)
@@ -3787,7 +5442,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_order_list_emits_submitted_and_rejected_for_supported_oco() {
+    async fn submit_order_list_denies_oco_when_order_plant_is_unavailable() {
         let cache = sample_cache();
         let mut client = sample_exec_client(Rc::clone(&cache));
         let mut rx = attach_event_sender(&mut client);
@@ -3800,15 +5455,16 @@ mod tests {
             .submit_order_list(cmd)
             .expect("supported oco should enter v2 submission path");
 
-        let events = recv_order_events(&mut rx, 4).await;
-        assert!(matches!(events[0], OrderEventAny::Submitted(_)));
-        assert!(matches!(events[1], OrderEventAny::Submitted(_)));
-        assert!(matches!(events[2], OrderEventAny::Rejected(_)));
-        assert!(matches!(events[3], OrderEventAny::Rejected(_)));
+        let events = recv_order_events(&mut rx, 2).await;
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event, OrderEventAny::Denied(_)))
+        );
     }
 
     #[tokio::test]
-    async fn submit_order_list_emits_submitted_and_rejected_for_supported_limit_entry_bracket() {
+    async fn submit_order_list_denies_bracket_when_order_plant_is_unavailable() {
         let cache = sample_cache();
         let mut client = sample_exec_client(Rc::clone(&cache));
         let mut rx = attach_event_sender(&mut client);
@@ -3821,13 +5477,12 @@ mod tests {
             .submit_order_list(cmd)
             .expect("supported bracket should enter v2 submission path");
 
-        let events = recv_order_events(&mut rx, 6).await;
-        assert!(matches!(events[0], OrderEventAny::Submitted(_)));
-        assert!(matches!(events[1], OrderEventAny::Submitted(_)));
-        assert!(matches!(events[2], OrderEventAny::Submitted(_)));
-        assert!(matches!(events[3], OrderEventAny::Rejected(_)));
-        assert!(matches!(events[4], OrderEventAny::Rejected(_)));
-        assert!(matches!(events[5], OrderEventAny::Rejected(_)));
+        let events = recv_order_events(&mut rx, 3).await;
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event, OrderEventAny::Denied(_)))
+        );
     }
 
     fn sample_gateway() -> Arc<RwLock<RithmicGateway>> {
@@ -3837,11 +5492,12 @@ mod tests {
                 "user",
                 "pass",
                 "system",
+                "TestApp",
                 "fcm",
                 "ib",
                 "account",
             )
-            .with_app_name("TestApp"),
+            .expect("valid gateway config"),
         )))
     }
 
@@ -3938,11 +5594,14 @@ mod tests {
                 inner: Arc::clone(&inner_a),
                 account_id: account_id_a,
                 emitter: sample_emitter(account_id_a),
-                is_connected: Arc::clone(&connected_a),
+                is_ready: Arc::clone(&connected_a),
+                account_registered: Arc::new(AtomicBool::new(true)),
+                reconciliation_gate: Arc::new(AsyncMutex::new(())),
                 order_reports_by_client: Arc::clone(&order_reports_a),
                 order_reports_by_venue: Arc::clone(&venue_reports_a),
                 fill_reports: Arc::clone(&fill_reports_a),
                 position_reports: Arc::clone(&position_reports_a),
+                tracked_orders: Arc::new(DashMap::new()),
                 replay_lookback_secs: 0,
             },
         ));
@@ -3955,11 +5614,14 @@ mod tests {
                 inner: Arc::clone(&inner_b),
                 account_id: account_id_b,
                 emitter: sample_emitter(account_id_b),
-                is_connected: Arc::clone(&connected_b),
+                is_ready: Arc::clone(&connected_b),
+                account_registered: Arc::new(AtomicBool::new(true)),
+                reconciliation_gate: Arc::new(AsyncMutex::new(())),
                 order_reports_by_client: Arc::clone(&order_reports_b),
                 order_reports_by_venue: Arc::clone(&venue_reports_b),
                 fill_reports: Arc::clone(&fill_reports_b),
                 position_reports: Arc::clone(&position_reports_b),
+                tracked_orders: Arc::new(DashMap::new()),
                 replay_lookback_secs: 0,
             },
         ));
@@ -4045,11 +5707,11 @@ mod tests {
         assert!(!order_reports_b.contains_key(&ClientOrderId::from("CLIENT-A")));
 
         let position_a = position_reports_a
-            .get("ESM6.RITHMIC")
+            .get("ESM6.CME.RITHMIC")
             .expect("expected account A position report");
         assert_eq!(position_a.account_id, account_id_a);
         let position_b = position_reports_b
-            .get("NQM6.RITHMIC")
+            .get("NQM6.CME.RITHMIC")
             .expect("expected account B position report");
         assert_eq!(position_b.account_id, account_id_b);
         assert!(connected_a.load(Ordering::Relaxed));
@@ -4098,11 +5760,14 @@ mod tests {
                 inner: Arc::clone(&inner_a),
                 account_id: account_id_a,
                 emitter: sample_emitter(account_id_a),
-                is_connected: Arc::clone(&connected_a),
+                is_ready: Arc::clone(&connected_a),
+                account_registered: Arc::new(AtomicBool::new(true)),
+                reconciliation_gate: Arc::new(AsyncMutex::new(())),
                 order_reports_by_client: Arc::clone(&order_reports_a),
                 order_reports_by_venue: Arc::clone(&venue_reports_a),
                 fill_reports: Arc::clone(&fill_reports_a),
                 position_reports: Arc::clone(&position_reports_a),
+                tracked_orders: Arc::new(DashMap::new()),
                 replay_lookback_secs: 0,
             },
         ));
@@ -4115,11 +5780,14 @@ mod tests {
                 inner: Arc::clone(&inner_b),
                 account_id: account_id_b,
                 emitter: sample_emitter(account_id_b),
-                is_connected: Arc::clone(&connected_b),
+                is_ready: Arc::clone(&connected_b),
+                account_registered: Arc::new(AtomicBool::new(true)),
+                reconciliation_gate: Arc::new(AsyncMutex::new(())),
                 order_reports_by_client: Arc::clone(&order_reports_b),
                 order_reports_by_venue: Arc::clone(&venue_reports_b),
                 fill_reports: Arc::clone(&fill_reports_b),
                 position_reports: Arc::clone(&position_reports_b),
+                tracked_orders: Arc::new(DashMap::new()),
                 replay_lookback_secs: 0,
             },
         ));
@@ -4152,7 +5820,7 @@ mod tests {
                 venue_order_id: "VENUE-A".to_string(),
                 fill_price: 5001.25,
                 fill_qty: 1.0,
-                leaves_qty: 0.0,
+                leaves_qty: Some(0.0),
                 commission: 0.0,
                 ts_event: 2,
                 trade_id: Some("TRADE-A".to_string()),

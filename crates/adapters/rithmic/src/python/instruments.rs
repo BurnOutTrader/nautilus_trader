@@ -17,7 +17,10 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use nautilus_core::{UnixNanos, python::to_pyruntime_err};
+use nautilus_core::{
+    UnixNanos,
+    python::{to_pyruntime_err, to_pyvalue_err},
+};
 use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     python::instruments::instrument_any_to_pyobject,
@@ -48,11 +51,7 @@ use crate::{
 };
 
 fn now_nanos() -> UnixNanos {
-    UnixNanos::from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64),
-    )
+    crate::common::converters::now_unix_nanos()
 }
 
 fn cache_key(symbol: &str, exchange: &str) -> String {
@@ -103,8 +102,10 @@ impl PyRithmicInstrumentSymbol {
     }
 
     #[getter]
-    fn instrument_id(&self) -> String {
-        self.inner.instrument_id()
+    fn instrument_id(&self) -> PyResult<String> {
+        self.inner
+            .instrument_id()
+            .map_err(|e| to_pyvalue_err(e.to_string()))
     }
 
     #[pyo3(name = "__repr__")]

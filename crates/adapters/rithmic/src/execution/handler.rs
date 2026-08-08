@@ -17,7 +17,6 @@
 use rithmic_rs::{
     OrderStatus,
     api::RithmicResponse,
-    rithmic_to_unix_nanos,
     rti::{
         ExchangeOrderNotification, RithmicOrderNotification,
         exchange_order_notification::{
@@ -30,10 +29,22 @@ use rithmic_rs::{
     },
 };
 
+fn notification_timestamp(ssboe: Option<i32>, usecs: Option<i32>) -> Option<u64> {
+    let seconds = u64::try_from(ssboe?).ok()?;
+    let microseconds = u64::try_from(usecs.unwrap_or_default()).ok()?;
+    if microseconds >= 1_000_000 {
+        return None;
+    }
+
+    seconds
+        .checked_mul(1_000_000_000)?
+        .checked_add(microseconds.checked_mul(1_000)?)
+}
+
 use super::{
     client::{
         ExecutionEvent, OrderAccepted, OrderCancelled, OrderContext, OrderFilled, OrderModified,
-        OrderRejected, OrderSubmitted,
+        OrderRejected, OrderSubmitted, validate_execution_event,
     },
     parse::{parse_order_side, parse_order_type, parse_time_in_force},
 };
@@ -127,7 +138,7 @@ fn exchange_fill_price(notif: &ExchangeOrderNotification) -> Option<(f64, &'stat
 
 /// Handles incoming execution messages from Rithmic and converts them to
 /// internal `ExecutionEvent`s used by the adapter.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ExecutionHandler;
 
 impl ExecutionHandler {
@@ -143,7 +154,7 @@ impl ExecutionHandler {
     }
 
     fn handle_message(&self, message: &RithmicMessage) -> Option<ExecutionEvent> {
-        match message {
+        let event = match message {
             RithmicMessage::RithmicOrderNotification(notif) => {
                 tracing::debug!(
                     user_tag = ?notif.user_tag,
@@ -183,7 +194,15 @@ impl ExecutionHandler {
                 );
                 None
             }
+        };
+
+        if let Some(event) = event.as_ref()
+            && let Err(e) = validate_execution_event(event)
+        {
+            tracing::warn!("Dropping invalid Rithmic execution notification: {e}");
+            return None;
         }
+        event
     }
 
     fn handle_rithmic_order_notification(
@@ -207,7 +226,14 @@ impl ExecutionHandler {
         };
 
         let notify_type = RithmicNotifyType::try_from(notif.notify_type?).ok()?;
-        let ts_event = rithmic_to_unix_nanos(notif.ssboe.unwrap_or(0), notif.usecs.unwrap_or(0));
+        let Some(ts_event) = notification_timestamp(notif.ssboe, notif.usecs) else {
+            tracing::warn!(
+                ssboe = ?notif.ssboe,
+                usecs = ?notif.usecs,
+                "Dropping Rithmic order notification with invalid timestamp"
+            );
+            return None;
+        };
         let account_id = notif.account_id.clone().unwrap_or_default();
 
         tracing::debug!(
@@ -232,7 +258,7 @@ impl ExecutionHandler {
             }
             RithmicNotifyType::Open => Some(ExecutionEvent::Accepted(OrderAccepted {
                 client_order_id,
-                venue_order_id: notif.basket_id.clone().unwrap_or_default(),
+                venue_order_id: notif.basket_id.clone()?,
                 account_id,
                 ts_event,
                 context,
@@ -240,7 +266,7 @@ impl ExecutionHandler {
             RithmicNotifyType::Modified => Some(ExecutionEvent::Modified(OrderModified {
                 client_order_id,
                 account_id,
-                venue_order_id: notif.basket_id.clone().unwrap_or_default(),
+                venue_order_id: notif.basket_id.clone()?,
                 new_price: notif.price,
                 new_qty: notif.quantity.map(|q| q as f64),
                 ts_event,
@@ -255,11 +281,10 @@ impl ExecutionHandler {
                     .unwrap_or(OrderStatus::Unknown);
 
                 if status == OrderStatus::Cancelled {
-                    let venue_order_id = notif.basket_id.clone().unwrap_or_default();
                     Some(ExecutionEvent::Cancelled(OrderCancelled {
                         client_order_id,
                         account_id,
-                        venue_order_id,
+                        venue_order_id: notif.basket_id.clone()?,
                         ts_event,
                         context,
                     }))
@@ -326,8 +351,15 @@ impl ExecutionHandler {
             }
         };
         let notify_type = ExchangeNotifyType::try_from(notif.notify_type?).ok()?;
-        let ts_event = rithmic_to_unix_nanos(notif.ssboe.unwrap_or(0), notif.usecs.unwrap_or(0));
-        let venue_order_id = notif.basket_id.clone().unwrap_or_default();
+        let Some(ts_event) = notification_timestamp(notif.ssboe, notif.usecs) else {
+            tracing::warn!(
+                ssboe = ?notif.ssboe,
+                usecs = ?notif.usecs,
+                "Dropping exchange order notification with invalid timestamp"
+            );
+            return None;
+        };
+        let venue_order_id = notif.basket_id.clone();
         let account_id = notif.account_id.clone().unwrap_or_default();
 
         tracing::debug!(
@@ -362,7 +394,7 @@ impl ExecutionHandler {
                         return None;
                     }
                 };
-                let leaves_qty = notif.total_unfilled_size.unwrap_or(0) as f64;
+                let leaves_qty = notif.total_unfilled_size.map(|value| value as f64);
 
                 if fill_price_source != "fill_price" {
                     tracing::debug!(
@@ -377,7 +409,7 @@ impl ExecutionHandler {
                 Some(ExecutionEvent::Filled(OrderFilled {
                     client_order_id,
                     account_id,
-                    venue_order_id,
+                    venue_order_id: venue_order_id?,
                     fill_price,
                     fill_qty,
                     leaves_qty,
@@ -391,7 +423,7 @@ impl ExecutionHandler {
             ExchangeNotifyType::Cancel => Some(ExecutionEvent::Cancelled(OrderCancelled {
                 client_order_id,
                 account_id,
-                venue_order_id,
+                venue_order_id: venue_order_id?,
                 ts_event,
                 context,
             })),
@@ -414,7 +446,7 @@ impl ExecutionHandler {
             ExchangeNotifyType::Modify => Some(ExecutionEvent::Modified(OrderModified {
                 client_order_id,
                 account_id,
-                venue_order_id,
+                venue_order_id: venue_order_id?,
                 new_price: notif.price,
                 new_qty: notif.modified_size.map(|q| q as f64),
                 ts_event,
@@ -575,6 +607,18 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case(None, Some(0))]
+    #[case(Some(-1), Some(0))]
+    #[case(Some(1), Some(-1))]
+    #[case(Some(1), Some(1_000_000))]
+    fn invalid_notification_timestamp_is_rejected(
+        #[case] ssboe: Option<i32>,
+        #[case] usecs: Option<i32>,
+    ) {
+        assert!(notification_timestamp(ssboe, usecs).is_none());
+    }
+
+    #[rstest::rstest]
     fn submitted_from_rithmic_notification() {
         let notif = RithmicOrderNotification {
             notify_type: Some(RithmicNotifyType::OrderRcvdFromClnt as i32),
@@ -605,7 +649,10 @@ mod tests {
                 assert_eq!(s.client_order_id, "C1");
                 assert_eq!(s.venue_order_id.as_deref(), Some("B1"));
                 assert_eq!(s.account_id, "ACCT");
-                assert_eq!(s.ts_event, rithmic_to_unix_nanos(1, 2));
+                assert_eq!(
+                    s.ts_event,
+                    notification_timestamp(Some(1), Some(2)).unwrap()
+                );
                 assert_eq!(s.context.symbol.as_deref(), Some("ESZ4"));
                 assert_eq!(s.context.exchange.as_deref(), Some("CME"));
                 assert!(s.context.is_snapshot);
@@ -651,8 +698,11 @@ mod tests {
                 assert_eq!(f.venue_order_id, "B2");
                 assert_eq!(f.fill_price, 4500.25);
                 assert_eq!(f.fill_qty, 2.0);
-                assert_eq!(f.leaves_qty, 3.0);
-                assert_eq!(f.ts_event, rithmic_to_unix_nanos(10, 20));
+                assert_eq!(f.leaves_qty, Some(3.0));
+                assert_eq!(
+                    f.ts_event,
+                    notification_timestamp(Some(10), Some(20)).unwrap()
+                );
                 assert_eq!(f.trade_id.as_deref(), Some("FILL1"));
                 assert_eq!(f.currency.as_deref(), Some("USD"));
                 assert!(f.context.is_snapshot);
@@ -662,6 +712,65 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[rstest::rstest]
+    fn fill_without_total_unfilled_size_preserves_unknown_leaves() {
+        let notif = ExchangeOrderNotification {
+            notify_type: Some(ExchangeNotifyType::Fill as i32),
+            user_tag: Some("C2".to_string()),
+            basket_id: Some("B2".to_string()),
+            symbol: Some("ESZ4".to_string()),
+            exchange: Some("CME".to_string()),
+            transaction_type: Some(1),
+            price_type: Some(2),
+            duration: Some(1),
+            quantity: Some(5),
+            fill_price: Some(4500.25),
+            fill_size: Some(2),
+            fill_id: Some("FILL1".to_string()),
+            currency: Some("USD".to_string()),
+            total_unfilled_size: None,
+            ssboe: Some(10),
+            usecs: Some(20),
+            ..Default::default()
+        };
+
+        let event = ExecutionHandler::new()
+            .handle_message(&RithmicMessage::ExchangeOrderNotification(notif))
+            .expect("expected filled event");
+        let ExecutionEvent::Filled(fill) = event else {
+            panic!("expected filled event");
+        };
+        assert_eq!(fill.leaves_qty, None);
+        assert_eq!(fill.context.leaves_qty, None);
+    }
+
+    #[rstest::rstest]
+    #[case(Some(f64::NAN), Some(1))]
+    #[case(Some(4500.25), Some(0))]
+    #[case(Some(4500.25), Some(-1))]
+    fn malformed_fill_numeric_notification_is_dropped(
+        #[case] fill_price: Option<f64>,
+        #[case] fill_size: Option<i32>,
+    ) {
+        let notif = ExchangeOrderNotification {
+            notify_type: Some(ExchangeNotifyType::Fill as i32),
+            user_tag: Some("C2".to_string()),
+            basket_id: Some("B2".to_string()),
+            fill_price,
+            fill_size,
+            total_unfilled_size: Some(1),
+            ssboe: Some(10),
+            usecs: Some(20),
+            ..Default::default()
+        };
+
+        assert!(
+            ExecutionHandler::new()
+                .handle_message(&RithmicMessage::ExchangeOrderNotification(notif))
+                .is_none()
+        );
     }
 
     #[rstest::rstest]
@@ -700,7 +809,7 @@ mod tests {
                 assert_eq!(f.venue_order_id, "B2");
                 assert_eq!(f.fill_price, 4500.25);
                 assert_eq!(f.fill_qty, 2.0);
-                assert_eq!(f.leaves_qty, 3.0);
+                assert_eq!(f.leaves_qty, Some(3.0));
                 assert_eq!(f.context.avg_price, Some(4500.25));
             }
             other => panic!("unexpected event: {other:?}"),
@@ -715,6 +824,26 @@ mod tests {
             basket_id: Some("B2".to_string()),
             fill_price: None,
             avg_fill_price: None,
+            fill_size: Some(2),
+            total_unfilled_size: Some(3),
+            ssboe: Some(10),
+            usecs: Some(20),
+            ..Default::default()
+        };
+
+        let handler = ExecutionHandler::new();
+        let event = handler.handle_message(&RithmicMessage::ExchangeOrderNotification(notif));
+
+        assert!(event.is_none());
+    }
+
+    #[rstest::rstest]
+    fn fill_without_venue_order_id_is_ignored() {
+        let notif = ExchangeOrderNotification {
+            notify_type: Some(ExchangeNotifyType::Fill as i32),
+            user_tag: Some("C2".to_string()),
+            basket_id: None,
+            fill_price: Some(4500.25),
             fill_size: Some(2),
             total_unfilled_size: Some(3),
             ssboe: Some(10),
@@ -749,7 +878,10 @@ mod tests {
             ExecutionEvent::Rejected(r) => {
                 assert_eq!(r.client_order_id, "C3");
                 assert_eq!(r.reason, "Reason");
-                assert_eq!(r.ts_event, rithmic_to_unix_nanos(5, 6));
+                assert_eq!(
+                    r.ts_event,
+                    notification_timestamp(Some(5), Some(6)).unwrap()
+                );
             }
             other => panic!("unexpected event: {other:?}"),
         }

@@ -25,11 +25,14 @@
 use nautilus_common::enums::Environment;
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
-    identifiers::{ClientId, InstrumentId, TraderId},
+    identifiers::{InstrumentId, TraderId},
     stubs::TestDefault,
 };
 use nautilus_testkit::testers::{DataTester, DataTesterConfig};
-use rithmic_nt::{config::RithmicDataClientConfig, factories::RithmicDataClientFactory};
+use rithmic_nt::{
+    config::{RithmicDataClientConfig, data_client_id},
+    factories::RithmicDataClientFactory,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,11 +42,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let trader_id = TraderId::test_default();
     let node_name = "RITHMIC-DATA-TESTER-001".to_string();
 
-    // Instrument IDs use the format `{symbol}.RITHMIC`.
+    // Instrument IDs use the format `{symbol}.{exchange}.RITHMIC`.
     // Adjust to an exact contract active at the time of testing.
     let instrument_ids = vec![
-        InstrumentId::from("ESM5.RITHMIC"),
-        // InstrumentId::from("NQM5.RITHMIC"),
+        InstrumentId::from("ESM5.CME.RITHMIC"),
+        // InstrumentId::from("NQM5.CME.RITHMIC"),
     ];
 
     // Reads credentials from env vars: RITHMIC_USERNAME, RITHMIC_PASSWORD,
@@ -51,12 +54,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rithmic_config = RithmicDataClientConfig::from_env()?;
 
     let client_factory = RithmicDataClientFactory::new();
-    let client_id = ClientId::new("RITHMIC");
+    let client_id = data_client_id(&rithmic_config.system_name)?;
 
     let mut node = LiveNode::builder(trader_id, environment)?
         .with_name(node_name)
         .with_delay_post_stop_secs(2)
-        .add_data_client(None, Box::new(client_factory), Box::new(rithmic_config))?
+        .add_data_client(
+            Some(client_id.to_string()),
+            Box::new(client_factory),
+            Box::new(rithmic_config),
+        )?
         .build()?;
 
     let tester_config = DataTesterConfig::builder()

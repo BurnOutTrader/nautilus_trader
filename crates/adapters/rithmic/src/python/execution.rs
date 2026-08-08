@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use nautilus_common::live::get_runtime;
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 #[cfg(feature = "python")]
@@ -31,17 +31,17 @@ use pyo3_async_runtimes::tokio::future_into_py;
 use rithmic_rs::{
     OrderSide, OrderType, RithmicAccount, RithmicBracketOrder, RithmicCancelOrder,
     RithmicOcoOrderLeg, RithmicOrder, TimeInForce, TrailingStop, api::RithmicResponse,
-    rithmic_to_unix_nanos, rti::messages::RithmicMessage,
+    rti::messages::RithmicMessage,
 };
 use tokio::task::JoinHandle;
 
 use super::{
     enums::{PyOrderSide, PyOrderType, PyTimeInForce},
-    events::PyExecutionEvent,
+    events::{PyExecutionEvent, checked_rithmic_timestamp_nanos},
     gateway::PyRithmicGateway,
 };
 use crate::{
-    execution::{ExecutionEvent, OrderRejected, OrderSubmitted},
+    execution::{ExecutionEvent, OrderRejected, OrderSubmitted, validate_command_price},
     gateway::{GatewayConfig, RithmicGateway},
 };
 
@@ -79,6 +79,8 @@ pub(crate) struct PyRithmicExecutionClient {
     account_id: String,
     /// Local order tracking (Arc for sharing with async futures).
     orders: Arc<parking_lot::RwLock<AHashMap<String, OrderInfo>>>,
+    /// Client order IDs reserved by in-flight submissions.
+    pending_order_ids: Arc<parking_lot::Mutex<AHashSet<String>>>,
     /// Python callback for execution events.
     execution_callback: Arc<parking_lot::Mutex<Option<Py<PyAny>>>>,
     event_task: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
@@ -103,6 +105,54 @@ struct OrderInfo {
     avg_price: Option<f64>,
 }
 
+struct ClientOrderIdReservation {
+    pending_order_ids: Arc<parking_lot::Mutex<AHashSet<String>>>,
+    client_order_ids: Vec<String>,
+}
+
+impl ClientOrderIdReservation {
+    fn new(
+        orders: &Arc<parking_lot::RwLock<AHashMap<String, OrderInfo>>>,
+        pending_order_ids: &Arc<parking_lot::Mutex<AHashSet<String>>>,
+        client_order_ids: Vec<String>,
+    ) -> PyResult<Self> {
+        let orders = orders.read();
+        let mut pending = pending_order_ids.lock();
+        let mut unique = AHashSet::new();
+
+        for client_order_id in &client_order_ids {
+            if !unique.insert(client_order_id.as_str()) {
+                return Err(to_pyvalue_err(format!(
+                    "Duplicate client_order_id in request: {client_order_id}"
+                )));
+            }
+            if orders.contains_key(client_order_id) || pending.contains(client_order_id) {
+                return Err(to_pyvalue_err(format!(
+                    "client_order_id is already tracked or pending: {client_order_id}"
+                )));
+            }
+        }
+
+        pending.extend(client_order_ids.iter().cloned());
+        drop(pending);
+        drop(orders);
+
+        Ok(Self {
+            pending_order_ids: Arc::clone(pending_order_ids),
+            client_order_ids,
+        })
+    }
+}
+
+impl Drop for ClientOrderIdReservation {
+    fn drop(&mut self) {
+        let mut pending = self.pending_order_ids.lock();
+        for client_order_id in &self.client_order_ids {
+            pending.remove(client_order_id);
+        }
+    }
+}
+
 struct TrackedOrderPatch<'a> {
     client_order_id: &'a str,
     venue_order_id: Option<&'a str>,
@@ -125,12 +175,47 @@ fn first_response_error(responses: &[RithmicResponse]) -> Option<String> {
         .find_map(|response| response.error.as_ref().map(|e| e.to_string()))
 }
 
+fn response_timestamp_nanos(ssboe: Option<i32>, usecs: Option<i32>) -> Option<u64> {
+    checked_rithmic_timestamp_nanos(ssboe?, usecs?)
+}
+
 fn account_from_gateway_config(config: &GatewayConfig, account_id: &str) -> RithmicAccount {
     RithmicAccount::new(
         config.fcm_id.clone(),
         config.ib_id.clone(),
         account_id.to_string(),
     )
+}
+
+fn validate_optional_positive_price(name: &str, value: Option<f64>) -> PyResult<()> {
+    if let Some(value) = value {
+        validate_command_price(value, name).map_err(|e| to_pyvalue_err(e.to_string()))?;
+    }
+    Ok(())
+}
+
+fn validate_optional_positive_ticks(name: &str, value: Option<i32>) -> PyResult<()> {
+    if value.is_some_and(|value| value <= 0) {
+        return Err(to_pyvalue_err(format!("{name} must be positive")));
+    }
+    Ok(())
+}
+
+fn validate_order_prices(
+    order_type: OrderType,
+    price: Option<f64>,
+    stop_price: Option<f64>,
+) -> PyResult<()> {
+    validate_optional_positive_price("price", price)?;
+    validate_optional_positive_price("stop_price", stop_price)?;
+
+    if matches!(order_type, OrderType::Limit | OrderType::StopLimit) && price.is_none() {
+        return Err(to_pyvalue_err("Limit/StopLimit orders require a price"));
+    }
+    if matches!(order_type, OrderType::StopMarket | OrderType::StopLimit) && stop_price.is_none() {
+        return Err(to_pyvalue_err("Stop orders require a stop_price"));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "python")]
@@ -152,6 +237,9 @@ impl PyRithmicExecutionClient {
         account_id: String,
         native_bracket_state_path: Option<String>,
     ) -> PyResult<Self> {
+        if account_id.trim().is_empty() {
+            return Err(to_pyvalue_err("account_id cannot be empty"));
+        }
         if native_bracket_state_path.is_some() {
             return Err(to_pyvalue_err(
                 "native_bracket_state_path is not supported by the raw PyO3 RithmicExecutionClient; remove the path or use a client path that implements persisted native bracket state",
@@ -162,6 +250,7 @@ impl PyRithmicExecutionClient {
             gateway: Arc::clone(&gateway.inner),
             account_id,
             orders: Arc::new(parking_lot::RwLock::new(AHashMap::new())),
+            pending_order_ids: Arc::new(parking_lot::Mutex::new(AHashSet::new())),
             execution_callback: Arc::new(parking_lot::Mutex::new(None)),
             event_task: Arc::new(parking_lot::Mutex::new(None)),
             event_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -259,7 +348,13 @@ impl PyRithmicExecutionClient {
 
             // Spawn event processing task
 
-            let handle = get_runtime().spawn(Self::event_loop(rx, rx_shutdown, orders, callback));
+            let handle = get_runtime().spawn(Self::event_loop(
+                rx,
+                rx_shutdown,
+                orders,
+                callback,
+                event_running,
+            ));
 
             // Store task handle
             *event_task.lock() = Some(handle);
@@ -363,25 +458,16 @@ impl PyRithmicExecutionClient {
         let rs_order_type: OrderType = order_type.into();
         let rs_side: OrderSide = side.into();
         let rs_tif: TimeInForce = time_in_force.map_or(TimeInForce::Day, |t| t.into());
-
-        // Validate limit orders have price
-
-        if (rs_order_type == OrderType::Limit || rs_order_type == OrderType::StopLimit)
-            && price.is_none()
-        {
-            return Err(to_pyvalue_err("Limit/StopLimit orders require a price"));
-        }
-
-        // Validate stop orders have stop price
-
-        if (rs_order_type == OrderType::StopMarket || rs_order_type == OrderType::StopLimit)
-            && stop_price.is_none()
-        {
-            return Err(to_pyvalue_err("Stop orders require a stop_price"));
-        }
+        validate_order_prices(rs_order_type, price, stop_price)?;
+        validate_optional_positive_ticks("trailing_stop_ticks", trailing_stop_ticks)?;
 
         let gateway = Arc::clone(&self.gateway);
         let orders = Arc::clone(&self.orders);
+        let reservation = ClientOrderIdReservation::new(
+            &orders,
+            &self.pending_order_ids,
+            vec![client_order_id.clone()],
+        )?;
         let callback = Arc::clone(&self.execution_callback);
         let execution_account_id = self.account_id.clone();
         let order_price = match rs_order_type {
@@ -399,6 +485,7 @@ impl PyRithmicExecutionClient {
         let tracking_client_order_id = client_order_id.clone();
 
         future_into_py(py, async move {
+            let _reservation_guard = reservation;
             let gw = gateway.read().await;
             let account = account_from_gateway_config(gw.config(), &execution_account_id);
             let handle = gw
@@ -429,14 +516,18 @@ impl PyRithmicExecutionClient {
             for response in &responses {
                 if let RithmicMessage::ResponseNewOrder(resp) = &response.message {
                     if let Some(e) = &response.error {
+                        let Some(ts_event) = response_timestamp_nanos(resp.ssboe, resp.usecs)
+                        else {
+                            tracing::warn!(
+                                "Dropping rejected-order callback with a missing or invalid Rithmic timestamp"
+                            );
+                            return Err(to_pyruntime_err(format!("Order submission failed: {e}")));
+                        };
                         let rejected_event = ExecutionEvent::Rejected(OrderRejected {
                             client_order_id: tracking_client_order_id.clone(),
                             account_id: execution_account_id.clone(),
                             reason: e.to_string(),
-                            ts_event: rithmic_to_unix_nanos(
-                                resp.ssboe.unwrap_or(0),
-                                resp.usecs.unwrap_or(0),
-                            ),
+                            ts_event,
                             context: crate::execution::OrderContext {
                                 symbol: Some(tracking_symbol.clone()),
                                 exchange: Some(tracking_exchange.clone()),
@@ -461,15 +552,18 @@ impl PyRithmicExecutionClient {
                     let has_venue_identity = resp.basket_id.is_some();
 
                     if matches_request || has_venue_identity {
+                        let ts_event = response_timestamp_nanos(resp.ssboe, resp.usecs)
+                            .ok_or_else(|| {
+                                to_pyruntime_err(
+                                    "Order response had a missing or invalid Rithmic timestamp",
+                                )
+                            })?;
                         venue_order_id = resp.basket_id.clone();
                         submitted_event = Some(ExecutionEvent::Submitted(OrderSubmitted {
                             client_order_id: tracking_client_order_id.clone(),
                             venue_order_id: venue_order_id.clone(),
                             account_id: execution_account_id.clone(),
-                            ts_event: rithmic_to_unix_nanos(
-                                resp.ssboe.unwrap_or(0),
-                                resp.usecs.unwrap_or(0),
-                            ),
+                            ts_event,
                             context: crate::execution::OrderContext {
                                 symbol: Some(tracking_symbol.clone()),
                                 exchange: Some(tracking_exchange.clone()),
@@ -578,15 +672,19 @@ impl PyRithmicExecutionClient {
             ));
         }
 
-        if rs_order_type == OrderType::Limit && price.is_none() {
-            return Err(to_pyvalue_err("Limit bracket orders require a price"));
-        }
+        validate_order_prices(rs_order_type, price, None)?;
 
         let gateway = Arc::clone(&self.gateway);
         let orders = Arc::clone(&self.orders);
+        let reservation = ClientOrderIdReservation::new(
+            &orders,
+            &self.pending_order_ids,
+            vec![client_order_id.clone()],
+        )?;
         let execution_account_id = self.account_id.clone();
 
         future_into_py(py, async move {
+            let _reservation_guard = reservation;
             let gw = gateway.read().await;
             let account = account_from_gateway_config(gw.config(), &execution_account_id);
             let handle = gw
@@ -713,6 +811,8 @@ impl PyRithmicExecutionClient {
             ("leg1", leg1_order_type_rs, leg1_price, leg1_stop_price),
             ("leg2", leg2_order_type_rs, leg2_price, leg2_stop_price),
         ] {
+            validate_optional_positive_price(&format!("{label}_price"), price)?;
+            validate_optional_positive_price(&format!("{label}_stop_price"), stop_price)?;
             if matches!(order_type, OrderType::Limit | OrderType::StopLimit) && price.is_none() {
                 return Err(to_pyvalue_err(format!("{label} requires a price",)));
             }
@@ -726,9 +826,15 @@ impl PyRithmicExecutionClient {
 
         let gateway = Arc::clone(&self.gateway);
         let orders = Arc::clone(&self.orders);
+        let reservation = ClientOrderIdReservation::new(
+            &orders,
+            &self.pending_order_ids,
+            vec![leg1_client_order_id.clone(), leg2_client_order_id.clone()],
+        )?;
         let execution_account_id = self.account_id.clone();
 
         future_into_py(py, async move {
+            let _reservation_guard = reservation;
             let gw = gateway.read().await;
             let account = account_from_gateway_config(gw.config(), &execution_account_id);
             let handle = gw
@@ -1252,8 +1358,10 @@ impl PyRithmicExecutionClient {
             return Err(to_pyvalue_err("Quantity must be positive"));
         }
 
-        let gateway = Arc::clone(&self.gateway);
         let rs_order_type: OrderType = order_type.map_or(OrderType::Limit, |t| t.into());
+        validate_optional_positive_price("new_price", Some(new_price))?;
+
+        let gateway = Arc::clone(&self.gateway);
         let execution_account_id = self.account_id.clone();
 
         future_into_py(py, async move {
@@ -1422,6 +1530,7 @@ impl PyRithmicExecutionClient {
         mut rx_shutdown: tokio::sync::oneshot::Receiver<()>,
         orders: Arc<parking_lot::RwLock<AHashMap<String, OrderInfo>>>,
         callback: Arc<parking_lot::Mutex<Option<Py<PyAny>>>>,
+        event_running: Arc<std::sync::atomic::AtomicBool>,
     ) {
         loop {
             tokio::select! {
@@ -1450,6 +1559,7 @@ impl PyRithmicExecutionClient {
                 }
             }
         }
+        event_running.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn upsert_tracked_order(
@@ -1718,7 +1828,7 @@ impl PyRithmicExecutionClient {
                 orders.write().remove(&e.client_order_id);
             }
             ExecutionEvent::Filled(e) => {
-                if e.leaves_qty > 0.0 {
+                if e.leaves_qty.is_none_or(|leaves_qty| leaves_qty > 0.0) {
                     Self::upsert_tracked_order(
                         orders,
                         TrackedOrderPatch {
@@ -1731,7 +1841,7 @@ impl PyRithmicExecutionClient {
                             time_in_force: e.context.time_in_force,
                             quantity: e.context.quantity,
                             filled_qty: e.context.filled_qty.or(Some(e.fill_qty)),
-                            leaves_qty: e.context.leaves_qty.or(Some(e.leaves_qty)),
+                            leaves_qty: e.leaves_qty,
                             price: e.context.price,
                             trigger_price: e.context.trigger_price,
                             avg_price: e.context.avg_price,
@@ -1786,10 +1896,14 @@ impl Drop for PyRithmicExecutionClient {
 mod tests {
     use std::sync::Arc;
 
-    use ahash::AHashMap;
+    use ahash::{AHashMap, AHashSet};
+    use pyo3::Python;
     use rithmic_rs::{OrderSide, OrderType, TimeInForce};
 
-    use super::{OrderInfo, PyRithmicExecutionClient, account_from_gateway_config};
+    use super::{
+        ClientOrderIdReservation, OrderInfo, PyRithmicExecutionClient, account_from_gateway_config,
+        validate_optional_positive_price, validate_optional_positive_ticks, validate_order_prices,
+    };
     use crate::{
         RithmicEnv,
         execution::{ExecutionEvent, OrderContext, OrderSubmitted},
@@ -1803,16 +1917,91 @@ mod tests {
             "user",
             "pass",
             "Apex",
+            "TestApp",
             "FCM123",
             "IB456",
             "DEFAULT",
-        );
+        )
+        .expect("valid test gateway configuration");
 
         let account = account_from_gateway_config(&config, "ALT_ACCOUNT");
 
         assert_eq!(account.fcm_id, "FCM123");
         assert_eq!(account.ib_id, "IB456");
         assert_eq!(account.account_id, "ALT_ACCOUNT");
+    }
+
+    #[rstest::rstest]
+    #[case(f64::NAN)]
+    #[case(f64::INFINITY)]
+    #[case(f64::NEG_INFINITY)]
+    #[case(f64::MAX)]
+    #[case(0.0)]
+    #[case(-1.0)]
+    fn prices_must_be_positive_and_representable(#[case] price: f64) {
+        Python::initialize();
+        assert!(validate_optional_positive_price("price", Some(price)).is_err());
+    }
+
+    #[rstest::rstest]
+    #[case(0)]
+    #[case(-1)]
+    fn trailing_stop_ticks_must_be_positive(#[case] ticks: i32) {
+        Python::initialize();
+        assert!(validate_optional_positive_ticks("ticks", Some(ticks)).is_err());
+    }
+
+    #[rstest::rstest]
+    fn required_order_prices_are_checked_by_order_type() {
+        Python::initialize();
+        assert!(validate_order_prices(OrderType::Limit, None, None).is_err());
+        assert!(validate_order_prices(OrderType::StopMarket, None, None).is_err());
+        assert!(validate_order_prices(OrderType::StopLimit, Some(1.0), Some(2.0)).is_ok());
+    }
+
+    #[rstest::rstest]
+    fn client_order_id_reservations_reject_tracked_pending_and_request_duplicates() {
+        Python::initialize();
+        let orders = Arc::new(parking_lot::RwLock::new(AHashMap::new()));
+        let pending = Arc::new(parking_lot::Mutex::new(AHashSet::new()));
+        let info = OrderInfo {
+            symbol: "MNQM6".to_string(),
+            exchange: "CME".to_string(),
+            venue_order_id: None,
+            side: None,
+            order_type: None,
+            time_in_force: None,
+            quantity: None,
+            filled_qty: None,
+            leaves_qty: None,
+            price: None,
+            trigger_price: None,
+            avg_price: None,
+        };
+        orders.write().insert("TRACKED".to_string(), info);
+
+        assert!(
+            ClientOrderIdReservation::new(&orders, &pending, vec!["TRACKED".to_string()]).is_err()
+        );
+        assert!(
+            ClientOrderIdReservation::new(
+                &orders,
+                &pending,
+                vec!["SAME".to_string(), "SAME".to_string()],
+            )
+            .is_err()
+        );
+
+        let reservation =
+            ClientOrderIdReservation::new(&orders, &pending, vec!["PENDING".to_string()])
+                .expect("first reservation should succeed");
+        assert!(
+            ClientOrderIdReservation::new(&orders, &pending, vec!["PENDING".to_string()]).is_err()
+        );
+        drop(reservation);
+        assert!(
+            ClientOrderIdReservation::new(&orders, &pending, vec!["PENDING".to_string()]).is_ok()
+        );
     }
 
     #[rstest::rstest]

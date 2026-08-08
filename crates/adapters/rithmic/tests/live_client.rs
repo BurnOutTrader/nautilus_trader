@@ -50,7 +50,9 @@ fn make_cache() -> Rc<RefCell<Cache>> {
 }
 
 fn make_data_client() -> RithmicLiveDataClient {
-    let config = RithmicDataClientConfig::new(RithmicEnv::Demo, "user", "pass", "TestSystem");
+    let config =
+        RithmicDataClientConfig::new(RithmicEnv::Demo, "user", "pass", "TestSystem", "TestApp")
+            .expect("test data config should be valid");
     RithmicLiveDataClient::new(ClientId::new("TESTSYSTEM"), config)
 }
 
@@ -62,7 +64,9 @@ fn make_exec_client() -> RithmicLiveExecClient {
         "pass",
         "TestSystem",
         "ACC-001",
-    );
+        "TestApp",
+    )
+    .expect("test execution config should be valid");
     let cache = make_cache();
     let core = ExecutionClientCore::new(
         TraderId::from("TEST-001"),
@@ -78,7 +82,7 @@ fn make_exec_client() -> RithmicLiveExecClient {
 }
 
 fn instrument_id() -> InstrumentId {
-    InstrumentId::from("ESM5.RITHMIC")
+    InstrumentId::from("ESM5.CME.RITHMIC")
 }
 
 fn minute_bar_type() -> BarType {
