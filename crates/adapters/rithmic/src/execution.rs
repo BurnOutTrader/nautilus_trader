@@ -1,0 +1,31 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2026 Kevin Monaghan. All rights reserved.
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 or later.
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+//! Rithmic execution client for order management.
+//!
+//! This module provides the execution client that connects to Rithmic's
+//! order plant for submitting, modifying, and cancelling orders.
+
+mod client;
+mod handler;
+pub mod live;
+mod parse;
+
+pub use client::{
+    ExecutionEvent, OrderAccepted, OrderCancelled, OrderContext, OrderFilled, OrderModified,
+    OrderRejected, OrderRequest, OrderState, OrderSubmitted, RithmicExecutionClient,
+    TrailingStopConfig,
+};
+pub use handler::ExecutionHandler;
+pub use live::RithmicLiveExecClient;

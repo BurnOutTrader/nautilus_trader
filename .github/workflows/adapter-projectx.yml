@@ -1,0 +1,131 @@
+name: adapter-projectx
+
+permissions:
+  contents: read
+  actions: read
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - stable-addons
+      - stable-addons/**
+    paths:
+      - ".github/workflows/adapter-projectx.yml"
+      - ".github/actions/common-setup/**"
+      - ".cargo/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "scripts/ci/**"
+      - "crates/adapters/projectx/**"
+      - "crates/pyo3/Cargo.toml"
+      - "crates/pyo3/src/lib.rs"
+      - "python/nautilus_trader/adapters/projectx/**"
+      - "examples/backtest/projectx/**"
+      - "examples/live/projectx/**"
+      - "python/tests/unit/adapters/projectx/**"
+  pull_request:
+    branches:
+      - stable-addons
+    paths:
+      - ".github/workflows/adapter-projectx.yml"
+      - ".github/actions/common-setup/**"
+      - ".cargo/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "scripts/ci/**"
+      - "crates/adapters/projectx/**"
+      - "crates/pyo3/Cargo.toml"
+      - "crates/pyo3/src/lib.rs"
+      - "python/nautilus_trader/adapters/projectx/**"
+      - "examples/backtest/projectx/**"
+      - "examples/live/projectx/**"
+      - "python/tests/unit/adapters/projectx/**"
+
+concurrency:
+  group: adapter-projectx-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-adapter-projectx-rust
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Common setup
+        uses: ./.github/actions/common-setup
+        with:
+          python-version: "3.13"
+          free-disk-space: "true"
+          rust-cache-key: adapter-projectx-rust
+          rust-cache-workspaces: . -> target-adapter-projectx-rust
+          rust-cache-on-failure: "false"
+
+      - name: Check Rust formatting
+        run: cargo fmt -p projectx-nt --check
+
+      - name: Run Clippy
+        run: cargo clippy -p projectx-nt --all-targets --all-features -- -D warnings
+
+      - name: Run Rust tests
+        run: make cargo-test-crate-projectx-nt NEXTEST_PROFILE=ci
+
+  python:
+    name: python
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD_MODE: debug
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-adapter-projectx-py
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Common setup
+        uses: ./.github/actions/common-setup
+        with:
+          python-version: "3.13"
+          free-disk-space: "true"
+          rust-cache-key: adapter-projectx-py
+          rust-cache-workspaces: . -> target-adapter-projectx-py
+          rust-cache-on-failure: "false"
+
+      - name: Sync Python dependencies
+        run: uv sync --all-groups --all-extras --inexact --no-install-package nautilus_trader
+
+      - name: Lint adapter Python paths
+        run: >-
+          uv run --no-sync ruff check
+          python/nautilus_trader/adapters/projectx
+          examples/backtest/projectx
+          examples/live/projectx
+          python/tests/unit/adapters/projectx
+
+      - name: Build debug extension
+        run: make build-debug
+
+      - name: Run adapter Python tests
+        run: >-
+          cd python && uv run --no-sync pytest -q
+          tests/unit/adapters/projectx

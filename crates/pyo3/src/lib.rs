@@ -267,6 +267,18 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(submodule)?;
     sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
 
+    let n = "projectx";
+    let submodule = pyo3::wrap_pymodule!(projectx_nt::python::projectx);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+
+    let n = "rithmic";
+    let submodule = pyo3::wrap_pymodule!(rithmic_nt::python::rithmic);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    // Keep Rithmic bindings namespaced under `nautilus_pyo3.rithmic` so venue-level
+    // QuoteTick/TradeTick/Order* types do not shadow the core top-level exports.
+
     let n = "sandbox";
     let submodule = pyo3::wrap_pymodule!(nautilus_sandbox::python::sandbox);
     m.add_wrapped(submodule)?;

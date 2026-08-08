@@ -1,0 +1,131 @@
+name: adapter-rithmic
+
+permissions:
+  contents: read
+  actions: read
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - stable-addons
+      - stable-addons/**
+    paths:
+      - ".github/workflows/adapter-rithmic.yml"
+      - ".github/actions/common-setup/**"
+      - ".cargo/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "scripts/ci/**"
+      - "crates/adapters/rithmic/**"
+      - "crates/pyo3/Cargo.toml"
+      - "crates/pyo3/src/lib.rs"
+      - "python/nautilus_trader/adapters/rithmic/**"
+      - "examples/backtest/rithmic/**"
+      - "examples/live/rithmic/**"
+      - "python/tests/unit/adapters/rithmic/**"
+  pull_request:
+    branches:
+      - stable-addons
+    paths:
+      - ".github/workflows/adapter-rithmic.yml"
+      - ".github/actions/common-setup/**"
+      - ".cargo/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "scripts/ci/**"
+      - "crates/adapters/rithmic/**"
+      - "crates/pyo3/Cargo.toml"
+      - "crates/pyo3/src/lib.rs"
+      - "python/nautilus_trader/adapters/rithmic/**"
+      - "examples/backtest/rithmic/**"
+      - "examples/live/rithmic/**"
+      - "python/tests/unit/adapters/rithmic/**"
+
+concurrency:
+  group: adapter-rithmic-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-adapter-rithmic-rust
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Common setup
+        uses: ./.github/actions/common-setup
+        with:
+          python-version: "3.13"
+          free-disk-space: "true"
+          rust-cache-key: adapter-rithmic-rust
+          rust-cache-workspaces: . -> target-adapter-rithmic-rust
+          rust-cache-on-failure: "false"
+
+      - name: Check Rust formatting
+        run: cargo fmt -p rithmic-nt --check
+
+      - name: Run Clippy
+        run: cargo clippy -p rithmic-nt --all-targets --all-features -- -D warnings
+
+      - name: Run Rust tests
+        run: make cargo-test-crate-rithmic-nt NEXTEST_PROFILE=ci
+
+  python:
+    name: python
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD_MODE: debug
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-adapter-rithmic-py
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Common setup
+        uses: ./.github/actions/common-setup
+        with:
+          python-version: "3.13"
+          free-disk-space: "true"
+          rust-cache-key: adapter-rithmic-py
+          rust-cache-workspaces: . -> target-adapter-rithmic-py
+          rust-cache-on-failure: "false"
+
+      - name: Sync Python dependencies
+        run: uv sync --all-groups --all-extras --inexact --no-install-package nautilus_trader
+
+      - name: Lint adapter Python paths
+        run: >-
+          uv run --no-sync ruff check
+          python/nautilus_trader/adapters/rithmic
+          examples/backtest/rithmic
+          examples/live/rithmic
+          python/tests/unit/adapters/rithmic
+
+      - name: Build debug extension
+        run: make build-debug
+
+      - name: Run adapter Python tests
+        run: >-
+          cd python && uv run --no-sync pytest -q
+          tests/unit/adapters/rithmic

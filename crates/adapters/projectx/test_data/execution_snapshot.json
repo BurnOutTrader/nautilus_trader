@@ -1,0 +1,57 @@
+{
+  "accounts": [
+    {
+      "id": 42,
+      "name": "SIM-ACCOUNT",
+      "balance": 125000.0,
+      "canTrade": true,
+      "isVisible": true,
+      "simulated": true
+    }
+  ],
+  "positions": [
+    {
+      "id": 501,
+      "accountId": 42,
+      "contractId": "CON.F.US.MNQ.M26",
+      "creationTimestamp": "2026-04-08T10:15:00Z",
+      "type": 1,
+      "size": 2,
+      "averagePrice": 21205.25
+    }
+  ],
+  "orders": [
+    {
+      "id": 7001,
+      "accountId": 42,
+      "contractId": "CON.F.US.MNQ.M26",
+      "symbolId": "F.US.MNQ",
+      "creationTimestamp": "2026-04-08T10:20:00Z",
+      "updateTimestamp": "2026-04-08T10:20:01Z",
+      "status": 2,
+      "type": 1,
+      "side": 0,
+      "size": 2,
+      "limitPrice": 21204.0,
+      "stopPrice": null,
+      "fillVolume": 0,
+      "filledPrice": null,
+      "customTag": "STRAT-ENTRY"
+    }
+  ],
+  "trades": [
+    {
+      "id": 9001,
+      "accountId": 42,
+      "contractId": "CON.F.US.MNQ.M26",
+      "creationTimestamp": "2026-04-08T10:21:00Z",
+      "price": 21204.0,
+      "profitAndLoss": 0.0,
+      "fees": 1.2,
+      "side": 0,
+      "size": 1,
+      "voided": false,
+      "orderId": 7001
+    }
+  ]
+}

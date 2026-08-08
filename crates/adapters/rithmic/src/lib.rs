@@ -1,0 +1,82 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2026 Kevin Monaghan. All rights reserved.
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 or later.
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+//! NautilusTrader adapter for Rithmic futures trading.
+//!
+//! This crate provides connectivity to Rithmic's R | Protocol API™
+//! for market data and order execution on futures exchanges.
+//!
+//! # Architecture
+//!
+//! The adapter follows NautilusTrader's layered architecture:
+//! - **Rust layer**: Performance-critical networking, parsing, and data transformation
+//! - **Python layer**: Integration with NautilusTrader's data and execution engines
+//!
+//! # Modules
+//!
+//! - [`common`]: Shared utilities, constants, and type converters
+//! - [`config`]: Configuration types for data and execution clients
+//! - [`data`]: Market data client for streaming quotes and trades
+//! - [`execution`]: Execution client for order management
+//! - [`instruments`]: Instrument provider for loading contract definitions
+//! - [`providers`]: Account and position state providers
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use rithmic_nt::{RithmicDataClient, RithmicDataClientConfig};
+//!
+//! let config = RithmicDataClientConfig::from_env()?;
+//! let mut client = RithmicDataClient::new(config);
+//! client.connect().await?;
+//! ```
+
+pub mod common;
+pub mod config;
+pub mod data;
+pub mod error;
+pub mod execution;
+pub mod factories;
+pub mod gateway;
+pub mod instruments;
+pub mod providers;
+mod shared_gateway;
+
+#[cfg(feature = "python")]
+pub mod python;
+
+// Re-exports for convenient access
+pub use common::{
+    databento_to_rithmic_symbol, projectx_to_rithmic_symbol, rithmic_to_databento_symbol,
+    rithmic_to_databento_symbol_with_year, rithmic_to_projectx_symbol,
+    rithmic_to_projectx_symbol_with_year,
+};
+#[allow(deprecated)]
+pub use config::{
+    RithmicDataClientConfig, RithmicEnv, RithmicEnvironment, RithmicExecClientConfig,
+};
+pub use data::{
+    RithmicBarType, RithmicDataClient, RithmicEndOfDayPrices, RithmicIndicatorPrices,
+    RithmicLiveDataClient, RithmicMinuteVolumeProfileBar, RithmicOpenInterest,
+    RithmicOrderPriceLimits, RithmicQuoteStatistics, RithmicSymbolMarginRate,
+    RithmicTradeStatistics, RithmicVolumeAtPrice,
+};
+pub use error::{Result, RithmicError, RithmicWsError, WsResult};
+pub use execution::{RithmicExecutionClient, RithmicLiveExecClient};
+pub use factories::{RithmicDataClientFactory, RithmicExecClientFactory};
+pub use gateway::{GatewayConfig, InstrumentInfo, PnlEvent, RithmicGateway};
+// Re-export bar types for historical data requests
+pub use instruments::{RithmicInstrumentProvider, RithmicInstrumentSymbol};
+pub use providers::{RithmicAccountProvider, RithmicPositionProvider};
+pub use rithmic_rs::rti::request_time_bar_replay::BarType as TimeBarType;

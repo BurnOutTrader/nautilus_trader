@@ -1,0 +1,53 @@
+{
+  "snapshots": [
+    {
+      "template_id": 157,
+      "user_msg": [],
+      "rq_handler_rp_code": [],
+      "rp_code": [],
+      "exchange": "CME",
+      "symbol": "ESM6",
+      "sequence_number": 101,
+      "depth_side": 1,
+      "depth_price": 4500.25,
+      "depth_size": [7, 5],
+      "depth_order_priority": [11, 12],
+      "exchange_order_id": ["bid-11", "bid-12"]
+    },
+    {
+      "template_id": 157,
+      "user_msg": [],
+      "rq_handler_rp_code": [],
+      "rp_code": [],
+      "exchange": "CME",
+      "symbol": "ESM6",
+      "sequence_number": 101,
+      "depth_side": 2,
+      "depth_price": 4500.5,
+      "depth_size": [6],
+      "depth_order_priority": [21],
+      "exchange_order_id": ["ask-21"]
+    }
+  ],
+  "delta": {
+    "template_id": 156,
+    "symbol": "ESM6",
+    "exchange": "CME",
+    "sequence_number": 102,
+    "update_type": [2, 1],
+    "transaction_type": [1, 2],
+    "depth_price": [4500.25, 4500.75],
+    "prev_depth_price": [4500.25, 0.0],
+    "prev_depth_price_flag": [true, false],
+    "depth_size": [9, 4],
+    "depth_order_priority": [11, 22],
+    "exchange_order_id": ["bid-11", "ask-22"],
+    "ssboe": 1700000102,
+    "usecs": 250000,
+    "source_ssboe": null,
+    "source_usecs": null,
+    "source_nsecs": null,
+    "jop_ssboe": null,
+    "jop_nsecs": null
+  }
+}

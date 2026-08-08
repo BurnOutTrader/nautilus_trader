@@ -1,0 +1,33 @@
+{
+  "quote": {
+    "symbol": "MNQM6",
+    "symbolName": "Micro E-mini Nasdaq-100 Jun 2026",
+    "lastPrice": 21250.25,
+    "bestBid": 21250.0,
+    "bestAsk": 21250.25,
+    "change": 15.0,
+    "changePercent": 0.07,
+    "open": 21200.0,
+    "high": 21300.0,
+    "low": 21180.0,
+    "volume": 12345,
+    "lastUpdated": "2026-04-08T10:30:00Z",
+    "timestamp": "2026-04-08T10:30:00Z"
+  },
+  "trade": {
+    "symbolId": "CON.F.US.MNQ.M26",
+    "price": 21250.25,
+    "timestamp": "2026-04-08T10:30:01Z",
+    "type": 0,
+    "volume": 3
+  },
+  "depth": {
+    "symbolId": "CON.F.US.MNQ.M26",
+    "timestamp": "2026-04-08T10:30:02Z",
+    "type": 2,
+    "price": 21250.0,
+    "volume": 2,
+    "currentVolume": 7,
+    "index": 1
+  }
+}

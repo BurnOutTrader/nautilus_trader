@@ -1,0 +1,122 @@
+[package]
+name = "projectx-nt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors = ["Kevin Monaghan"]
+license.workspace = true
+description = "Independent ProjectX adapter primitives for NautilusTrader-compatible integrations"
+categories.workspace = true
+keywords.workspace = true
+repository = "https://github.com/BurnOutTrader/nautilus_trader"
+
+[lints]
+workspace = true
+
+[lib]
+name = "projectx_nt"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["high-precision"]
+high-precision = ["nautilus-model/high-precision"]
+extension-module = [
+  "nautilus-common/extension-module",
+  "nautilus-core/extension-module",
+  "nautilus-model/extension-module",
+  "python",
+  "pyo3/extension-module",
+]
+python = [
+  "nautilus-common/python",
+  "nautilus-core/python",
+  "nautilus-model/python",
+  "nautilus-system/python",
+  "pyo3",
+  "pyo3-async-runtimes",
+  "pyo3-stub-gen",
+]
+
+[dependencies]
+nautilus-common = { workspace = true }
+nautilus-core = { workspace = true }
+nautilus-live = { workspace = true, features = ["node", "examples"] }
+nautilus-model = { workspace = true }
+nautilus-network = { workspace = true }
+nautilus-system = { workspace = true }
+
+ahash = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { version = "0.4.45", default-features = false, features = ["serde", "std", "clock"] }
+dashmap = { workspace = true }
+futures-util = { workspace = true }
+jiff = { version = "0.2.35", default-features = false, features = ["perf-inline", "serde", "std", "tzdb-zoneinfo"] }
+log = { workspace = true }
+parking_lot = "0.12"
+projectx-client = "2"
+reqwest = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+
+pyo3 = { workspace = true, optional = true }
+pyo3-async-runtimes = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
+
+[dev-dependencies]
+nautilus-backtest = { workspace = true, features = ["streaming"] }
+nautilus-indicators = { workspace = true }
+nautilus-persistence = { workspace = true }
+nautilus-testkit = { workspace = true, features = ["testers"] }
+nautilus-trading = { workspace = true }
+
+dotenvy = { workspace = true }
+rstest = { workspace = true }
+tempfile = { workspace = true }
+ustr = { workspace = true }
+
+# cargo run --example projectx-rust-quote-probe -p projectx-nt
+[[example]]
+name = "projectx-rust-quote-probe"
+path = "examples/node_quote_probe.rs"
+required-features = []
+doc = false
+
+# cargo run --example projectx-rust-exec-tester -p projectx-nt
+[[example]]
+name = "projectx-rust-exec-tester"
+path = "examples/node_exec_tester.rs"
+required-features = []
+doc = false
+
+# cargo run --example projectx-rust-backtest-bars -p projectx-nt
+[[example]]
+name = "projectx-rust-backtest-bars"
+path = "examples/backtest_bar_strategy.rs"
+required-features = []
+doc = false
+
+# cargo run --example projectx-rust-download-bars -p projectx-nt
+[[example]]
+name = "projectx-rust-download-bars"
+path = "examples/download_bars.rs"
+required-features = []
+doc = false
+
+# cargo run --example projectx-rust-backtest-ema-cross -p projectx-nt
+[[example]]
+name = "projectx-rust-backtest-ema-cross"
+path = "examples/backtest_ema_cross.rs"
+required-features = []
+doc = false
+
+# cargo run --example projectx-rust-live-ema-cross -p projectx-nt
+[[example]]
+name = "projectx-rust-live-ema-cross"
+path = "examples/node_ema_cross.rs"
+required-features = []
+doc = false

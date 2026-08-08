@@ -1,0 +1,50 @@
+{
+  "responses": [
+    {
+      "template_id": 203,
+      "request_key": "history-req",
+      "user_msg": [],
+      "rq_handler_rp_code": ["0"],
+      "rp_code": [],
+      "symbol": "ESM6",
+      "exchange": "CME",
+      "type": 2,
+      "period": "1",
+      "marker": 1700000000,
+      "num_trades": 12,
+      "volume": 100,
+      "bid_volume": 45,
+      "ask_volume": 55,
+      "open_price": 4500.0,
+      "close_price": 4500.25,
+      "high_price": 4500.5,
+      "low_price": 4499.75,
+      "settlement_price": null,
+      "has_settlement_price": false,
+      "must_clear_settlement_price": false
+    },
+    {
+      "template_id": 203,
+      "request_key": "history-req",
+      "user_msg": [],
+      "rq_handler_rp_code": [],
+      "rp_code": [],
+      "symbol": "ESM6",
+      "exchange": "CME",
+      "type": 2,
+      "period": "1",
+      "marker": 1700000060,
+      "num_trades": 10,
+      "volume": 80,
+      "bid_volume": 30,
+      "ask_volume": 50,
+      "open_price": 4500.25,
+      "close_price": 4500.75,
+      "high_price": 4501.0,
+      "low_price": 4500.0,
+      "settlement_price": null,
+      "has_settlement_price": false,
+      "must_clear_settlement_price": false
+    }
+  ]
+}

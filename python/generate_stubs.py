@@ -200,6 +200,42 @@ EXTRA_REEXPORTS: dict[str, tuple[str, ...]] = {
     "nautilus_trader/adapters/binance/__init__.pyi": (
         "from nautilus_trader.adapters.binance.instruments import load_binance_instruments as load_binance_instruments",
     ),
+    "nautilus_trader/adapters/projectx/__init__.pyi": (
+        "from nautilus_trader.adapters.projectx.backtest import ProjectXCatalogDownloadResult as ProjectXCatalogDownloadResult",
+        "from nautilus_trader.adapters.projectx.backtest import build_external_bar_type as build_external_bar_type",
+        "from nautilus_trader.adapters.projectx.backtest import download_bars_to_catalog as download_bars_to_catalog",
+        "from nautilus_trader.adapters.projectx.providers import ProjectXInstrumentProvider as ProjectXInstrumentProvider",
+    ),
+    "nautilus_trader/adapters/rithmic/__init__.pyi": (
+        "from nautilus_trader.adapters.rithmic.backtest import build_external_bar_type as build_external_bar_type",
+        "from nautilus_trader.adapters.rithmic.backtest import download_bars_to_catalog as download_bars_to_catalog",
+        "from nautilus_trader.adapters.rithmic.backtest import normalize_rithmic_bar_spec as normalize_rithmic_bar_spec",
+        "from nautilus_trader.adapters.rithmic.backtest import resolve_catalog_backtest_window as resolve_catalog_backtest_window",
+        "from nautilus_trader.adapters.rithmic.backtest import resolve_catalog_instrument_id as resolve_catalog_instrument_id",
+        "from nautilus_trader.adapters.rithmic.backtest import resolve_download_instrument_id as resolve_download_instrument_id",
+        "from nautilus_trader.adapters.rithmic.backtest import resolve_front_month_instrument_id as resolve_front_month_instrument_id",
+        "from nautilus_trader.adapters.rithmic.config import RITHMIC_ACCOUNT_ID_ENV as RITHMIC_ACCOUNT_ID_ENV",
+        "from nautilus_trader.adapters.rithmic.config import RITHMIC_APP_NAME_ENV as RITHMIC_APP_NAME_ENV",
+        "from nautilus_trader.adapters.rithmic.config import RITHMIC_APP_VERSION_ENV as RITHMIC_APP_VERSION_ENV",
+        "from nautilus_trader.adapters.rithmic.config import RITHMIC_ENV_ENV as RITHMIC_ENV_ENV",
+        "from nautilus_trader.adapters.rithmic.config import RITHMIC_FCM_ID_ENV as RITHMIC_FCM_ID_ENV",
+        "from nautilus_trader.adapters.rithmic.config import RITHMIC_IB_ID_ENV as RITHMIC_IB_ID_ENV",
+        "from nautilus_trader.adapters.rithmic.config import RITHMIC_PASSWORD_ENV as RITHMIC_PASSWORD_ENV",
+        "from nautilus_trader.adapters.rithmic.config import RITHMIC_SERVER_ENV as RITHMIC_SERVER_ENV",
+        "from nautilus_trader.adapters.rithmic.config import RITHMIC_SYSTEM_NAME_ENV as RITHMIC_SYSTEM_NAME_ENV",
+        "from nautilus_trader.adapters.rithmic.config import RITHMIC_USERNAME_ENV as RITHMIC_USERNAME_ENV",
+        "from nautilus_trader.adapters.rithmic.config import get_rithmic_adapter_account_id as get_rithmic_adapter_account_id",
+        "from nautilus_trader.adapters.rithmic.config import get_rithmic_data_client_id as get_rithmic_data_client_id",
+        "from nautilus_trader.adapters.rithmic.config import get_rithmic_exec_client_id as get_rithmic_exec_client_id",
+        "from nautilus_trader.adapters.rithmic.config import get_rithmic_profiles_from_env as get_rithmic_profiles_from_env",
+        "from nautilus_trader.adapters.rithmic.config import load_rithmic_env_file as load_rithmic_env_file",
+        "from nautilus_trader.adapters.rithmic.config import parse_rithmic_env as parse_rithmic_env",
+        "from nautilus_trader.adapters.rithmic.config import rithmic_env_token as rithmic_env_token",
+        "from nautilus_trader.adapters.rithmic.config import to_binding_environment as to_binding_environment",
+        "from nautilus_trader.adapters.rithmic.constants import RITHMIC as RITHMIC",
+        "from nautilus_trader.adapters.rithmic.constants import RITHMIC_CLIENT_ID as RITHMIC_CLIENT_ID",
+        "from nautilus_trader.adapters.rithmic.constants import RITHMIC_VENUE as RITHMIC_VENUE",
+    ),
     "nautilus_trader/core/__init__.pyi": (
         "from nautilus_trader.core.datetime import dt_to_unix_nanos as dt_to_unix_nanos",
         "from nautilus_trader.core.datetime import unix_nanos_to_dt as unix_nanos_to_dt",
@@ -556,7 +592,7 @@ PYCLASS_ATTR_RE = re.compile(r"\b(?:pyo3::)?pyclass\s*\(")
 PYO3_NAME_RE = re.compile(r'#\[pyo3\(\s*name\s*=\s*"([^"]+)"')
 ATTR_NAME_RE = re.compile(r'\bname\s*=\s*"([^"]+)"')
 RUST_IMPL_RE = re.compile(r"^\s*impl(?:\s*<[^>]+>)?\s+([A-Za-z_][A-Za-z0-9_:<>]*)\s*\{")
-RUST_STRUCT_RE = re.compile(r"^\s*(?:pub\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+RUST_STRUCT_RE = re.compile(r"^\s*(?:(?:pub|pub\s*\(\s*crate\s*\))\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)\b")
 RUST_FN_RE = re.compile(
     r"fn\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*<[^>]+>)?\s*\((.*)\)\s*(?:->\s*(.*?))?\s*\{",
     flags=re.DOTALL,

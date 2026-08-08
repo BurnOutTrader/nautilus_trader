@@ -78,6 +78,7 @@ venv*/
 python/nautilus_trader/_libnautilus.pyi
 
 # Build environment and temp
+.env
 _build/
 build/
 dist/
@@ -196,3 +197,9 @@ tests/unit_tests/persistence/catalog/
 !/test_data/nautilus/*/**.parquet
 !tests/integration_tests/adapters/betfair/responses/*.log
 !/nautilus_core/adapters/src/databento/test_data/*
+
+# Local dev artifacts
+crates/adapters/projectx/completed.md
+crates/adapters/projectx/devplan.md
+docs/dev_plans/
+crates/adapters/rithmic/vendor/

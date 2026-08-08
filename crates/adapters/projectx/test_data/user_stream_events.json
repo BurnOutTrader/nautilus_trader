@@ -1,0 +1,76 @@
+{
+  "accounts": [
+    {
+      "id": 42,
+      "name": "SIM-ACCOUNT",
+      "balance": 125000.0,
+      "canTrade": true,
+      "isVisible": true,
+      "simulated": true
+    }
+  ],
+  "positions": [
+    {
+      "id": 601,
+      "accountId": 42,
+      "contractId": "CON.F.US.MNQ.M26",
+      "creationTimestamp": "2026-04-08T11:00:00Z",
+      "type": 1,
+      "size": 1,
+      "averagePrice": 21206.25
+    }
+  ],
+  "orders_initial": [
+    {
+      "id": 7101,
+      "accountId": 42,
+      "contractId": "CON.F.US.MNQ.M26",
+      "symbolId": "F.US.MNQ",
+      "creationTimestamp": "2026-04-08T11:01:00Z",
+      "updateTimestamp": "2026-04-08T11:01:01Z",
+      "status": 1,
+      "type": 2,
+      "side": 0,
+      "size": 2,
+      "limitPrice": null,
+      "stopPrice": null,
+      "fillVolume": 0,
+      "filledPrice": null,
+      "customTag": "PXEMA-TEST-FIXTURE-001"
+    }
+  ],
+  "orders_progress": [
+    {
+      "id": 7101,
+      "accountId": 42,
+      "contractId": "CON.F.US.MNQ.M26",
+      "symbolId": "F.US.MNQ",
+      "creationTimestamp": "2026-04-08T11:01:00Z",
+      "updateTimestamp": "2026-04-08T11:01:03Z",
+      "status": 1,
+      "type": 2,
+      "side": 0,
+      "size": 2,
+      "limitPrice": null,
+      "stopPrice": null,
+      "fillVolume": 1,
+      "filledPrice": 21206.5,
+      "customTag": "PXEMA-TEST-FIXTURE-001"
+    }
+  ],
+  "trades": [
+    {
+      "id": 9101,
+      "accountId": 42,
+      "contractId": "CON.F.US.MNQ.M26",
+      "creationTimestamp": "2026-04-08T11:01:04Z",
+      "price": 21206.5,
+      "profitAndLoss": 0.0,
+      "fees": 1.2,
+      "side": 0,
+      "size": 1,
+      "voided": false,
+      "orderId": 7101
+    }
+  ]
+}

@@ -1,0 +1,90 @@
+{
+  "trade_statistics": {
+    "template_id": 154,
+    "symbol": "ESM6",
+    "exchange": "CME",
+    "presence_bits": 7,
+    "clear_bits": 0,
+    "is_snapshot": true,
+    "open_price": 4499.0,
+    "high_price": 4505.0,
+    "low_price": 4498.5,
+    "ssboe": 1700000200,
+    "usecs": 10000,
+    "source_ssboe": null,
+    "source_usecs": null,
+    "source_nsecs": null,
+    "jop_ssboe": null,
+    "jop_nsecs": null
+  },
+  "quote_statistics": {
+    "template_id": 155,
+    "symbol": "ESM6",
+    "exchange": "CME",
+    "presence_bits": 3,
+    "clear_bits": 0,
+    "is_snapshot": true,
+    "highest_bid_price": 4500.25,
+    "lowest_ask_price": 4500.5,
+    "ssboe": 1700000200,
+    "usecs": 20000
+  },
+  "indicator_prices": {
+    "template_id": 156,
+    "symbol": "ESM6",
+    "exchange": "CME",
+    "presence_bits": 3,
+    "clear_bits": 0,
+    "is_snapshot": true,
+    "opening_indicator": 4498.75,
+    "closing_indicator": 4501.25,
+    "ssboe": 1700000200,
+    "usecs": 30000
+  },
+  "open_interest": {
+    "template_id": 157,
+    "symbol": "ESM6",
+    "exchange": "CME",
+    "is_snapshot": true,
+    "should_clear": true,
+    "open_interest": 123456,
+    "ssboe": 1700000200,
+    "usecs": 40000
+  },
+  "end_of_day_prices": {
+    "template_id": 158,
+    "symbol": "ESM6",
+    "exchange": "CME",
+    "presence_bits": 15,
+    "clear_bits": 0,
+    "is_snapshot": true,
+    "close_price": 4500.0,
+    "close_date": "20260401",
+    "adjusted_close_price": 4500.25,
+    "settlement_price": 4500.5,
+    "settlement_date": "20260401",
+    "settlement_price_type": "FINAL",
+    "projected_settlement_price": 4500.75,
+    "ssboe": 1700000200,
+    "usecs": 50000
+  },
+  "order_price_limits": {
+    "template_id": 159,
+    "symbol": "ESM6",
+    "exchange": "CME",
+    "presence_bits": 3,
+    "clear_bits": 0,
+    "is_snapshot": true,
+    "high_price_limit": 4550.0,
+    "low_price_limit": 4450.0,
+    "ssboe": 1700000200,
+    "usecs": 60000
+  },
+  "symbol_margin_rate": {
+    "template_id": 160,
+    "symbol": "ESM6",
+    "exchange": "CME",
+    "is_snapshot": true,
+    "margin_rate": 1.25
+  }
+}

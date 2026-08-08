@@ -1,0 +1,100 @@
+{
+  "rithmic_order_notifications": [
+    {
+      "expected_event": "submitted",
+      "notify_type": "order_received_from_client",
+      "user_tag": "SAN-CLIENT-001",
+      "basket_id": "SAN-VENUE-001",
+      "account_id": "SAN-ACCOUNT-001",
+      "is_snapshot": true,
+      "symbol": "ESM6",
+      "exchange": "CME",
+      "transaction_type": 1,
+      "price_type": 2,
+      "duration": 1,
+      "quantity": 2,
+      "price": 5100.25,
+      "total_fill_size": 0,
+      "total_unfilled_size": 2,
+      "ssboe": 1700001000,
+      "usecs": 1200
+    },
+    {
+      "expected_event": "modified",
+      "notify_type": "modified",
+      "user_tag": "SAN-CLIENT-002",
+      "basket_id": "SAN-VENUE-002",
+      "account_id": "SAN-ACCOUNT-001",
+      "is_snapshot": false,
+      "symbol": "ESM6",
+      "exchange": "CME",
+      "transaction_type": 1,
+      "price_type": 2,
+      "duration": 1,
+      "quantity": 3,
+      "price": 5101.0,
+      "total_fill_size": 1,
+      "total_unfilled_size": 2,
+      "ssboe": 1700001001,
+      "usecs": 1300
+    }
+  ],
+  "exchange_order_notifications": [
+    {
+      "expected_event": "fill",
+      "notify_type": "fill",
+      "user_tag": "SAN-CLIENT-001",
+      "basket_id": "SAN-VENUE-001",
+      "account_id": "SAN-ACCOUNT-001",
+      "is_snapshot": true,
+      "symbol": "ESM6",
+      "exchange": "CME",
+      "transaction_type": 1,
+      "price_type": 2,
+      "duration": 1,
+      "quantity": 2,
+      "fill_price": 5100.5,
+      "fill_size": 1,
+      "fill_id": "SAN-FILL-001",
+      "currency": "USD",
+      "total_fill_size": 1,
+      "total_unfilled_size": 1,
+      "ssboe": 1700001002,
+      "usecs": 1400
+    },
+    {
+      "expected_event": "reject",
+      "notify_type": "reject",
+      "user_tag": "SAN-CLIENT-003",
+      "basket_id": "SAN-VENUE-003",
+      "account_id": "SAN-ACCOUNT-001",
+      "text": "SANITIZED_REJECT_REASON",
+      "ssboe": 1700001003,
+      "usecs": 1500
+    },
+    {
+      "expected_event": "cancel",
+      "notify_type": "cancel",
+      "user_tag": "SAN-CLIENT-004",
+      "basket_id": "SAN-VENUE-004",
+      "account_id": "SAN-ACCOUNT-001",
+      "symbol": "ESM6",
+      "exchange": "CME",
+      "ssboe": 1700001004,
+      "usecs": 1600
+    },
+    {
+      "expected_event": "modify",
+      "notify_type": "modify",
+      "user_tag": "SAN-CLIENT-005",
+      "basket_id": "SAN-VENUE-005",
+      "account_id": "SAN-ACCOUNT-001",
+      "symbol": "ESM6",
+      "exchange": "CME",
+      "price": 5102.0,
+      "modified_size": 4,
+      "ssboe": 1700001005,
+      "usecs": 1700
+    }
+  ]
+}

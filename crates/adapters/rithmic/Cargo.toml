@@ -1,0 +1,135 @@
+[package]
+name = "rithmic-nt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors = ["Kevin Monaghan"]
+license.workspace = true
+description = "Independent Rithmic adapter for NautilusTrader-compatible integrations"
+categories.workspace = true
+keywords.workspace = true
+repository = "https://github.com/BurnOutTrader/nautilus_trader"
+
+[lints]
+workspace = true
+
+[lib]
+name = "rithmic_nt"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["high-precision"]
+high-precision = ["nautilus-model/high-precision"]
+python = [
+  "nautilus-common/python",
+  "nautilus-core/python",
+  "nautilus-model/python",
+  "nautilus-system/python",
+  "pyo3",
+  "pyo3-async-runtimes",
+  "pyo3-stub-gen",
+]
+extension-module = [
+  "nautilus-common/extension-module",
+  "nautilus-core/extension-module",
+  "nautilus-model/extension-module",
+  "python",
+  "pyo3/extension-module",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+nautilus-common = { workspace = true, features = ["live"] }
+nautilus-core = { workspace = true }
+nautilus-live = { workspace = true, features = ["node", "examples"] }
+nautilus-model = { workspace = true }
+nautilus-system = { workspace = true }
+
+ahash = { workspace = true }
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+chrono = { version = "0.4.45", default-features = false, features = ["serde", "std", "clock"] }
+dashmap = { workspace = true }
+dotenvy = { workspace = true }
+futures-util = { workspace = true }
+jiff = { version = "0.2.35", default-features = false, features = ["perf-inline", "serde", "std", "tzdb-zoneinfo"] }
+log = { workspace = true }
+parking_lot = "0.12"
+pyo3 = { workspace = true, optional = true }
+pyo3-async-runtimes = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
+rithmic-rs = { git = "https://github.com/BurnOutTrader/rithmic-rs", branch = "main", features = [
+  "serde",
+] }
+rust_decimal = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = "0.1"
+ustr = { workspace = true }
+
+[dev-dependencies]
+nautilus-backtest = { workspace = true, features = ["streaming"] }
+nautilus-indicators = { workspace = true }
+nautilus-persistence = { workspace = true }
+nautilus-testkit = { workspace = true, features = ["testers"] }
+nautilus-trading = { workspace = true }
+prost = { version = "0.14.3", default-features = false, features = ["std"] }
+rstest = { workspace = true }
+tokio-test = "0.4"
+tokio-tungstenite = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Run with `cargo run --example rithmic-data-tester --package rithmic-nt`.
+[[example]]
+name = "rithmic-data-tester"
+path = "examples/node_data_tester.rs"
+required-features = []
+doc = false
+
+# Run with `cargo run --example rithmic-exec-tester --package rithmic-nt`.
+[[example]]
+name = "rithmic-exec-tester"
+path = "examples/node_exec_tester.rs"
+required-features = []
+doc = false
+
+# cargo run --example rithmic-rust-download-bars --package rithmic-nt
+[[example]]
+name = "rithmic-rust-download-bars"
+path = "examples/download_bars.rs"
+required-features = []
+doc = false
+
+# cargo run --example rithmic-rust-backtest-ema-cross --package rithmic-nt
+[[example]]
+name = "rithmic-rust-backtest-ema-cross"
+path = "examples/backtest_ema_cross.rs"
+required-features = []
+doc = false
+
+# cargo run --example rithmic-rust-live-ema-cross --package rithmic-nt
+[[example]]
+name = "rithmic-rust-live-ema-cross"
+path = "examples/node_ema_cross.rs"
+required-features = []
+doc = false
+
+# cargo run --example rithmic-instrument-discovery-probe --package rithmic-nt
+[[example]]
+name = "rithmic-instrument-discovery-probe"
+path = "examples/instrument_discovery_probe.rs"
+required-features = []
+doc = false
+
+# cargo run --example rithmic-write-instruments-catalog --package rithmic-nt
+[[example]]
+name = "rithmic-write-instruments-catalog"
+path = "examples/write_instruments_catalog.rs"
+required-features = []
+doc = false

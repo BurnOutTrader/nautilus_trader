@@ -64,6 +64,8 @@ extension-module = [
   "nautilus-okx/extension-module",
   "nautilus-portfolio/extension-module",
   "nautilus-polymarket/extension-module",
+  "projectx-nt/extension-module",
+  "rithmic-nt/extension-module",
   "nautilus-sandbox/extension-module",
   "nautilus-persistence/extension-module",
   "nautilus-risk/extension-module",
@@ -91,6 +93,8 @@ high-precision = [
   "nautilus-lighter/high-precision",
   "nautilus-okx/high-precision",
   "nautilus-polymarket/high-precision",
+  "projectx-nt/high-precision",
+  "rithmic-nt/high-precision",
   "nautilus-sandbox/high-precision",
   "nautilus-tardis/high-precision",
 ]
@@ -154,6 +158,8 @@ nautilus-kraken = { workspace = true, features = ["python"] }
 nautilus-lighter = { workspace = true, features = ["python"] }
 nautilus-okx = { workspace = true, features = ["python"] }
 nautilus-polymarket = { workspace = true, features = ["python"] }
+projectx-nt = { workspace = true, features = ["python"] }
+rithmic-nt = { workspace = true, features = ["python"] }
 nautilus-sandbox = { workspace = true, features = ["python"] }
 nautilus-tardis = { workspace = true, features = ["python", "replay"] }
 
