@@ -123,7 +123,7 @@ The Data publish/subscribe approach works well when you need:
 
 - **Exchange of structured trading data** like market data, indicators, custom metrics, or option greeks.
 - **Proper event ordering** via built-in timestamps (`ts_event`, `ts_init`) crucial for backtest accuracy.
-- **Data persistence and serialization** through the `@customdataclass` decorator, integrating with NautilusTrader's data catalog system.
+- **Data persistence and serialization** through registered custom data classes, integrating with NautilusTrader's data catalog system.
 - **Standardized trading data exchange** between system components.
 
 #### Considerations
@@ -288,6 +288,34 @@ Ingress yields the same `BusMessage { topic, payload_type, encoding, payload }` 
 without forwarding the message back out. The inbound payload type must first be registered for
 streaming on the receiving message bus; unregistered types are skipped without decoding.
 
+For custom data, egress writes and ingress expects an envelope in the Redis `payload` field, not the
+bare custom object. The canonical JSON envelope is:
+
+```json
+{
+  "type": "MyData",
+  "data_type": {
+    "type_name": "MyData",
+    "metadata": {
+      "source": "external"
+    },
+    "identifier": "optional-storage-key"
+  },
+  "payload": {
+    "value": 42,
+    "ts_event": 0,
+    "ts_init": 0
+  }
+}
+```
+
+The envelope requires `type` and `payload`; `data_type` is optional on ingress and defaults to the
+message type with no metadata or identifier. In the canonical emitted form, `data_type.type_name`
+uses the same custom type name, `metadata` is an object that may be empty, and `identifier` is
+present only when assigned. The envelope `type` must match the Redis stream `type`. The envelope
+`payload` is the bare object passed to the registered class's `from_json(...)` method. MessagePack
+uses the same map fields encoded as MessagePack bytes.
+
 For Python custom data, register the class before starting the node:
 
 ```python
@@ -420,9 +448,9 @@ when the matching Rust feature is enabled. `encoding_builtin = "sbe"` and
 `encoding_builtin = "capnp"` fail validation until those schema codecs cover the built-in event
 category.
 
-The legacy Python/Cython Redis serializer and the Redis cache payload path support MessagePack and
-JSON. SBE and Cap'n Proto are schema payload encodings for Rust-native external message bus egress,
-not Redis cache encodings.
+The Redis cache payload path supports MessagePack and JSON only. SBE and Cap'n Proto are schema
+payload encodings for Rust-native external message bus egress, not Redis cache encodings, and
+selecting either for a Redis cache payload is an error.
 
 :::tip
 The `json` encoding is used by default for human readability and interoperability.

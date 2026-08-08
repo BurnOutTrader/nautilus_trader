@@ -76,8 +76,8 @@ use nautilus_model::{
     },
     events::{AccountState, OrderEventAny},
     identifiers::{
-        AccountId, ClientId, ClientOrderId, ComponentId, ExecAlgorithmId, InstrumentId,
-        OrderListId, PositionId, StrategyId, Venue, VenueOrderId,
+        AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId,
+        PositionId, StrategyId, Venue, VenueOrderId,
     },
     instruments::{Instrument, InstrumentAny, SyntheticInstrument},
     orderbook::{
@@ -371,16 +371,6 @@ impl<'a> CacheApi<'a> {
     ) -> AHashSet<PositionId> {
         self.cache()
             .position_closed_ids(venue, instrument_id, strategy_id, account_id)
-    }
-
-    /// Returns the actor IDs in the cache.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the cache is already mutably borrowed.
-    #[must_use]
-    pub fn actor_ids(&self) -> AHashSet<ComponentId> {
-        self.cache().actor_ids()
     }
 
     /// Returns the strategy IDs in the cache.
@@ -2750,11 +2740,11 @@ impl Cache {
     /// Returns an error if loading actor state fails.
     pub fn load_actor_state(
         &self,
-        component_id: &ComponentId,
+        actor_id: &ActorId,
     ) -> anyhow::Result<Option<IndexMap<String, Vec<u8>>>> {
         self.database
             .as_ref()
-            .map(|database| database.load_actor(component_id))
+            .map(|database| database.load_actor(actor_id))
             .transpose()
             .map(|state| state.map(Self::decode_component_state))
     }
@@ -2784,11 +2774,11 @@ impl Cache {
     /// Returns an error if updating actor state fails.
     pub fn update_actor_state(
         &self,
-        component_id: &ComponentId,
+        actor_id: &ActorId,
         state: &IndexMap<String, Vec<u8>>,
     ) -> anyhow::Result<()> {
         if let Some(database) = &self.database {
-            database.update_actor(component_id, &Self::encode_component_state(state))?;
+            database.update_actor(actor_id, &Self::encode_component_state(state))?;
         }
         Ok(())
     }
@@ -6057,12 +6047,6 @@ impl Cache {
             strategy_id,
             account_id,
         )
-    }
-
-    /// Returns the `ComponentId`s of all actors.
-    #[must_use]
-    pub fn actor_ids(&self) -> AHashSet<ComponentId> {
-        self.index.actors.clone()
     }
 
     /// Returns the `StrategyId`s of all strategies.

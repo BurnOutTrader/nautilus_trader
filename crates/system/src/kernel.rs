@@ -666,12 +666,21 @@ impl NautilusKernel {
     pub fn start_trader(&mut self) -> anyhow::Result<()> {
         log::info!("Starting trader...");
 
-        if self.config.load_state() {
+        let load_state = self.config.load_state();
+        let save_state = self.config.save_state();
+
+        if (load_state || save_state) && !self.cache.borrow().has_backing() {
+            log::warn!(
+                "Cache has no database backing, load_state={load_state} and save_state={save_state} will have no effect"
+            );
+        }
+
+        if load_state {
             Trader::load_state(&self.trader)
                 .map_err(|e| anyhow::anyhow!("Failed to load actor and strategy state: {e:#}"))?;
         }
 
-        self.state_save_armed = self.config.save_state();
+        self.state_save_armed = save_state;
         self.order_emulator.start();
 
         if let Err(start_err) = Trader::start_with_component_callbacks(&self.trader) {
@@ -1067,7 +1076,7 @@ mod lifecycle_tests {
     use nautilus_execution::engine::SnapshotAnchorer;
     use nautilus_model::{
         enums::{OrderSide, OrderStatus, OrderType, TriggerType},
-        identifiers::{ActorId, ClientOrderId, ComponentId, StrategyId},
+        identifiers::{ActorId, ClientOrderId, StrategyId},
         instruments::{
             CryptoPerpetual, Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt,
         },
@@ -1190,7 +1199,7 @@ mod lifecycle_tests {
         let actor_save = state("actor-saved", b"actor-save-value");
         let strategy_save = state("strategy-saved", b"strategy-save-value");
         let (database, control) = TestCacheDatabaseControl::create();
-        control.set_actor_state(ComponentId::from(actor_id.as_str()), &actor_load);
+        control.set_actor_state(actor_id, &actor_load);
         control.set_strategy_state(strategy_id, &strategy_load);
 
         let event_store_control = control.clone();
@@ -1249,10 +1258,7 @@ mod lifecycle_tests {
                 "database.close",
             ]
         );
-        assert_eq!(
-            control.actor_state(&ComponentId::from(actor_id.as_str())),
-            Some(actor_save)
-        );
+        assert_eq!(control.actor_state(&actor_id), Some(actor_save));
         assert_eq!(control.strategy_state(&strategy_id), Some(strategy_save));
     }
 
@@ -1318,10 +1324,7 @@ mod lifecycle_tests {
                 "strategy.update:EMPTY-STATE-STRATEGY-001",
             ]
         );
-        assert_eq!(
-            control.actor_state(&ComponentId::from(actor_id.as_str())),
-            Some(IndexMap::new())
-        );
+        assert_eq!(control.actor_state(&actor_id), Some(IndexMap::new()));
         assert_eq!(control.strategy_state(&strategy_id), Some(IndexMap::new()));
         kernel.dispose();
     }
@@ -1385,10 +1388,7 @@ mod lifecycle_tests {
         let actor_id = ActorId::from("FAIL-LOAD-ACTOR");
         let strategy_id = StrategyId::from("FAIL-LOAD-STRATEGY-001");
         let (database, control) = TestCacheDatabaseControl::create();
-        control.set_actor_state(
-            ComponentId::from(actor_id.as_str()),
-            &state("actor", b"load"),
-        );
+        control.set_actor_state(actor_id, &state("actor", b"load"));
         control.set_strategy_state(strategy_id, &state("strategy", b"load"));
         let mut kernel = NautilusKernelBuilder::default()
             .with_cache_database(Box::new(database))
@@ -1505,7 +1505,7 @@ mod lifecycle_tests {
             ]
         );
         assert_eq!(
-            control.actor_state(&ComponentId::from(actor_id.as_str())),
+            control.actor_state(&actor_id),
             Some(state("actor", b"partial"))
         );
         assert_eq!(

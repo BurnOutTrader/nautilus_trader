@@ -8,10 +8,13 @@ Released on TBD (UTC).
 - Added full Rust config parity for the Python testkit `ExecTesterConfig`
 - Added Python v2 Redis message bus backing for `LiveNode` (#4630), thanks for reporting @davidgreyme
 - Added `LiveNode.start()` warning when external message bus ingress requires `run()`
+- Added trader start warning when `load_state` or `save_state` is enabled without a cache database backing
 - Added runtime external‑order claim registration and removal to Rust `LiveNode` (#4620), thanks @folknor
 - Added `INFO` logs for socket and WebSocket connection loss and recovery (#4621), thanks @folknor
 - Added Deribit book summaries as requestable custom data (#4576), thanks @graceyangfan
 - Added Polymarket `compute_effective_deltas` config option to emit net changes for book snapshots (default `False`)
+- Added Polymarket `series_ids` instrument provider scoping for recurring Gamma market families (#4650), thanks @mystic-io
+- Added Polymarket instrument bootstrap from a `filters` map or a market-sourcing registered `InstrumentFilter` alone, without requiring `load_all`
 
 ### Breaking Changes
 
@@ -23,10 +26,19 @@ Released on TBD (UTC).
 - Removed Databento `load_*_as_pycapsule` methods; use the corresponding `load_*` methods
 - Removed generic Python clients and support APIs from `nautilus_trader.network`; use adapter APIs or `nautilus-network`
 - Removed unused Rust `SocketClient` connection/disconnection callbacks and `WebSocketClient` reconnection callback; use message or epoch handlers
+- Removed `nautilus_trader.data.OptionChainManager`; use `subscribe_option_chain` and handle `OptionChainSlice` in `on_option_chain`
+- Removed duck-typed object conversion from `BacktestEngine.add_data`; pass model objects such as `QuoteTick`, `TradeTick`, and `Bar`
+- Removed Rust `from_pyobject` constructors from `nautilus_model` data types; use `Bound::extract` for the target type
+- Removed `Cache.actor_ids()`, which always returned an empty set because no data flowing through the cache carries an actor ID; the Rust `Trader::actor_ids()` still lists registered actors
 - Replaced Rust `nautilus_model::python::data::data_to_pycapsule` with `data_to_pyobject`
 - Changed `DataQueryResult` iteration to return Python object lists instead of `DataFFI` capsules
+- Changed Rust `QueryResult` and `DataQueryResult` to iterate `Result` items carrying a new `QueryError`; collect with `collect::<Result<Vec<_>, _>>()` to surface query failures
 - Changed adapter callbacks to receive typed model objects instead of `PyCapsule` objects
+- Changed the cache actor APIs to use `ActorId` instead of `ComponentId`, covering the Rust `CacheDatabaseAdapter` actor state methods
 - Changed Interactive Brokers historical tick responses and Tardis batch streams to provide typed model objects
+- Changed portfolio statistic `calculate_from_positions` to require `Position` objects instead of arbitrary objects with an `entry` attribute
+- Changed Bybit `bybit_bar_spec_to_interval` to take a `BarAggregation` instead of an integer
+- Changed Hyperliquid `subscribe_book_deltas` and `subscribe_book_snapshots` to take a `BookType` instead of an integer
 
 ### Security
 
@@ -45,29 +57,45 @@ Released on TBD (UTC).
 - Fixed `Position` average open price (`avg_px_open`) for exact closes after partial fills
 - Fixed order list `OrderInitialized` events to carry `order_list_id` through publication, persistence, and replay
 - Fixed failed live strategy registrations leaving orphaned external‑order claims (#4620), thanks @folknor
+- Fixed network controllers treating aborted reconnects as completed reconnections (#4623), thanks @folknor
+- Fixed WebSocket pong frames being held across a reconnect and enqueued on the replacement connection (#4613), thanks @folknor
 - Fixed Python v2 `FeeModel` subclass constructors and concrete model inheritance (#4640), thanks @dfjmax
+- Fixed `ChandeMomentumOscillator` returning a value outside [-100, 100] for a zero gain average, which gave `VariableIndexDynamicAverage` a smoothing weight above 1 (#4667), thanks @mkzung
+- Fixed portfolio PnL and net exposure currency when `convert_to_account_base_currency` is disabled
+- Fixed portfolio realized PnL converting snapshot and position amounts at different exchange rates when `use_mark_xrates` is enabled
+- Fixed account state log throttling for events carrying an earlier `ts_init`
+- Fixed catalog and session queries reporting a DataFusion stream or record‑batch decode failure as a successfully exhausted query, which truncated data without warning and aborted the process in release builds; Python `DataQueryResult` iteration and `to_list` now raise `RuntimeError`
 - Fixed Binance Spot HTTP submissions to use private‑stream order events across reconnects
 - Fixed Bybit REST and WebSocket order `smpGroup` string decoding (#4655), thanks for reporting @a-green-hand-jack
 - Fixed Derive cancel‑only replacements and reused labels during order reconciliation
 - Fixed Polymarket maker fill ownership and reported mass‑status trade drops (#4662), thanks @seungpyoson
 - Fixed Polymarket WebSocket asset and discovery subscription replay across reconnects
+- Fixed Polymarket WebSocket buffered fills emitting after a terminal order status, which left canceled orders `PartiallyFilled` and dropped fills on market‑resolution expiry
+- Fixed Polymarket HTTP rejection reasons carrying the raw JSON error body, so an `OrderRejected` now reports the venue message alone
 
 ### Internal Improvements
 
+- Added `From` conversions from `ActorId`, `ExecAlgorithmId`, and `StrategyId` to `ComponentId` that reuse the interned value
 - Hardened development wheel publishing to validate exact artifacts and fail closed
 - Improved native backtest workload coverage for canonical result checks
 - Improved Coinbase request tests by removing redundant waits (#4637), thanks @pengpengyi92
 - Improved network crate tests for retries, rate limits, mutual TLS, HTTP, socket reconnects, and WebSocket messages
+- Improved Polymarket order response tests for the `tradeIDs` matched shape and batch submission legs
 - Refined CI, build, and dependency configuration after the v1 removal
 - Replaced Chrono and Chrono-TZ with Jiff and bundled TZDB data (#4639), thanks @sunlei
+- Standardized Rust adapter order command failure classification with a shared `CommandFailure` type for Architect AX, Bybit, and Kraken
+- Updated concept and tutorial docs to describe current Rust and PyO3 behavior after the v1 removal
 - Upgraded Rust development tools: `cargo-hawk` v0.1.12, `cargo-nextest` v0.9.143, and Miri `nightly-2026-08-01`
 - Upgraded Python and workflow tools: `uv` v0.12.1, `pypi-attestations` v0.0.30, and `zizmor` v1.29.0
 - Upgraded `base64` crate to v0.23.1 with only its safe `std` feature enabled
 - Upgraded `capnp` and `capnpc` crates to v0.27.0 and regenerated schema bindings
-- Upgraded `clap` to v4.6.5, `http` to v1.5.0, `time` to v0.3.55, and `toml` to v1.1.4
+- Upgraded `clap` crate to v4.6.6
+- Upgraded `http` crate to v1.5.0
 - Upgraded `pem` crate to v4.0.0 to align with the current Base64 API
-- Upgraded `pyo3` crate to v0.29.1 for object‑lifetime, free‑threading, and compatibility fixes
+- Upgraded `pyo3` crate to v0.29.2 for object‑lifetime, free‑threading, and compatibility fixes
 - Upgraded `redis` crate to v1.5.0
+- Upgraded `time` crate to v0.3.55
+- Upgraded `toml` crate to v1.1.4
 
 ### Documentation Updates
 

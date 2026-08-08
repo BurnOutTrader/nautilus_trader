@@ -95,7 +95,7 @@ use nautilus_common::{
         execution::{GenerateOrderStatusReports, GeneratePositionStatusReports, TradingCommand},
     },
     msgbus::{self, BusMessage, MessagingSwitchboard},
-    runner::{TimeEventMessage, TradingCommandMessage},
+    runner::{SystemChannel, TimeEventMessage, TradingCommandMessage},
 };
 use nautilus_core::{
     UUID4,
@@ -141,7 +141,7 @@ use builder::ExternalMessageBusIngress;
 pub use builder::LiveNodeBuilder;
 use config::{LiveNodeConfig, PluginConfig, validate_live_environment};
 pub use metrics::{RunnerChannelMetricsSnapshot, RunnerMetricsDelta, RunnerMetricsSnapshot};
-use metrics::{RunnerChannelQueueDepths, RunnerMetricChannel, RunnerMetrics};
+use metrics::{RunnerChannelQueueDepths, RunnerMetrics};
 use state::{EngineConnectionStatus, RunningTransition};
 pub use state::{LiveNodeHandle, NodeState};
 
@@ -1485,7 +1485,7 @@ impl LiveNode {
                     if dispatched {
                         record_runner_dispatch(
                             &metrics,
-                            RunnerMetricChannel::TimeEvents,
+                            SystemChannel::TimeEvents,
                             dispatch_start,
                             metrics_start,
                         );
@@ -1502,7 +1502,7 @@ impl LiveNode {
                     self.process_exec_event(evt);
                     record_runner_dispatch(
                         &metrics,
-                        RunnerMetricChannel::ExecEvents,
+                        SystemChannel::ExecEvents,
                         dispatch_start,
                         metrics_start,
                     );
@@ -1518,7 +1518,7 @@ impl LiveNode {
                     self.process_exec_command(cmd);
                     record_runner_dispatch(
                         &metrics,
-                        RunnerMetricChannel::ExecCommands,
+                        SystemChannel::ExecCommands,
                         dispatch_start,
                         metrics_start,
                     );
@@ -1557,7 +1557,7 @@ impl LiveNode {
                     AsyncRunner::handle_data_event(evt);
                     record_runner_dispatch(
                         &metrics,
-                        RunnerMetricChannel::DataEvents,
+                        SystemChannel::DataEvents,
                         dispatch_start,
                         metrics_start,
                     );
@@ -1572,7 +1572,7 @@ impl LiveNode {
                     AsyncRunner::handle_data_command(cmd);
                     record_runner_dispatch(
                         &metrics,
-                        RunnerMetricChannel::DataCommands,
+                        SystemChannel::DataCommands,
                         dispatch_start,
                         metrics_start,
                     );
@@ -1654,7 +1654,10 @@ impl LiveNode {
 
     fn republish_external_msgbus_message(message: &BusMessage) {
         if let Err(e) = msgbus::republish_external_message(message) {
-            log::error!("Failed to republish external message bus message: {e}");
+            log::error!(
+                "Failed to republish external message bus topic '{}': {e:#}",
+                message.topic
+            );
         }
     }
 
@@ -2720,7 +2723,7 @@ impl LiveNode {
 
 fn record_runner_dispatch(
     metrics: &RunnerMetrics,
-    channel: RunnerMetricChannel,
+    channel: SystemChannel,
     dispatch_start: dst::time::Instant,
     metrics_start: dst::time::Instant,
 ) {
@@ -3200,6 +3203,7 @@ mod tests {
 
     use bytes::Bytes;
     use indexmap::IndexMap;
+    use log::{Level, LevelFilter, Log, Metadata, Record};
     #[cfg(feature = "python")]
     use nautilus_common::runner::{
         SyncDataCommandSender, SyncTradingCommandSender, replace_data_cmd_sender,
@@ -3235,8 +3239,8 @@ mod tests {
             order::spec::{OrderAcceptedSpec, OrderPendingUpdateSpec, OrderUpdatedSpec},
         },
         identifiers::{
-            AccountId, ActorId, ClientId, ComponentId, InstrumentId, PositionId, StrategyId,
-            TradeId, TraderId, VenueOrderId,
+            AccountId, ActorId, ClientId, InstrumentId, PositionId, StrategyId, TradeId, TraderId,
+            VenueOrderId,
         },
         instruments::{Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
         orders::{OrderTestBuilder, stubs::TestOrderEventStubs},
@@ -3254,8 +3258,34 @@ mod tests {
     };
     use rstest::*;
     use rust_decimal_macros::dec;
+    use ustr::Ustr;
 
     use super::*;
+
+    struct ExternalIngressLogCapture {
+        messages: Mutex<Vec<String>>,
+    }
+
+    static EXTERNAL_INGRESS_LOG_CAPTURE: ExternalIngressLogCapture = ExternalIngressLogCapture {
+        messages: Mutex::new(Vec::new()),
+    };
+
+    impl Log for ExternalIngressLogCapture {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.level() == Level::Error && metadata.target() == "nautilus_live::node"
+        }
+
+        fn log(&self, record: &Record<'_>) {
+            if self.enabled(record.metadata()) {
+                self.messages
+                    .lock()
+                    .unwrap()
+                    .push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
 
     #[rstest]
     fn test_render_client_statuses() {
@@ -3281,6 +3311,35 @@ mod tests {
 ╰─────────┴───────────┴───────────╯";
 
         assert_eq!(output, expected);
+    }
+
+    #[rstest]
+    fn test_republish_external_msgbus_message_logs_topic_and_error_chain() {
+        log::set_logger(&EXTERNAL_INGRESS_LOG_CAPTURE).expect("test logger already installed");
+        log::set_max_level(LevelFilter::Error);
+        EXTERNAL_INGRESS_LOG_CAPTURE
+            .messages
+            .lock()
+            .unwrap()
+            .clear();
+        let message = BusMessage::with_str_topic(
+            "data.quotes.AUDUSD.SIM*",
+            BusPayloadType::Custom(Ustr::from("UnregisteredCustomData")),
+            Bytes::new(),
+            SerializationEncoding::Json,
+        );
+
+        LiveNode::republish_external_msgbus_message(&message);
+
+        assert_eq!(
+            *EXTERNAL_INGRESS_LOG_CAPTURE.messages.lock().unwrap(),
+            vec![
+                "Failed to republish external message bus topic 'data.quotes.AUDUSD.SIM*': invalid \
+                 external message topic: Topic `value` contained invalid characters, was \
+                 data.quotes.AUDUSD.SIM*"
+                    .to_string()
+            ],
+        );
     }
 
     #[rstest]
@@ -5111,7 +5170,7 @@ mod tests {
         let strategy_save =
             IndexMap::from([("strategy-save".to_string(), b"strategy-saved".to_vec())]);
         let (database, control) = TestCacheDatabaseControl::create();
-        control.set_actor_state(ComponentId::from(actor_id.as_str()), &actor_load);
+        control.set_actor_state(actor_id, &actor_load);
         control.set_strategy_state(strategy_id, &strategy_load);
         let config = LiveNodeConfig {
             load_state: true,
@@ -5165,10 +5224,7 @@ mod tests {
                 "database.close",
             ]
         );
-        assert_eq!(
-            control.actor_state(&ComponentId::from(actor_id.as_str())),
-            Some(actor_save)
-        );
+        assert_eq!(control.actor_state(&actor_id), Some(actor_save));
         assert_eq!(control.strategy_state(&strategy_id), Some(strategy_save));
         assert_eq!(node.state(), NodeState::Stopped);
     }
@@ -5451,7 +5507,7 @@ mod tests {
 
         record_runner_dispatch(
             &metrics,
-            RunnerMetricChannel::DataCommands,
+            SystemChannel::DataCommands,
             dispatch_start,
             metrics_start,
         );

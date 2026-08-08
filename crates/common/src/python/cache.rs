@@ -28,8 +28,8 @@ use nautilus_model::{
     },
     enums::{AggregationSource, OmsType, OrderSide, PositionSide, PriceType},
     identifiers::{
-        AccountId, ClientId, ClientOrderId, ComponentId, ExecAlgorithmId, InstrumentId,
-        OrderListId, PositionId, StrategyId, Venue, VenueOrderId,
+        AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId, PositionId,
+        StrategyId, Venue, VenueOrderId,
     },
     instruments::SyntheticInstrument,
     orderbook::{OrderBook, own::OwnOrderBook},
@@ -601,11 +601,6 @@ impl PyCache {
             )
             .into_iter()
             .collect()
-    }
-
-    #[pyo3(name = "actor_ids")]
-    fn py_actor_ids(&self) -> Vec<ComponentId> {
-        self.0.borrow().actor_ids().into_iter().collect()
     }
 
     #[pyo3(name = "strategy_ids")]
@@ -2217,12 +2212,6 @@ impl Cache {
         )
         .into_iter()
         .collect()
-    }
-
-    /// Returns the `ComponentId`s of all actors.
-    #[pyo3(name = "actor_ids")]
-    fn py_actor_ids(&self) -> Vec<ComponentId> {
-        self.actor_ids().into_iter().collect()
     }
 
     /// Returns the `StrategyId`s of all strategies.

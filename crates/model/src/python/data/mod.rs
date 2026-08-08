@@ -155,7 +155,7 @@ pub fn data_to_pyobject(py: Python<'_>, data: Data) -> PyResult<Py<PyAny>> {
 pub fn pyobjects_to_book_deltas(data: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<OrderBookDelta>> {
     let deltas: Vec<OrderBookDelta> = data
         .into_iter()
-        .map(|obj| OrderBookDelta::from_pyobject(&obj))
+        .map(|obj| obj.extract::<OrderBookDelta>().map_err(PyErr::from))
         .collect::<PyResult<Vec<OrderBookDelta>>>()?;
 
     // Validate monotonically increasing
@@ -174,7 +174,7 @@ pub fn pyobjects_to_book_deltas(data: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<Ord
 pub fn pyobjects_to_quotes(data: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<QuoteTick>> {
     let quotes: Vec<QuoteTick> = data
         .into_iter()
-        .map(|obj| QuoteTick::from_pyobject(&obj))
+        .map(|obj| obj.extract::<QuoteTick>().map_err(PyErr::from))
         .collect::<PyResult<Vec<QuoteTick>>>()?;
 
     // Validate monotonically increasing
@@ -193,7 +193,7 @@ pub fn pyobjects_to_quotes(data: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<QuoteTic
 pub fn pyobjects_to_trades(data: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<TradeTick>> {
     let trades: Vec<TradeTick> = data
         .into_iter()
-        .map(|obj| TradeTick::from_pyobject(&obj))
+        .map(|obj| obj.extract::<TradeTick>().map_err(PyErr::from))
         .collect::<PyResult<Vec<TradeTick>>>()?;
 
     // Validate monotonically increasing
@@ -212,7 +212,7 @@ pub fn pyobjects_to_trades(data: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<TradeTic
 pub fn pyobjects_to_bars(data: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<Bar>> {
     let bars: Vec<Bar> = data
         .into_iter()
-        .map(|obj| Bar::from_pyobject(&obj))
+        .map(|obj| obj.extract::<Bar>().map_err(PyErr::from))
         .collect::<PyResult<Vec<Bar>>>()?;
 
     // Validate monotonically increasing
@@ -231,7 +231,7 @@ pub fn pyobjects_to_bars(data: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<Bar>> {
 pub fn pyobjects_to_mark_prices(data: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<MarkPriceUpdate>> {
     let mark_prices: Vec<MarkPriceUpdate> = data
         .into_iter()
-        .map(|obj| MarkPriceUpdate::from_pyobject(&obj))
+        .map(|obj| obj.extract::<MarkPriceUpdate>().map_err(PyErr::from))
         .collect::<PyResult<Vec<MarkPriceUpdate>>>()?;
 
     // Validate monotonically increasing
@@ -250,7 +250,7 @@ pub fn pyobjects_to_mark_prices(data: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<Mar
 pub fn pyobjects_to_index_prices(data: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<IndexPriceUpdate>> {
     let index_prices: Vec<IndexPriceUpdate> = data
         .into_iter()
-        .map(|obj| IndexPriceUpdate::from_pyobject(&obj))
+        .map(|obj| obj.extract::<IndexPriceUpdate>().map_err(PyErr::from))
         .collect::<PyResult<Vec<IndexPriceUpdate>>>()?;
 
     // Validate monotonically increasing
@@ -271,7 +271,7 @@ pub fn pyobjects_to_instrument_statuses(
 ) -> PyResult<Vec<InstrumentStatus>> {
     let statuses: Vec<InstrumentStatus> = data
         .into_iter()
-        .map(|obj| InstrumentStatus::from_pyobject(&obj))
+        .map(|obj| obj.extract::<InstrumentStatus>().map_err(PyErr::from))
         .collect::<PyResult<Vec<InstrumentStatus>>>()?;
 
     if !is_monotonically_increasing_by_init(&statuses) {
@@ -289,7 +289,7 @@ pub fn pyobjects_to_instrument_statuses(
 pub fn pyobjects_to_option_greeks(data: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<OptionGreeks>> {
     let greeks: Vec<OptionGreeks> = data
         .into_iter()
-        .map(|obj| OptionGreeks::from_pyobject(&obj))
+        .map(|obj| obj.extract::<OptionGreeks>().map_err(PyErr::from))
         .collect::<PyResult<Vec<OptionGreeks>>>()?;
 
     if !is_monotonically_increasing_by_init(&greeks) {
@@ -309,7 +309,7 @@ pub fn pyobjects_to_instrument_closes(
 ) -> PyResult<Vec<InstrumentClose>> {
     let closes: Vec<InstrumentClose> = data
         .into_iter()
-        .map(|obj| InstrumentClose::from_pyobject(&obj))
+        .map(|obj| obj.extract::<InstrumentClose>().map_err(PyErr::from))
         .collect::<PyResult<Vec<InstrumentClose>>>()?;
 
     // Validate monotonically increasing
@@ -499,7 +499,8 @@ fn py_decode_record_batch_to_custom_data(
 /// Use this when you prefer to pass the class instead of a sample instance.
 /// The class must have:
 /// - `type_name_static()` class method or `__name__` (used as type name in storage)
-/// - `decode_record_batch_py(metadata, ipc_bytes)` class method
+/// - `from_json(data)` class method
+/// - `decode_record_batch_py(metadata, batch)` class method
 /// - Instances must have `ts_event`, `ts_init`, and `encode_record_batch_py(items)`.
 ///
 /// # Arguments
@@ -513,17 +514,35 @@ fn py_decode_record_batch_to_custom_data(
 /// # Example
 ///
 /// ```python
-/// from nautilus_trader.model.custom import customdataclass_pyo3
+/// import json
+///
 /// from nautilus_trader.model import register_custom_data_class
 ///
-/// @customdataclass_pyo3()
 /// class MarketTickPython:
-///     symbol: str = ""
-///     price: float = 0.0
-///     volume: int = 0
+///     ts_event = 0
+///     ts_init = 0
+///
+///     def to_json(self):
+///         return json.dumps(self.__dict__)
+///
+///     @classmethod
+///     def from_json(cls, data):
+///         instance = cls()
+///         instance.__dict__.update(data)
+///         return instance
+///
+///     def encode_record_batch_py(self, items):
+///         raise NotImplementedError("Arrow encoding is not configured")
+///
+///     @classmethod
+///     def decode_record_batch_py(cls, metadata, batch):
+///         raise NotImplementedError("Arrow decoding is not configured")
 ///
 /// register_custom_data_class(MarketTickPython)
 /// ```
+///
+/// The Arrow methods may raise for a message-bus-only class, but must be implemented before catalog
+/// persistence is used.
 #[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.model")]
@@ -629,7 +648,7 @@ pub fn register_custom_data_class(data_class: &Bound<'_, PyAny>) -> PyResult<()>
 pub fn pyobjects_to_funding_rates(data: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<FundingRateUpdate>> {
     let funding_rates: Vec<FundingRateUpdate> = data
         .into_iter()
-        .map(|obj| FundingRateUpdate::from_pyobject(&obj))
+        .map(|obj| obj.extract::<FundingRateUpdate>().map_err(PyErr::from))
         .collect::<PyResult<Vec<FundingRateUpdate>>>()?;
 
     // Validate monotonically increasing

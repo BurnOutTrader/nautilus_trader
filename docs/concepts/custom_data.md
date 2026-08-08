@@ -27,9 +27,9 @@ The custom-data architecture satisfies the following requirements:
 
 There are two supported authoring modes:
 
-| Mode             | Example                                         | Registration path                                           | Encode/decode path            | Wrapper backend           |
+| Mode             | Authoring form                                  | Registration path                                           | Encode/decode path            | Wrapper backend           |
 | ---------------- | ----------------------------------------------- | ----------------------------------------------------------- | ----------------------------- | ------------------------- |
-| Pure Python      | `@customdataclass_pyo3` class                   | `register_custom_data_class(...)`                           | Python callback + Arrow C FFI | `PythonCustomDataWrapper` |
+| Pure Python      | Class with JSON and Arrow methods               | `register_custom_data_class(...)`                           | Python callback + Arrow C FFI | `PythonCustomDataWrapper` |
 | Same‑binary Rust | `#[custom_data]` or `#[custom_data(pyo3)]` type | `ensure_custom_data_registered::<T>()` and native extractor | Native Rust                   | Native Rust payload       |
 
 Both modes converge on the same outer PyO3 `CustomData` wrapper and the same
@@ -371,16 +371,6 @@ Current behavior:
 - Redis `add_custom_data` and `load_custom_data` filter by `DataType`
   (type_name, metadata, identifier) and return results sorted by `ts_init`;
   this is exposed via the PyO3 `RedisCacheDatabase` API.
-
-## Cython custom data
-
-The Cython `@customdataclass` system is separate from this architecture.
-This document describes the PyO3 custom-data system:
-
-- PyO3 `CustomData`.
-- Dynamic runtime registration.
-- Arrow/Parquet persistence.
-- Native Rust execution paths.
 
 ## Practical implications
 
